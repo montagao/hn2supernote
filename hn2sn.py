@@ -6,7 +6,8 @@ from datetime import date
 from dotenv import load_dotenv
 from newspaper import Article
 from weasyprint import HTML
-import supernote
+from sncloud import SNClient
+from pathlib import Path
 
 load_dotenv()
 
@@ -116,8 +117,8 @@ def get_pdf_filename(rank):
 
 def upload_to_supernote(pdf_files):
     """
-    Upload PDF files to the HackerNews folder on Supernote
-    Returns the number of successfully uploaded files
+    Upload PDF files to the specified path on Supernote using sncloud.
+    Returns the number of successfully uploaded files.
     """
     test_mode_val = os.getenv("TEST_MODE", "False").lower()
     test_mode = test_mode_val in ("true", "1", "t", "yes")
@@ -131,66 +132,68 @@ def upload_to_supernote(pdf_files):
 
     email = os.getenv("SUPERNOTE_EMAIL")
     password = os.getenv("SUPERNOTE_PASSWORD")
-    dir_id = os.getenv("SUPERNOTE_DIR_ID")
-
-    if dir_id:
-        try:
-            dir_id = int(dir_id)
-        except ValueError:
-            log(f"WARNING: SUPERNOTE_DIR_ID is not a valid integer: {dir_id}")
-            dir_id = None
+    target_path_str = os.getenv("SUPERNOTE_TARGET_PATH", "/Inbox/HackerNews")
 
     if not email or not password:
         log("ERROR: Supernote credentials not found in .env file")
         return 0
 
-    if not dir_id:
-        log("WARNING: SUPERNOTE_DIR_ID not set in .env file")
-        log("Please set SUPERNOTE_DIR_ID after first run")
-        log("Find the HackerNews folder ID and add it to .env")
+    if not target_path_str.startswith("/"):
+        target_path_str = "/" + target_path_str
+        log(f"Corrected Supernote target path to: {target_path_str}")
+    
+    target_folder_name = os.path.basename(target_path_str)
+    parent_path_str = os.path.dirname(target_path_str)
+
 
     try:
+        client = SNClient()
         log(f"Logging in to Supernote cloud with email: {email}")
-        token = supernote.login(email, password)
-
-        if not token:
-            log("ERROR: Failed to login to Supernote cloud")
-            return 0
-
+        client.login(email, password)
         log("Successfully logged in to Supernote cloud")
 
-        if not dir_id:
-            log("Searching for HackerNews folder...")
-            root_files = supernote.file_list(token)
-
-            for item in root_files:
-                is_folder = item['isFolder'] == 'Y'
-                is_hn_folder = item['fileName'] == "HackerNews"
-                if is_folder and is_hn_folder:
-                    dir_id = item['id']
-                    log(f"Found HackerNews folder with ID: {dir_id}")
-                    log(f"Add SUPERNOTE_DIR_ID={dir_id} to your .env file")
+        path_exists = False
+        try:
+            current_path_items = client.ls(directory=parent_path_str)
+            for item in current_path_items:
+                log(f"Item: {item}")
+                if item.file_name == target_folder_name and item.is_folder:
+                    path_exists = True
+                    log(f"Found target folder: {target_path_str}")
                     break
+            
+            if not path_exists:
+                log(f"Target folder '{target_folder_name}' not found in '{parent_path_str}'. Attempting to create it.")
+                client.mkdir(target_folder_name, parent_path=parent_path_str)
+                log(f"Successfully created folder: {target_path_str}")
+                path_exists = True
 
-            if not dir_id:
-                log("ERROR: HackerNews folder not found.")
-                log("Please create it manually in Supernote cloud")
-                return 0
+        except Exception as e:
+            log(f"Error while checking or creating target folder '{target_path_str}': {e}")
+            log(f"Please ensure the base path '{parent_path_str}' exists or create '{target_path_str}' manually.")
+            return 0
+
+        if not path_exists:
+             log(f"ERROR: Target folder '{target_path_str}' could not be found or created.")
+             return 0
 
         uploaded_count = 0
         for pdf_file in pdf_files:
             try:
-                log(f"Uploading {pdf_file} to Supernote cloud...")
-                supernote.upload_file(token, pdf_file, directory=dir_id)
+                log(f"Uploading {pdf_file} to Supernote path '{target_path_str}'...")
+                client.put(file_path=Path(pdf_file), parent=target_path_str)
                 log(f"Successfully uploaded {pdf_file}")
                 uploaded_count += 1
             except Exception as e:
                 log(f"ERROR uploading {pdf_file}: {e}")
+                log(traceback.format_exc())
+
 
         return uploaded_count
 
     except Exception as e:
         log(f"ERROR in Supernote upload process: {e}")
+        log(traceback.format_exc())
         return 0
 
 
@@ -230,7 +233,6 @@ def main():
 
         log(f"Generated {len(pdf_files)} PDF files")
 
-        # Step 4: Upload PDFs to Supernote
         if pdf_files:
             try:
                 uploaded_count = upload_to_supernote(pdf_files)
