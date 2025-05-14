@@ -1,7 +1,10 @@
-feedparser==6.0.11
-newspaper3k==0.2.8
-weasyprint==65.1
-python-dotenv==1.1.0
-readability-lxml==0.8.1
-lxml[html_clean]
+feedparser
+python-dotenv
+WeasyPrint
 sncloud
+google-generativeai
+markdown2
+trafilatura
+playwright
+lxml # Often a core dependency for trafilatura and others, good to list explicitly
+listparser # For OPML parsing
