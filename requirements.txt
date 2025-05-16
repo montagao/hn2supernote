@@ -8,3 +8,6 @@ trafilatura
 playwright
 lxml # Often a core dependency for trafilatura and others, good to list explicitly
 listparser # For OPML parsing
+fastapi
+uvicorn[standard]
+beautifulsoup4

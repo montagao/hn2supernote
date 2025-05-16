@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Supernote Setup</title></head>
+<body style="font-family:sans-serif;max-width:420px;margin:2em">
+  <h2>Supernote Backend Configuration</h2>
+
+  <label>Backend URL<br>
+    <input id="backendUrl" type="url" style="width:100%" placeholder="https://your-backend-url.com">
+  </label><br><br>
+
+  <label>Supernote Email<br>
+    <input id="email" type="email" style="width:100%">
+  </label><br><br>
+
+  <label>Supernote Password<br>
+    <input id="password" type="password" style="width:100%" placeholder="Enter to login & save token">
+  </label><br><br>
+
+  <button id="loginSaveButton">Login and Save Settings</button>
+  <div id="statusMessage" style="margin-top: 1em; padding: 0.5em;"></div>
+
+  <p style="margin-top:1.5em;color:#555">
+    Your password is used once to obtain a login token from the backend and is not stored by the extension.
+  </p>
+
+  <script src="options.js"></script>
+</body>
+</html> 
