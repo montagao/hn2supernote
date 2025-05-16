@@ -99,3 +99,7 @@ This project uses the `sncloud` library ([https://github.com/julianprester/snclo
 ## Contributing
 
 Feel free to open issues or submit pull requests if you have suggestions for improvements or bug fixes. 
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
