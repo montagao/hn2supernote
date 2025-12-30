@@ -427,53 +427,6 @@ def scrape_article_content(url: str) -> dict | None:
     }
 
 
-def classify_article_quality(article_text: str, api_key: str) -> bool:
-    """
-    Classify article quality using Gemini API.
-    Returns True if thought-provoking, False if advertisement/low-quality.
-    Defaults to True on errors.
-    """
-    if not api_key:
-        logger.warning("No Gemini API key. Skipping classification, defaulting to good.")
-        return True
-
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-3-flash-preview')
-        prompt = (
-            "You are an expert content quality analyst. Classify this article: "
-            "Is it substantive and thought-provoking, or is it primarily an advertisement/promotional/superficial? "
-            "Respond with only one word: 'thought-provoking' or 'advertisement'.\n\n"
-            f"Article (first 10000 chars):\n{article_text[:10000]}"
-        )
-
-        response = model.generate_content(prompt)
-
-        if not response.candidates:
-            logger.warning(f"Gemini (classify): No candidates. Feedback: {response.prompt_feedback}")
-            return True
-
-        candidate = response.candidates[0]
-        if not candidate.content or not candidate.content.parts:
-            logger.warning(f"Gemini (classify): No content. Finish: {candidate.finish_reason}")
-            return True
-
-        response_text = candidate.content.parts[0].text.strip().lower()
-        logger.info(f"Gemini classification: '{response_text}'")
-
-        if "thought-provoking" in response_text:
-            return True
-        elif "advertisement" in response_text:
-            return False
-        else:
-            logger.warning(f"Gemini classification unclear: '{response_text}'. Defaulting to good.")
-            return True
-
-    except Exception as e:
-        logger.error(f"Error during Gemini classification: {e}\n{traceback.format_exc()}")
-        return True
-
-
 def reformat_to_markdown_gemini(
     article_text: str,
     article_url: str,
@@ -835,7 +788,6 @@ def process_url(
     sn_password: str,
     sn_target_path: str = "/Inbox/SendToSupernote",
     font_size: str = "14pt",
-    skip_quality_check: bool = False
 ) -> dict:
     """
     Main processing pipeline: scrape URL, convert to PDF, upload to Supernote.
@@ -873,14 +825,7 @@ def process_url(
         result["title"] = scraped['title']
         result["author"] = scraped['author']
 
-        # Step 2: Quality check (optional)
-        if not skip_quality_check:
-            is_quality = classify_article_quality(scraped['plain_text'], gemini_api_key)
-            if not is_quality:
-                result["message"] = "Article classified as low-quality/advertisement"
-                return result
-
-        # Step 3: Reformat to Markdown
+        # Step 2: Reformat to Markdown
         markdown = reformat_to_markdown_gemini(
             scraped['plain_text'],
             url,
@@ -894,7 +839,7 @@ def process_url(
             logger.warning("Markdown reformatting failed. Using cleaned HTML fallback.")
             html_content = scraped['html_content']
         else:
-            # Step 4: Convert Markdown to styled HTML
+            # Step 3: Convert Markdown to styled HTML
             html_content = convert_markdown_to_styled_html(
                 markdown,
                 font_size=font_size,
@@ -905,7 +850,7 @@ def process_url(
             result["message"] = "Failed to generate HTML content"
             return result
 
-        # Step 5: Generate PDF
+        # Step 4: Generate PDF
         temp_dir = tempfile.mkdtemp(prefix="telegram_bot_pdf_")
         pdf_filename = generate_pdf_filename(scraped['title'], scraped['author'])
         pdf_path = os.path.join(temp_dir, pdf_filename)
@@ -915,7 +860,7 @@ def process_url(
             result["message"] = "Failed to generate PDF"
             return result
 
-        # Step 6: Upload to Supernote
+        # Step 5: Upload to Supernote
         uploaded, upload_message, verification = upload_to_supernote(
             pdf_path, sn_email, sn_password, sn_target_path
         )

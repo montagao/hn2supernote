@@ -204,7 +204,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             sn_password=config["SN_PASSWORD"],
             sn_target_path=config["SUPERNOTE_TARGET_PATH"],
             font_size=config["PDF_FONT_SIZE"],
-            skip_quality_check=False
         )
 
         if result.get("verification"):
