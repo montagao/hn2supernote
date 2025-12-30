@@ -1,0 +1,19 @@
+[project]
+name = "telegram-supernote-bot"
+version = "0.1.0"
+description = "Telegram bot that converts web articles to PDFs and uploads to Supernote"
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot>=20.0",
+    "python-dotenv",
+    "sncloud",
+    "google-generativeai",
+    "markdown2",
+    "trafilatura",
+    "playwright",
+    "beautifulsoup4",
+    "lxml",
+]
+
+[project.scripts]
+bot = "bot:main"
