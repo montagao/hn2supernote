@@ -31,11 +31,144 @@ logger = logging.getLogger(__name__)
 # Constants
 MIN_CONTENT_LENGTH = 150
 HTML_SNIPPET_LENGTH = 1000
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/121.0.0.0 Safari/537.36"
+)
+JS_BLOCK_MARKERS = (
+    "javascript is not available",
+    "please enable javascript",
+    "enable javascript to continue",
+    "your browser does not support javascript",
+)
+BOT_BLOCK_MARKERS = (
+    "checking your browser",
+    "verify you are human",
+    "attention required",
+    "just a moment",
+    "please enable cookies",
+)
+RAW_BLOCK_MARKERS = (
+    "cf-browser-verification",
+    "challenge-platform",
+)
 
 # In-memory token cache keyed by email for the running bot process.
 _ACCESS_TOKEN_CACHE: dict[str, str] = {}
 _TOKEN_CACHE_PATH = Path(__file__).parent / "token_cache.json"
 _TOKEN_CACHE_LOADED = False
+
+
+def _normalize_text(text: str | None) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _extract_title_from_html(html: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.title and soup.title.string:
+            return soup.title.string.strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _extract_body_text(html: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        return soup.get_text(separator=" ", strip=True)
+    except Exception:
+        return ""
+
+
+def _looks_like_blocked_page(html: str | None) -> bool:
+    if not html:
+        return True
+
+    lower_html = html.lower()
+    if any(marker in lower_html for marker in RAW_BLOCK_MARKERS):
+        return True
+
+    title_text = _normalize_text(_extract_title_from_html(html))
+    if title_text and any(marker in title_text for marker in JS_BLOCK_MARKERS + BOT_BLOCK_MARKERS):
+        return True
+
+    body_text = _normalize_text(_extract_body_text(html))
+    if not body_text:
+        return False
+
+    snippet = body_text[:800]
+    if any(marker in snippet for marker in JS_BLOCK_MARKERS + BOT_BLOCK_MARKERS):
+        return len(body_text) <= 2000
+
+    return False
+
+
+def _fetch_html_with_playwright(url: str, browser_name: str = "chromium") -> str | None:
+    browser = None
+    try:
+        with sync_playwright() as p:
+            browser_type = getattr(p, browser_name, None)
+            if browser_type is None:
+                logger.warning(f"Playwright: Browser '{browser_name}' not available.")
+                return None
+
+            browser = browser_type.launch(headless=True, timeout=60000)
+            context = browser.new_context(
+                user_agent=DEFAULT_USER_AGENT,
+                viewport={"width": 1280, "height": 720},
+                locale="en-US",
+                java_script_enabled=True,
+            )
+            page = context.new_page()
+            page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            page.set_default_navigation_timeout(45000)
+            page.set_default_timeout(30000)
+            logger.info(f"Playwright({browser_name}): Navigating to {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeoutError:
+                logger.info(f"Playwright({browser_name}): networkidle timeout; continuing.")
+            html_source = page.content()
+            logger.info(
+                f"Playwright({browser_name}): Fetched HTML. Length: {len(html_source)}"
+            )
+            return html_source
+    except PlaywrightTimeoutError as pte:
+        logger.error(f"FAIL {url}: Playwright({browser_name}) timeout: {pte}")
+        return None
+    except Exception as e_pw:
+        logger.error(
+            f"FAIL {url}: Playwright({browser_name}) failed: {e_pw}\n{traceback.format_exc()}"
+        )
+        return None
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+def _fetch_html_with_httpx(url: str) -> str | None:
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        resp = httpx.get(url, headers=headers, follow_redirects=True, timeout=30.0)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        logger.warning(f"HTTP fetch failed for {url}: {e}")
+        return None
 
 
 def _get_cached_access_token(email: str) -> str | None:
@@ -293,28 +426,31 @@ def scrape_article_content(url: str) -> dict | None:
     image_urls = []
     html_source_to_process = None
 
-    # Fetch page with Playwright
+    # Fetch page with Playwright (Chromium first, then Firefox fallback)
     try:
-        with sync_playwright() as p:
-            browser = p.firefox.launch(headless=True, timeout=60000)
-            page = browser.new_page()
-            page.set_default_navigation_timeout(45000)
-            page.set_default_timeout(30000)
-            logger.info(f"Playwright: Navigating to {url}")
-            page.goto(url, wait_until="networkidle", timeout=45000)
-            logger.info(f"Playwright: Page loaded. Extracting content for {url}")
-            html_source_to_process = page.content()
-            logger.info(f"Playwright: Fetched HTML. Length: {len(html_source_to_process)}")
-            browser.close()
-    except PlaywrightTimeoutError as pte:
-        logger.error(f"FAIL {url}: Playwright timeout: {pte}")
-        return None
+        html_source_to_process = _fetch_html_with_playwright(url, browser_name="chromium")
+        if not html_source_to_process:
+            html_source_to_process = _fetch_html_with_playwright(url, browser_name="firefox")
+
+        if html_source_to_process and _looks_like_blocked_page(html_source_to_process):
+            logger.warning(
+                f"{url}: Page appears JS-blocked/bot-checked with Playwright. Trying fallback fetch."
+            )
+            html_fallback = _fetch_html_with_httpx(url)
+            if html_fallback and not _looks_like_blocked_page(html_fallback):
+                html_source_to_process = html_fallback
     except Exception as e_pw:
-        logger.error(f"FAIL {url}: Playwright failed: {e_pw}\n{traceback.format_exc()}")
+        logger.error(f"FAIL {url}: Fetch failed: {e_pw}\n{traceback.format_exc()}")
         return None
 
     if not html_source_to_process:
-        logger.error(f"FAIL {url}: HTML source is empty after Playwright fetch.")
+        logger.error(f"FAIL {url}: HTML source is empty after fetch.")
+        return None
+
+    if _looks_like_blocked_page(html_source_to_process):
+        logger.error(
+            f"FAIL {url}: Page appears to require JavaScript or presented a bot check."
+        )
         return None
 
     # Trafilatura extraction - JSON format for metadata
