@@ -8,13 +8,57 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
 import re
+from datetime import datetime, timezone
+from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from config import get_config, validate_config
 from processing import process_url, verify_supernote_code
+
+# History storage
+HISTORY_PATH = Path(__file__).parent / "history.json"
+MAX_HISTORY_ITEMS = 50
+
+
+def _load_history() -> list[dict]:
+    """Load history from JSON file."""
+    if not HISTORY_PATH.exists():
+        return []
+    try:
+        data = json.loads(HISTORY_PATH.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_history(history: list[dict]) -> None:
+    """Save history to JSON file."""
+    try:
+        HISTORY_PATH.write_text(json.dumps(history, indent=2))
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Failed to save history: {e}")
+
+
+def add_to_history(result: dict) -> None:
+    """Add a processed article to history."""
+    history = _load_history()
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "url": result.get("source_url"),
+        "title": result.get("title"),
+        "author": result.get("author"),
+        "filename": result.get("filename"),
+        "target_path": result.get("target_path"),
+        "success": result.get("success", False),
+    }
+    history.insert(0, entry)
+    # Keep only the most recent items
+    history = history[:MAX_HISTORY_ITEMS]
+    _save_history(history)
 
 # Configure logging
 logging.basicConfig(
@@ -59,9 +103,40 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Commands:\n"
         "/start - Show welcome message\n"
         "/help - Show this help message\n"
+        "/history - Show recently sent articles\n"
         "/verify <code> - Verify Supernote login when prompted"
     )
     await update.message.reply_text(help_text)
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /history command."""
+    history = _load_history()
+
+    if not history:
+        await update.message.reply_text("No articles sent yet.")
+        return
+
+    # Show last 10 items
+    lines = ["Recent articles sent to Supernote:\n"]
+    for i, entry in enumerate(history[:10], 1):
+        # Parse timestamp
+        try:
+            dt = datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
+            date_str = dt.strftime("%b %d, %H:%M")
+        except Exception:
+            date_str = "Unknown"
+
+        title = entry.get("title") or "Untitled"
+        # Truncate long titles
+        if len(title) > 40:
+            title = title[:37] + "..."
+
+        status = "OK" if entry.get("success") else "FAIL"
+        lines.append(f"{i}. [{status}] {title}")
+        lines.append(f"   {date_str}")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -137,6 +212,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await status_message.edit_text(result["message"])
             return
 
+        # Save to history
+        add_to_history(result)
+
         if result["success"]:
             # Format a nice success message
             lines = ["Sent to Supernote!"]
@@ -175,6 +253,7 @@ def main() -> None:
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("verify", verify_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
