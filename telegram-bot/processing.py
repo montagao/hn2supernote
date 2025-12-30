@@ -9,6 +9,9 @@ import json
 import re
 import os
 import tempfile
+import time
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -17,7 +20,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 import google.generativeai as genai
 import markdown2
 from bs4 import BeautifulSoup
-from sncloud import SNClient
+import httpx
+from sncloud import SNClient, endpoints
+from sncloud.api import calc_md5, calc_sha256
+from sncloud.exceptions import ApiError, AuthenticationError
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -25,6 +31,242 @@ logger = logging.getLogger(__name__)
 # Constants
 MIN_CONTENT_LENGTH = 150
 HTML_SNIPPET_LENGTH = 1000
+
+# In-memory token cache keyed by email for the running bot process.
+_ACCESS_TOKEN_CACHE: dict[str, str] = {}
+_TOKEN_CACHE_PATH = Path(__file__).parent / "token_cache.json"
+_TOKEN_CACHE_LOADED = False
+
+
+def _get_cached_access_token(email: str) -> str | None:
+    _ensure_token_cache_loaded()
+    return _ACCESS_TOKEN_CACHE.get(email)
+
+
+def _set_cached_access_token(email: str, token: str) -> None:
+    if email and token:
+        _ACCESS_TOKEN_CACHE[email] = token
+        _save_token_cache()
+
+
+def _clear_cached_access_token(email: str) -> None:
+    if email in _ACCESS_TOKEN_CACHE:
+        _ACCESS_TOKEN_CACHE.pop(email, None)
+        _save_token_cache()
+
+
+def _ensure_token_cache_loaded() -> None:
+    global _TOKEN_CACHE_LOADED
+    if _TOKEN_CACHE_LOADED:
+        return
+    _load_token_cache()
+
+
+def _load_token_cache() -> None:
+    global _TOKEN_CACHE_LOADED
+    _TOKEN_CACHE_LOADED = True
+    if not _TOKEN_CACHE_PATH.exists():
+        return
+    try:
+        data = json.loads(_TOKEN_CACHE_PATH.read_text())
+        if isinstance(data, dict):
+            # Support both {email: token} and {email: {"token": token}} formats.
+            for email, value in data.items():
+                if isinstance(value, dict):
+                    token = value.get("token")
+                else:
+                    token = value
+                if email and token:
+                    _ACCESS_TOKEN_CACHE[email] = token
+    except Exception as e:
+        logger.warning(f"Failed to load token cache: {e}")
+
+
+def _save_token_cache() -> None:
+    try:
+        payload = {
+            email: {
+                "token": token,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            for email, token in _ACCESS_TOKEN_CACHE.items()
+        }
+        _TOKEN_CACHE_PATH.write_text(json.dumps(payload, indent=2))
+    except Exception as e:
+        logger.warning(f"Failed to save token cache: {e}")
+
+
+class SNClientWithCSRF(SNClient):
+    """SNClient wrapper that adds CSRF token handling required by Supernote Cloud."""
+
+    def __init__(self):
+        super().__init__()
+        # Ensure UA is present for both GET (/csrf) and POST calls.
+        self._client.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/107.0.0.0 Safari/537.36"
+            )
+        })
+        self._csrf_token: str | None = None
+        self._last_login_timestamp: str | None = None
+        self._last_auth_error_code: str | None = None
+        self._last_auth_error_msg: str | None = None
+
+    def _fetch_csrf_token(self) -> str:
+        """
+        Fetch CSRF token required by Supernote Cloud APIs.
+        Stores token in self._csrf_token and relies on the shared client to hold the XSRF-TOKEN cookie.
+        """
+        resp = self._client.get(f"{self.BASE_URL}/csrf")
+        resp.raise_for_status()
+        token = resp.headers.get("x-xsrf-token") or resp.cookies.get("XSRF-TOKEN")
+        if not token:
+            raise ApiError("Failed to obtain CSRF token from Supernote")
+        self._csrf_token = token
+        return token
+
+    def _ensure_csrf_token(self) -> None:
+        # Only fetch when missing; 30-day cookie will be reused by httpx client.
+        if not self._csrf_token:
+            self._fetch_csrf_token()
+
+    def _api_call(self, endpoint: str, payload: dict) -> dict:
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/107.0.0.0 Safari/537.36"
+            ),
+        }
+        if self._access_token:
+            headers["x-access-token"] = self._access_token
+
+        # Supernote enforces CSRF protection on POST endpoints
+        if endpoint != "/csrf":
+            self._ensure_csrf_token()
+            headers["X-XSRF-TOKEN"] = self._csrf_token
+
+        url = f"{self.BASE_URL}{endpoint}"
+        try:
+            response = self._client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            # If CSRF token expired or missing, refresh once and retry
+            if e.response is not None and e.response.status_code == 403:
+                self._fetch_csrf_token()
+                headers["X-XSRF-TOKEN"] = self._csrf_token
+                response = self._client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                return response.json()
+            raise
+
+    def _extract_real_key(self, token: str) -> str:
+        if not token or "-" not in token:
+            raise ApiError("Invalid pre-auth token format from Supernote")
+        try:
+            idx = int(token[-1])
+        except ValueError as exc:
+            raise ApiError("Invalid pre-auth token index from Supernote") from exc
+        parts = token.split("-")
+        if idx < 0 or idx >= len(parts):
+            raise ApiError("Invalid pre-auth token index from Supernote")
+        return parts[idx]
+
+    def _hash256(self, text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def login(self, email: str, password: str) -> str:
+        (rc, timestamp) = self._get_random_code(email)
+        self._last_login_timestamp = str(timestamp)
+        self._last_auth_error_code = None
+        self._last_auth_error_msg = None
+
+        pd = calc_sha256(calc_md5(password) + rc)
+        payload = {
+            "countryCode": 1,
+            "account": email,
+            "password": pd,
+            "browser": "Chrome107",
+            "equipment": "1",
+            "loginMethod": "1",
+            "timestamp": timestamp,
+            "language": "en",
+        }
+
+        data = self._api_call(endpoints.login, payload)
+        if not data.get("success"):
+            self._last_auth_error_code = data.get("errorCode")
+            self._last_auth_error_msg = data.get("errorMsg")
+            raise AuthenticationError(self._last_auth_error_msg or "Login failed")
+        self._access_token = data["token"]
+        return data["token"]
+
+    def request_email_verification_code(self, email: str, timestamp: str | None = None) -> dict:
+        ts = timestamp or str(int(time.time() * 1000))
+        pre_auth = self._api_call("/user/validcode/pre-auth", {"account": email})
+        if not pre_auth.get("success"):
+            raise ApiError(pre_auth.get("errorMsg") or "Failed to pre-auth for verification")
+        token = pre_auth.get("token")
+        if not token:
+            raise ApiError("Missing pre-auth token from Supernote")
+        real_key = self._extract_real_key(token)
+        sign = self._hash256(email + real_key)
+        send_resp = self._api_call(
+            "/user/mail/validcode/send",
+            {"email": email, "timestamp": ts, "token": token, "sign": sign},
+        )
+        if not send_resp.get("success"):
+            raise ApiError(send_resp.get("errorMsg") or "Failed to send verification code")
+        valid_code_key = send_resp.get("validCodeKey")
+        if not valid_code_key:
+            raise ApiError("Missing validCodeKey from Supernote")
+        return {"email": email, "timestamp": ts, "valid_code_key": valid_code_key}
+
+    def login_with_verification_code(
+        self,
+        email: str,
+        verification_code: str,
+        valid_code_key: str,
+        timestamp: str,
+    ) -> str:
+        payload = {
+            "email": email,
+            "validCode": verification_code,
+            "validCodeKey": valid_code_key,
+            "timestamp": timestamp,
+            "browser": "Chrome107",
+            "equipment": "4",
+        }
+        data = self._api_call("/official/user/sms/login", payload)
+        if not data.get("success"):
+            raise AuthenticationError(data.get("errorMsg") or "Verification login failed")
+        self._access_token = data["token"]
+        return data["token"]
+
+
+def verify_supernote_code(
+    sn_email: str,
+    verification_code: str,
+    valid_code_key: str,
+    timestamp: str,
+) -> tuple[bool, str]:
+    client = SNClientWithCSRF()
+    try:
+        client.login_with_verification_code(
+            email=sn_email,
+            verification_code=verification_code,
+            valid_code_key=valid_code_key,
+            timestamp=timestamp,
+        )
+        _set_cached_access_token(sn_email, client._access_token)
+        return True, "Verification successful. Please resend your URL."
+    except Exception as e:
+        logger.error(f"Verification failed for {sn_email}: {e}\n{traceback.format_exc()}")
+        return False, f"Verification failed: {e}"
 
 
 def scrape_article_content(url: str) -> dict | None:
@@ -197,7 +439,7 @@ def classify_article_quality(article_text: str, api_key: str) -> bool:
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = genai.GenerativeModel('gemini-3-flash-preview')
         prompt = (
             "You are an expert content quality analyst. Classify this article: "
             "Is it substantive and thought-provoking, or is it primarily an advertisement/promotional/superficial? "
@@ -254,7 +496,7 @@ def reformat_to_markdown_gemini(
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = genai.GenerativeModel('gemini-3-flash-preview')
 
         prompt = (
             "You are an expert text reformatter. Convert the following article to clean, "
@@ -395,6 +637,11 @@ def convert_markdown_to_styled_html(
             display: block;
             margin: 1em 0;
         }}
+        a {{
+            color: black;
+            text-decoration: none;
+            font-weight: bold;
+        }}
     """
 
     logger.info(f"Converting Markdown to HTML. Font size: {font_size}")
@@ -480,14 +727,15 @@ def upload_to_supernote(
     sn_email: str,
     sn_password: str,
     sn_target_path: str = "/Inbox/SendToSupernote"
-) -> bool:
+) -> tuple[bool, str, dict | None]:
     """
     Upload a PDF file to Supernote cloud.
-    Returns True on success, False on failure.
+    Returns (success, message, verification_info).
+    verification_info is populated when a login verification code is required.
     """
     if not sn_email or not sn_password:
         logger.error("Supernote credentials not provided.")
-        return False
+        return False, "Supernote credentials not provided.", None
 
     if not sn_target_path.startswith("/"):
         sn_target_path = "/" + sn_target_path
@@ -498,13 +746,50 @@ def upload_to_supernote(
     pdf_path = Path(pdf_filepath)
     if not pdf_path.exists():
         logger.error(f"PDF file not found: {pdf_filepath}")
-        return False
+        return False, f"PDF file not found: {pdf_filepath}", None
 
     try:
-        client = SNClient()
-        logger.info(f"Logging in to Supernote cloud with email: {sn_email}")
-        client.login(sn_email, sn_password)
-        logger.info("Successfully logged in to Supernote cloud")
+        client = SNClientWithCSRF()
+        cached_token = _get_cached_access_token(sn_email)
+        if cached_token:
+            client._access_token = cached_token
+            try:
+                client.ls(directory="/")
+                logger.info("Using cached Supernote access token")
+            except Exception:
+                logger.info("Cached Supernote access token invalid; re-authenticating")
+                _clear_cached_access_token(sn_email)
+                client._access_token = None
+
+        if not client._access_token:
+            logger.info(f"Logging in to Supernote cloud with email: {sn_email}")
+            try:
+                client.login(sn_email, sn_password)
+            except AuthenticationError as auth_err:
+                if client._last_auth_error_code == "E1760":
+                    try:
+                        verification = client.request_email_verification_code(
+                            sn_email, client._last_login_timestamp
+                        )
+                        return (
+                            False,
+                            "Verification required. A code was sent to your email. "
+                            "Reply with /verify <code> and then resend the URL.",
+                            verification,
+                        )
+                    except Exception as code_err:
+                        logger.error(
+                            f"Verification required but sending code failed: {code_err}\n"
+                            f"{traceback.format_exc()}"
+                        )
+                        return (
+                            False,
+                            f"Verification required but sending code failed: {code_err}",
+                            None,
+                        )
+                return False, f"Supernote login failed: {auth_err}", None
+            logger.info("Successfully logged in to Supernote cloud")
+            _set_cached_access_token(sn_email, client._access_token)
 
         # Check if target folder exists, create if not
         path_exists = False
@@ -526,21 +811,21 @@ def upload_to_supernote(
 
         except Exception as e_folder:
             logger.error(f"Error checking/creating folder: {e_folder}\n{traceback.format_exc()}")
-            return False
+            return False, "Error checking/creating target folder on Supernote.", None
 
         if not path_exists:
             logger.error(f"Could not confirm folder: {sn_target_path}")
-            return False
+            return False, f"Could not confirm folder: {sn_target_path}", None
 
         # Upload the PDF
         logger.info(f"Uploading {pdf_path.name} to {sn_target_path}...")
         client.put(file_path=pdf_path, parent=sn_target_path)
         logger.info(f"Successfully uploaded {pdf_path.name}")
-        return True
+        return True, "Upload successful", None
 
     except Exception as e:
         logger.error(f"Error during Supernote upload: {e}\n{traceback.format_exc()}")
-        return False
+        return False, f"Error during Supernote upload: {e}", None
 
 
 def process_url(
@@ -551,25 +836,49 @@ def process_url(
     sn_target_path: str = "/Inbox/SendToSupernote",
     font_size: str = "14pt",
     skip_quality_check: bool = False
-) -> tuple[bool, str]:
+) -> dict:
     """
     Main processing pipeline: scrape URL, convert to PDF, upload to Supernote.
 
-    Returns a tuple of (success: bool, message: str).
+    Returns a dict with:
+        - success: bool
+        - message: str (error message if failed)
+        - verification: dict | None (if verification needed)
+        - title: str | None
+        - author: str | None
+        - filename: str | None
+        - target_path: str | None
+        - source_url: str
     """
     temp_dir = None
+    result = {
+        "success": False,
+        "message": "",
+        "verification": None,
+        "title": None,
+        "author": None,
+        "filename": None,
+        "target_path": sn_target_path,
+        "source_url": url,
+    }
+
     try:
         # Step 1: Scrape content
         logger.info(f"Processing URL: {url}")
         scraped = scrape_article_content(url)
         if not scraped:
-            return False, "Failed to scrape article content"
+            result["message"] = "Failed to scrape article content"
+            return result
+
+        result["title"] = scraped['title']
+        result["author"] = scraped['author']
 
         # Step 2: Quality check (optional)
         if not skip_quality_check:
             is_quality = classify_article_quality(scraped['plain_text'], gemini_api_key)
             if not is_quality:
-                return False, "Article classified as low-quality/advertisement"
+                result["message"] = "Article classified as low-quality/advertisement"
+                return result
 
         # Step 3: Reformat to Markdown
         markdown = reformat_to_markdown_gemini(
@@ -593,25 +902,35 @@ def process_url(
             )
 
         if not html_content:
-            return False, "Failed to generate HTML content"
+            result["message"] = "Failed to generate HTML content"
+            return result
 
         # Step 5: Generate PDF
         temp_dir = tempfile.mkdtemp(prefix="telegram_bot_pdf_")
         pdf_filename = generate_pdf_filename(scraped['title'], scraped['author'])
         pdf_path = os.path.join(temp_dir, pdf_filename)
+        result["filename"] = pdf_filename
 
         if not generate_pdf_from_html(html_content, pdf_path):
-            return False, "Failed to generate PDF"
+            result["message"] = "Failed to generate PDF"
+            return result
 
         # Step 6: Upload to Supernote
-        if not upload_to_supernote(pdf_path, sn_email, sn_password, sn_target_path):
-            return False, "Failed to upload to Supernote"
+        uploaded, upload_message, verification = upload_to_supernote(
+            pdf_path, sn_email, sn_password, sn_target_path
+        )
+        if not uploaded:
+            result["message"] = upload_message
+            result["verification"] = verification
+            return result
 
-        return True, f"Successfully processed and uploaded: {scraped['title']}"
+        result["success"] = True
+        return result
 
     except Exception as e:
         logger.error(f"Error processing URL {url}: {e}\n{traceback.format_exc()}")
-        return False, f"Error: {str(e)}"
+        result["message"] = f"Error: {str(e)}"
+        return result
 
     finally:
         # Cleanup temp directory

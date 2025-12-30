@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from config import get_config, validate_config
-from processing import process_url
+from processing import process_url, verify_supernote_code
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 URL_PATTERN = re.compile(
     r'https?://[^\s<>"{}|\\^`\[\]]+'
 )
+
+# Pending verification info per Telegram user
+pending_verifications: dict[int, dict] = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -55,9 +58,40 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- Any webpage with readable content\n\n"
         "Commands:\n"
         "/start - Show welcome message\n"
-        "/help - Show this help message"
+        "/help - Show this help message\n"
+        "/verify <code> - Verify Supernote login when prompted"
     )
     await update.message.reply_text(help_text)
+
+
+async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle verification code submissions."""
+    user_id = update.effective_user.id
+    if user_id not in pending_verifications:
+        await update.message.reply_text(
+            "No pending verification. Send a URL first, then use /verify if prompted."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /verify <code>")
+        return
+
+    code = context.args[0].strip()
+    info = pending_verifications[user_id]
+    config = get_config()
+
+    success, message = await asyncio.to_thread(
+        verify_supernote_code,
+        sn_email=info.get("email") or config["SN_EMAIL"],
+        verification_code=code,
+        valid_code_key=info["valid_code_key"],
+        timestamp=info["timestamp"],
+    )
+
+    if success:
+        pending_verifications.pop(user_id, None)
+    await update.message.reply_text(message)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -87,7 +121,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         config = get_config()
 
         # Run the processing pipeline in a thread to avoid blocking
-        success, message = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             process_url,
             url=url,
             gemini_api_key=config["GEMINI_API_KEY"],
@@ -98,10 +132,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             skip_quality_check=False
         )
 
-        if success:
-            await status_message.edit_text(f"Done! {message}")
+        if result.get("verification"):
+            pending_verifications[update.effective_user.id] = result["verification"]
+            await status_message.edit_text(result["message"])
+            return
+
+        if result["success"]:
+            # Format a nice success message
+            lines = ["Sent to Supernote!"]
+            if result.get("title"):
+                lines.append(f"Title: {result['title']}")
+            if result.get("author"):
+                lines.append(f"Author: {result['author']}")
+            if result.get("filename"):
+                lines.append(f"File: {result['filename']}")
+            if result.get("target_path"):
+                lines.append(f"Location: {result['target_path']}")
+
+            await status_message.edit_text("\n".join(lines))
         else:
-            await status_message.edit_text(f"Failed: {message}")
+            await status_message.edit_text(f"Failed: {result['message']}")
 
     except Exception as e:
         logger.error(f"Error processing URL {url}: {e}")
@@ -125,6 +175,7 @@ def main() -> None:
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("verify", verify_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Start the bot
