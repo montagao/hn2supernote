@@ -54,6 +54,8 @@ RAW_BLOCK_MARKERS = (
     "challenge-platform",
 )
 
+JINA_READER_PREFIX = "https://r.jina.ai/"
+
 # In-memory token cache keyed by email for the running bot process.
 _ACCESS_TOKEN_CACHE: dict[str, str] = {}
 _TOKEN_CACHE_PATH = Path(__file__).parent / "token_cache.json"
@@ -168,6 +170,60 @@ def _fetch_html_with_httpx(url: str) -> str | None:
         return resp.text
     except Exception as e:
         logger.warning(f"HTTP fetch failed for {url}: {e}")
+        return None
+
+
+def _is_substack_url(url: str) -> bool:
+    """Check if URL is a Substack article."""
+    return "substack.com" in url.lower()
+
+
+def _fetch_via_jina_reader(url: str) -> dict | None:
+    """
+    Fetch article content via Jina Reader (r.jina.ai).
+    Returns clean markdown content for Substack and other supported sites.
+
+    Returns a dict with:
+        - markdown: The clean markdown content
+        - title: Extracted title (if available)
+    Returns None on failure.
+    """
+    jina_url = f"{JINA_READER_PREFIX}{url}"
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "text/plain",
+    }
+
+    try:
+        logger.info(f"Fetching via Jina Reader: {jina_url}")
+        resp = httpx.get(jina_url, headers=headers, follow_redirects=True, timeout=60.0)
+        resp.raise_for_status()
+
+        content = resp.text
+        if not content or len(content) < MIN_CONTENT_LENGTH:
+            logger.warning(f"Jina Reader returned insufficient content (len={len(content) if content else 0})")
+            return None
+
+        # Jina returns markdown with title as first line (usually # Title)
+        title = None
+        lines = content.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('# '):
+                title = line[2:].strip()
+                break
+            elif line.startswith('Title: '):
+                title = line[7:].strip()
+                break
+
+        logger.info(f"Jina Reader success. Title: '{title}', content_len: {len(content)}")
+        return {
+            "markdown": content,
+            "title": title,
+        }
+
+    except Exception as e:
+        logger.warning(f"Jina Reader fetch failed for {url}: {e}")
         return None
 
 
@@ -953,33 +1009,56 @@ def process_url(
     try:
         # Step 1: Scrape content
         logger.info(f"Processing URL: {url}")
-        scraped = scrape_article_content(url)
-        if not scraped:
-            result["message"] = "Failed to scrape article content"
-            return result
 
-        result["title"] = scraped['title']
-        result["author"] = scraped['author']
+        # For Substack URLs, try Jina Reader first for clean content
+        jina_result = None
+        if _is_substack_url(url):
+            logger.info(f"Detected Substack URL, trying Jina Reader: {url}")
+            jina_result = _fetch_via_jina_reader(url)
 
-        # Step 2: Reformat to Markdown
-        markdown = reformat_to_markdown_gemini(
-            scraped['plain_text'],
-            url,
-            scraped['extracted_date'],
-            scraped['image_urls'],
-            gemini_api_key
-        )
+        if jina_result:
+            # Jina Reader returned clean markdown, use it directly
+            logger.info("Using Jina Reader content for Substack article")
+            result["title"] = jina_result.get("title") or "Untitled Article"
+            result["author"] = None  # Jina doesn't always extract author
+
+            # Use Jina markdown directly, add metadata
+            markdown = jina_result["markdown"]
+            markdown += f"\n\n---\nOriginal article: [{url}]({url})"
+            scraped = None  # Mark that we used Jina path
+        else:
+            # Regular scraping path
+            scraped = scrape_article_content(url)
+            if not scraped:
+                result["message"] = "Failed to scrape article content"
+                return result
+
+            result["title"] = scraped['title']
+            result["author"] = scraped['author']
+
+            # Step 2: Reformat to Markdown
+            markdown = reformat_to_markdown_gemini(
+                scraped['plain_text'],
+                url,
+                scraped['extracted_date'],
+                scraped['image_urls'],
+                gemini_api_key
+            )
 
         if not markdown:
-            # Fallback: use plain HTML
-            logger.warning("Markdown reformatting failed. Using cleaned HTML fallback.")
-            html_content = scraped['html_content']
+            # Fallback: use plain HTML (only available if we used regular scraping)
+            if scraped:
+                logger.warning("Markdown reformatting failed. Using cleaned HTML fallback.")
+                html_content = scraped['html_content']
+            else:
+                result["message"] = "Failed to get article content"
+                return result
         else:
             # Step 3: Convert Markdown to styled HTML
             html_content = convert_markdown_to_styled_html(
                 markdown,
                 font_size=font_size,
-                document_title=scraped['title']
+                document_title=result["title"] or "Article"
             )
 
         if not html_content:
@@ -988,7 +1067,7 @@ def process_url(
 
         # Step 4: Generate PDF
         temp_dir = tempfile.mkdtemp(prefix="telegram_bot_pdf_")
-        pdf_filename = generate_pdf_filename(scraped['title'], scraped['author'])
+        pdf_filename = generate_pdf_filename(result["title"], result["author"])
         pdf_path = os.path.join(temp_dir, pdf_filename)
         result["filename"] = pdf_filename
 
