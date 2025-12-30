@@ -178,6 +178,12 @@ def _is_substack_url(url: str) -> bool:
     return "substack.com" in url.lower()
 
 
+def _is_twitter_url(url: str) -> bool:
+    """Check if URL is a Twitter/X post."""
+    lower = url.lower()
+    return "twitter.com" in lower or "x.com" in lower
+
+
 def _fetch_via_jina_reader(url: str) -> dict | None:
     """
     Fetch article content via Jina Reader (r.jina.ai).
@@ -1010,15 +1016,15 @@ def process_url(
         # Step 1: Scrape content
         logger.info(f"Processing URL: {url}")
 
-        # For Substack URLs, try Jina Reader first for clean content
+        # For Substack/Twitter URLs, try Jina Reader first for clean content
         jina_result = None
-        if _is_substack_url(url):
-            logger.info(f"Detected Substack URL, trying Jina Reader: {url}")
+        if _is_substack_url(url) or _is_twitter_url(url):
+            logger.info(f"Detected Substack/Twitter URL, trying Jina Reader: {url}")
             jina_result = _fetch_via_jina_reader(url)
 
         if jina_result:
             # Jina Reader returned clean markdown, use it directly
-            logger.info("Using Jina Reader content for Substack article")
+            logger.info("Using Jina Reader content")
             result["title"] = jina_result.get("title") or "Untitled Article"
             result["author"] = None  # Jina doesn't always extract author
 
