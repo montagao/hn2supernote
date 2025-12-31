@@ -1035,21 +1035,33 @@ def process_url(
         else:
             # Regular scraping path
             scraped = scrape_article_content(url)
+
+            # If scraping failed (likely JS block), try Jina Reader as fallback
             if not scraped:
-                result["message"] = "Failed to scrape article content"
-                return result
+                logger.info(f"Scraping failed, trying Jina Reader as fallback: {url}")
+                jina_result = _fetch_via_jina_reader(url)
+                if jina_result:
+                    logger.info("Jina Reader fallback successful")
+                    result["title"] = jina_result.get("title") or "Untitled Article"
+                    result["author"] = None
+                    markdown = jina_result["markdown"]
+                    markdown += f"\n\n---\nOriginal article: [{url}]({url})"
+                    scraped = None
+                else:
+                    result["message"] = "Failed to scrape article content"
+                    return result
+            else:
+                result["title"] = scraped['title']
+                result["author"] = scraped['author']
 
-            result["title"] = scraped['title']
-            result["author"] = scraped['author']
-
-            # Step 2: Reformat to Markdown
-            markdown = reformat_to_markdown_gemini(
-                scraped['plain_text'],
-                url,
-                scraped['extracted_date'],
-                scraped['image_urls'],
-                gemini_api_key
-            )
+                # Step 2: Reformat to Markdown
+                markdown = reformat_to_markdown_gemini(
+                    scraped['plain_text'],
+                    url,
+                    scraped['extracted_date'],
+                    scraped['image_urls'],
+                    gemini_api_key
+                )
 
         if not markdown:
             # Fallback: use plain HTML (only available if we used regular scraping)
