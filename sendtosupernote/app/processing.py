@@ -7,7 +7,6 @@ import os
 import google.generativeai as genai
 from datetime import datetime # For reformat_to_markdown_gemini publish_date handling
 import markdown2
-from weasyprint import HTML as WeasyHTML # Renamed to avoid conflict if HTML is used elsewhere
 from bs4 import BeautifulSoup # Added for fallback title extraction
 import re
 from datetime import date as datetime_date # Alias to avoid confusion with datetime module
@@ -21,6 +20,58 @@ logger = logging.getLogger(__name__)
 # Min length for content to be considered valid after extraction
 MIN_CONTENT_LENGTH = 150
 HTML_SNIPPET_LENGTH = 1000 # For logging
+
+
+def _extract_text_with_image_placeholders(soup: BeautifulSoup, base_url: str) -> str:
+    """
+    Extract text from a BeautifulSoup object while preserving image positions
+    as Markdown-style placeholders. This ensures images stay in the correct
+    order relative to the surrounding text.
+
+    Returns plain text with embedded ![](image_url) placeholders.
+    """
+    result_parts = []
+
+    def process_element(element):
+        """Recursively process elements, preserving image positions."""
+        if element.name is None:  # NavigableString (text node)
+            text = str(element).strip()
+            if text:
+                result_parts.append(text)
+        elif element.name == 'img':
+            src = element.get('src')
+            if src:
+                absolute_src = urljoin(base_url, src)
+                alt = element.get('alt', '')
+                result_parts.append(f'\n\n![{alt}]({absolute_src})\n\n')
+        elif element.name in ['script', 'style', 'noscript']:
+            pass  # Skip these elements entirely
+        elif element.name in ['br']:
+            result_parts.append('\n')
+        elif element.name in ['p', 'div', 'article', 'section', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'li']:
+            # Block-level elements: process children and add newlines
+            for child in element.children:
+                process_element(child)
+            result_parts.append('\n\n')
+        else:
+            # Inline elements: just process children
+            for child in element.children:
+                process_element(child)
+
+    # Process all children of the soup body (or the soup itself)
+    body = soup.find('body') or soup
+    for child in body.children:
+        process_element(child)
+
+    # Clean up excessive whitespace while preserving image placeholders
+    text = ''.join(result_parts)
+    # Normalize multiple newlines to max 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Clean up spaces around image placeholders
+    text = re.sub(r' +', ' ', text)
+
+    return text.strip()
+
 
 def scrape_article_content(url: str, raw_html_from_extension: str | None = None):
     """
@@ -50,11 +101,11 @@ def scrape_article_content(url: str, raw_html_from_extension: str | None = None)
 
         try:
             soup = BeautifulSoup(html_source_to_process, 'html.parser')
-            
-            # Extract plain text from the Readability HTML
-            plain_text = soup.get_text(separator='\n', strip=True)
+
+            # Extract plain text WITH image placeholders to preserve ordering
+            plain_text = _extract_text_with_image_placeholders(soup, url)
             if plain_text:
-                logger.info(f"Extracted plain text from extension HTML. Length: {len(plain_text)}")
+                logger.info(f"Extracted plain text with image placeholders from extension HTML. Length: {len(plain_text)}")
             else:
                 logger.warning(f"Could not extract plain text from extension HTML for {url}")
 
@@ -70,8 +121,8 @@ def scrape_article_content(url: str, raw_html_from_extension: str | None = None)
                     logger.info(f"Extracted title from H2 in extension HTML: '{title}'")
                 else:
                     logger.info(f"No H1 or H2 found for title in extension HTML for {url}. Title remains '{title}'.")
-            
-            # Extract image URLs from Readability HTML
+
+            # Extract image URLs from Readability HTML (for reference, positions are now in plain_text)
             try:
                 images = soup.find_all('img')
                 for img in images:
@@ -244,10 +295,18 @@ def scrape_article_content(url: str, raw_html_from_extension: str | None = None)
             escaped_plain_text_as_html = plain_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br />\n')
             cleaned_html_content = f"<!DOCTYPE html><html><head><title>{escaped_title}</title></head><body><h1>{escaped_title}</h1><div>{escaped_plain_text_as_html}</div></body></html>"
 
-        # After cleaned_html_content is finalized, extract images from it
+        # After cleaned_html_content is finalized, extract text with image placeholders
+        # This ensures images are in the correct position relative to surrounding text
         if cleaned_html_content:
             try:
                 soup_for_images = BeautifulSoup(cleaned_html_content, 'html.parser')
+                # Re-extract plain_text with image placeholders for proper ordering
+                plain_text_with_images = _extract_text_with_image_placeholders(soup_for_images, url)
+                if plain_text_with_images and len(plain_text_with_images) >= MIN_CONTENT_LENGTH:
+                    plain_text = plain_text_with_images
+                    logger.info(f"Re-extracted plain text with image placeholders. Length: {len(plain_text)}")
+
+                # Also collect image URLs for reference
                 imgs = soup_for_images.find_all('img')
                 for img_tag in imgs:
                     src = img_tag.get('src')
@@ -317,7 +376,7 @@ def classify_article_quality(article_text: str) -> bool:
         return True
 
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash-preview-04-17') # Using a common model, adjust if needed
+        model = genai.GenerativeModel('gemini-3-flash-preview') # Using a common model, adjust if needed
         prompt = (
             "You are an expert content quality analyst. Your task is to classify an article based on its content. "
             "Determine if the article is a substantive, thought-provoking piece that offers insights, analysis, or in-depth information. "
@@ -359,11 +418,12 @@ def classify_article_quality(article_text: str) -> bool:
 def reformat_to_markdown_gemini(article_text: str, article_url: str, article_publish_date_str: str | None, image_urls: list[str] | None = None) -> str | None:
     """
     Reformats article text to Markdown using Gemini API, adds date/URL near top, and appends source URL.
-    Optionally includes image URLs in the Markdown.
+    The article_text may contain inline image placeholders like ![alt](url) which should be preserved
+    in their original positions relative to the surrounding text.
     Returns Markdown string or None if an error occurs or API key is missing.
     Assumes genai.configure(api_key=os.getenv("GEMINI_API_KEY")) has been called elsewhere.
     article_publish_date_str should be a string representation of the date if available.
-    image_urls is an optional list of absolute image URLs to include.
+    image_urls is kept for backward compatibility but images are now embedded inline in article_text.
     """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -375,7 +435,7 @@ def reformat_to_markdown_gemini(article_text: str, article_url: str, article_pub
         return None
 
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash-preview-04-17')
+        model = genai.GenerativeModel('gemini-3-flash-preview')
         instructional_prompt = (
             "You are an expert text reformatter. Your task is to convert the following article content into clean, readable, and well-structured Markdown. "
             "Focus on preserving the original meaning and structure (headings, paragraphs, lists, blockquotes, code blocks if any) as much as possible. "
@@ -383,24 +443,19 @@ def reformat_to_markdown_gemini(article_text: str, article_url: str, article_pub
             "Ensure that the Markdown is suitable for direct conversion to HTML and then to PDF.\n\n"
             "Make sure to remove any obvious ads or promotional material. "
             "Make sure to generate a heading for the article based on the content. "
+            "\n\nIMPORTANT: The article content contains image placeholders in Markdown format like ![alt text](image_url). "
+            "These images are already positioned in the correct location relative to the surrounding text. "
+            "You MUST preserve these image placeholders in their exact positions. Do not move, reorder, or remove them "
+            "unless they appear to be advertisements or decorative elements unrelated to the article content. "
         )
 
-        if image_urls:
-            instructional_prompt += (
-                "\n\nThe following image URLs were extracted from the article. "
-                "Where appropriate and relevant to the content, please include them in the Markdown using the syntax '![](image_url)'. "
-                "Try to place them near the text they illustrate. If the context for an image is unclear, you can omit it or place it at a sensible break. "
-                "Do not include all images if it makes the article cluttered; use your judgment. "
-                "List of available image URLs:\n"
-            )
-            for img_url in image_urls:
-                instructional_prompt += f"- {img_url}\n"
-        
         instructional_prompt += "\nArticle Content to Reformat:\n"
 
         contents_for_gemini = [instructional_prompt, article_text]
 
-        logger.info(f"Sending article of length {len(article_text)} to Gemini for Markdown reformatting. {len(image_urls) if image_urls else 'No'} images provided.")
+        # Count embedded images for logging
+        embedded_image_count = article_text.count('![')
+        logger.info(f"Sending article of length {len(article_text)} to Gemini for Markdown reformatting. {embedded_image_count} embedded images found.")
         response = model.generate_content(contents_for_gemini)
 
         if not response.candidates:
@@ -546,7 +601,7 @@ def convert_markdown_to_styled_html(markdown_string: str, font_size: str = "14pt
 
 def generate_pdf_from_html(html_content: str, output_pdf_path: str) -> bool:
     """
-    Convert final HTML content to PDF using WeasyPrint.
+    Convert final HTML content to PDF using Playwright (Chromium).
     output_pdf_path is the full path where the PDF should be saved.
     """
     if not html_content:
@@ -554,8 +609,18 @@ def generate_pdf_from_html(html_content: str, output_pdf_path: str) -> bool:
         return False
 
     try:
-        logger.info(f"Generating PDF: {output_pdf_path}")
-        WeasyHTML(string=html_content).write_pdf(output_pdf_path)
+        logger.info(f"Generating PDF with Playwright: {output_pdf_path}")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html_content, wait_until="networkidle")
+            page.pdf(
+                path=output_pdf_path,
+                format="A4",
+                margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"},
+                print_background=True
+            )
+            browser.close()
         logger.info(f"PDF generated successfully: {output_pdf_path}")
         return True
     except Exception as e:
