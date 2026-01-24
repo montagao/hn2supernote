@@ -33,9 +33,9 @@ class TestLoginCommand:
 
     def test_login_success(self, runner: CliRunner) -> None:
         """Test successful login."""
-        with patch("supernote_uploader.cli.get_client") as mock_get_client:
+        with patch("supernote_uploader.cli.SupernoteClient") as mock_client_class:
             mock_client = MagicMock()
-            mock_get_client.return_value = mock_client
+            mock_client_class.return_value = mock_client
 
             result = runner.invoke(
                 main,
@@ -48,9 +48,9 @@ class TestLoginCommand:
 
     def test_login_with_verification(self, runner: CliRunner) -> None:
         """Test login with email verification."""
-        with patch("supernote_uploader.cli.get_client") as mock_get_client:
+        with patch("supernote_uploader.cli.SupernoteClient") as mock_client_class:
             mock_client = MagicMock()
-            mock_get_client.return_value = mock_client
+            mock_client_class.return_value = mock_client
             mock_client.login.side_effect = VerificationRequiredError(
                 "Verification required",
                 verification_context={
@@ -72,9 +72,9 @@ class TestLoginCommand:
 
     def test_login_failure(self, runner: CliRunner) -> None:
         """Test login failure."""
-        with patch("supernote_uploader.cli.get_client") as mock_get_client:
+        with patch("supernote_uploader.cli.SupernoteClient") as mock_client_class:
             mock_client = MagicMock()
-            mock_get_client.return_value = mock_client
+            mock_client_class.return_value = mock_client
             mock_client.login.side_effect = AuthenticationError("Invalid credentials")
 
             result = runner.invoke(
@@ -97,7 +97,7 @@ class TestUploadCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
             mock_client.upload_many.return_value = [
                 UploadResult(
                     success=True,
@@ -124,7 +124,7 @@ class TestUploadCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
             mock_client.upload_many.return_value = [
                 UploadResult(
                     success=True,
@@ -148,7 +148,7 @@ class TestUploadCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
             mock_client.upload_many.return_value = [
                 UploadResult(
                     success=True,
@@ -176,7 +176,7 @@ class TestUploadCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
             mock_client.upload_many.return_value = [
                 UploadResult(
                     success=True,
@@ -207,7 +207,7 @@ class TestLsCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
             mock_client.list_folder.return_value = [
                 FolderInfo(id=1, name="Documents", path="/Documents"),
                 FolderInfo(id=2, name="Inbox", path="/Inbox"),
@@ -226,7 +226,7 @@ class TestLsCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
             mock_client.list_folder.return_value = [
                 FileInfo(id=1, name="article.pdf", path="/Inbox/article.pdf", size=2048),
             ]
@@ -242,7 +242,7 @@ class TestLsCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
             mock_client.list_folder.return_value = []
 
             result = runner.invoke(main, ["ls", "/Empty"])
@@ -259,7 +259,7 @@ class TestMkdirCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
 
             result = runner.invoke(main, ["mkdir", "/Inbox/Articles"])
 
@@ -272,7 +272,7 @@ class TestMkdirCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
 
             result = runner.invoke(main, ["mkdir", "/A/B/C", "--parents"])
 
@@ -284,7 +284,7 @@ class TestMkdirCommand:
         with patch("supernote_uploader.cli.get_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.is_authenticated = True
-            mock_get_client.return_value = mock_client
+            mock_get_client.return_value = (mock_client, "test@example.com")
             mock_client.mkdir.side_effect = Exception("Folder already exists")
 
             result = runner.invoke(main, ["mkdir", "/Existing"])

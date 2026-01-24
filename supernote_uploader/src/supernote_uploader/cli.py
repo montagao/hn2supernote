@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import sys
 from pathlib import Path
 
@@ -19,21 +21,59 @@ from supernote_uploader import (
 DEFAULT_TOKEN_CACHE = Path.home() / ".supernote" / "token_cache.json"
 
 
+def _load_last_email(cache_path: Path) -> str | None:
+    """Load the last used email from the token cache."""
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text())
+        return data.get("_last_email")
+    except Exception:
+        return None
+
+
+def _save_last_email(cache_path: Path, email: str) -> None:
+    """Save the last used email to the token cache."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(cache_path.read_text()) if cache_path.exists() else {}
+        data["_last_email"] = email
+        cache_path.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass  # Non-critical, ignore errors
+
+
 def get_client(
     email: str | None = None,
     password: str | None = None,
     token_cache: Path | None = None,
-) -> SupernoteClient:
-    """Create and authenticate a SupernoteClient."""
+) -> tuple[SupernoteClient, str | None]:
+    """Create a SupernoteClient, attempting to use cached credentials.
+
+    Returns (client, email) where email is the resolved email (from cache if not provided).
+    """
     cache_path = token_cache or DEFAULT_TOKEN_CACHE
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-    return SupernoteClient(
-        email=email,
+    # If no email provided, try to get the last used email
+    resolved_email = email
+    if not resolved_email:
+        resolved_email = _load_last_email(cache_path)
+
+    client = SupernoteClient(
+        email=resolved_email,
         password=password,
-        auto_login=bool(email and password),
+        auto_login=False,  # We'll handle login manually to check cached token
         token_cache_path=cache_path,
     )
+
+    # Try to authenticate with cached token if we have an email
+    if resolved_email:
+        with contextlib.suppress(AuthenticationError):
+            # This will attempt to use cached token
+            client.login(resolved_email, password or "")
+
+    return client, resolved_email
 
 
 @click.group()
@@ -56,15 +96,23 @@ def main() -> None:
 )
 def login(email: str, password: str, token_cache: Path | None) -> None:
     """Login to Supernote Cloud and cache credentials."""
+    cache_path = token_cache or DEFAULT_TOKEN_CACHE
     try:
-        client = get_client(email, password, token_cache)
+        client = SupernoteClient(
+            email=email,
+            password=password,
+            auto_login=False,
+            token_cache_path=cache_path,
+        )
         try:
             client.login(email, password)
+            _save_last_email(cache_path, email)
             click.echo(click.style("Login successful!", fg="green"))
         except VerificationRequiredError as e:
             click.echo("Email verification required. A code was sent to your email.")
             code = click.prompt("Enter verification code")
             client.verify(code, e.verification_context)
+            _save_last_email(cache_path, email)
             click.echo(click.style("Verification successful!", fg="green"))
         finally:
             client.close()
@@ -119,21 +167,24 @@ def upload(
 
         supernote upload book.epub -f /Books
     """
+    cache_path = token_cache or DEFAULT_TOKEN_CACHE
     try:
-        client = get_client(email, password, token_cache)
+        client, resolved_email = get_client(email, password, cache_path)
 
-        # Try to use cached token first, prompt for credentials if needed
+        # If not authenticated, prompt for credentials
         if not client.is_authenticated:
-            if not email:
-                email = click.prompt("Email")
+            if not resolved_email:
+                resolved_email = click.prompt("Email")
             if not password:
                 password = click.prompt("Password", hide_input=True)
             try:
-                client.login(email, password)
+                client.login(resolved_email, password)
+                _save_last_email(cache_path, resolved_email)
             except VerificationRequiredError as e:
                 click.echo("Email verification required. A code was sent to your email.")
                 code = click.prompt("Enter verification code")
                 client.verify(code, e.verification_context)
+                _save_last_email(cache_path, resolved_email)
 
         # Upload files
         results = client.upload_many(
@@ -207,15 +258,17 @@ def list_folder(
 
         supernote ls /Documents/Articles
     """
+    cache_path = token_cache or DEFAULT_TOKEN_CACHE
     try:
-        client = get_client(email, password, token_cache)
+        client, resolved_email = get_client(email, password, cache_path)
 
         if not client.is_authenticated:
-            if not email:
-                email = click.prompt("Email")
+            if not resolved_email:
+                resolved_email = click.prompt("Email")
             if not password:
                 password = click.prompt("Password", hide_input=True)
-            client.login(email, password)
+            client.login(resolved_email, password)
+            _save_last_email(cache_path, resolved_email)
 
         items = client.list_folder(path)
 
@@ -271,15 +324,17 @@ def mkdir(
 
         supernote mkdir /Documents/Work/Projects --parents
     """
+    cache_path = token_cache or DEFAULT_TOKEN_CACHE
     try:
-        client = get_client(email, password, token_cache)
+        client, resolved_email = get_client(email, password, cache_path)
 
         if not client.is_authenticated:
-            if not email:
-                email = click.prompt("Email")
+            if not resolved_email:
+                resolved_email = click.prompt("Email")
             if not password:
                 password = click.prompt("Password", hide_input=True)
-            client.login(email, password)
+            client.login(resolved_email, password)
+            _save_last_email(cache_path, resolved_email)
 
         client.mkdir(path, parents=parents)
         click.echo(click.style(f"Created folder: {path}", fg="green"))
