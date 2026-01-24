@@ -40,7 +40,7 @@ class TestLogin:
         """Test that login without credentials raises AuthenticationError."""
         client = SupernoteClient(auto_login=False)
 
-        with pytest.raises(AuthenticationError, match="Email and password are required"):
+        with pytest.raises(AuthenticationError, match="Email is required"):
             client.login()
 
     def test_login_failure_raises_authentication_error(

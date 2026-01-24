@@ -70,8 +70,8 @@ def get_client(
     # Try to authenticate with cached token if we have an email
     if resolved_email:
         with contextlib.suppress(AuthenticationError):
-            # This will attempt to use cached token
-            client.login(resolved_email, password or "")
+            # This will attempt to use cached token (password not needed if token valid)
+            client.login(resolved_email, password)
 
     return client, resolved_email
 

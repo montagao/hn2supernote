@@ -150,7 +150,8 @@ class SupernoteClient:
 
         Args:
             email: Account email (uses constructor value if not provided)
-            password: Account password (uses constructor value if not provided)
+            password: Account password (uses constructor value if not provided).
+                     Not required if a valid cached token exists.
 
         Returns:
             Access token on success
@@ -162,15 +163,16 @@ class SupernoteClient:
         email = email or self._email
         password = password or self._password
 
-        if not email or not password:
-            raise AuthenticationError("Email and password are required")
+        if not email:
+            raise AuthenticationError("Email is required")
 
         self._email = email
-        self._password = password
+        if password:
+            self._password = password
 
         client = self._get_client()
 
-        # Try cached token first
+        # Try cached token first (doesn't require password)
         cached_token = self._get_cached_token(email)
         if cached_token:
             client._access_token = cached_token
@@ -182,6 +184,10 @@ class SupernoteClient:
                 logger.info("Cached token invalid; re-authenticating")
                 self._clear_cached_token(email)
                 client._access_token = None
+
+        # Need password for fresh login
+        if not password:
+            raise AuthenticationError("Password is required (no valid cached token)")
 
         # Perform login
         try:
