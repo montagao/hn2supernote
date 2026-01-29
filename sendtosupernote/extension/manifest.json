@@ -6,11 +6,15 @@
   "permissions": [
     "activeTab",
     "storage",
-    "notifications" 
+    "notifications",
+    "contextMenus"
   ],
   "host_permissions": [
-    "<all_urls>" 
+    "<all_urls>"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "Send to Supernote",
@@ -22,6 +26,9 @@
     }
   },
   "options_page": "options.html",
+  "chrome_url_overrides": {
+    "newtab": "dashboard.html"
+  },
   "icons": {
     "16": "icon16.png",
     "32": "icon32.png",
