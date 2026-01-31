@@ -5,6 +5,9 @@ const STORAGE_KEYS = {
     AUTH_TOKEN: 'authToken'
 };
 
+// Track current tab for toast notifications
+let currentTabId = null;
+
 // Create context menu on install
 chrome.runtime.onInstalled.addListener(() => {
     chrome.contextMenus.create({
@@ -20,10 +23,10 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
     // If clicked on a link, use the link URL; otherwise use the current page
     const targetUrl = info.linkUrl || info.pageUrl;
-    const targetTabId = tab?.id;
+    currentTabId = tab?.id;
 
-    if (!targetTabId) {
-        showNotification('Error', 'Could not get current tab.');
+    if (!currentTabId) {
+        showNotification('error', 'Error', 'Could not get current tab.');
         return;
     }
 
@@ -32,7 +35,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     try {
         config = await chrome.storage.local.get([STORAGE_KEYS.BACKEND_URL, STORAGE_KEYS.AUTH_TOKEN]);
     } catch (error) {
-        showNotification('Error', `Error loading configuration: ${error.message}`);
+        showNotification('error', 'Error', `Error loading configuration: ${error.message}`);
         return;
     }
 
@@ -40,7 +43,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const authToken = config[STORAGE_KEYS.AUTH_TOKEN];
 
     if (!backendUrl || !authToken) {
-        showNotification('Configuration Required', 'Backend URL or Auth Token not set. Please configure in extension options.');
+        showNotification('error', 'Configuration Required', 'Backend URL or Auth Token not set. Please configure in extension options.');
         chrome.runtime.openOptionsPage();
         return;
     }
@@ -50,12 +53,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         await sendUrlToBackend(info.linkUrl, backendUrl, authToken);
     } else {
         // For page context, extract content from current tab
-        await sendCurrentPageToBackend(targetTabId, tab, backendUrl, authToken);
+        await sendCurrentPageToBackend(currentTabId, tab, backendUrl, authToken);
     }
 });
 
 async function sendUrlToBackend(url, backendUrl, authToken) {
-    showNotification('Sending...', `Sending ${truncateUrl(url)} to Supernote`);
+    showNotification('info', 'Sending to Supernote', truncateUrl(url));
 
     const payload = {
         url: url,
@@ -75,18 +78,18 @@ async function sendUrlToBackend(url, backendUrl, authToken) {
         const responseData = await response.json();
 
         if (response.ok) {
-            showNotification('Success', responseData.message || 'Article queued!');
+            showNotification('success', 'Sent to Supernote', responseData.message || 'Article queued!');
         } else {
             const errorMsg = responseData.detail || response.statusText || 'Unknown error';
-            showNotification('Error', errorMsg);
+            showNotification('error', 'Failed to Send', errorMsg);
         }
     } catch (error) {
-        showNotification('Error', `Network error: ${error.message}`);
+        showNotification('error', 'Network Error', error.message);
     }
 }
 
 async function sendCurrentPageToBackend(tabId, tab, backendUrl, authToken) {
-    showNotification('Processing...', 'Extracting page content...');
+    showNotification('info', 'Processing', 'Extracting page content...');
 
     let extractedHtmlResponse;
     try {
@@ -95,11 +98,11 @@ async function sendCurrentPageToBackend(tabId, tab, backendUrl, authToken) {
             const errorDetail = extractedHtmlResponse
                 ? (extractedHtmlResponse.error || 'Content script indicated failure.')
                 : 'No response from content script.';
-            showNotification('Error', `Could not extract HTML: ${errorDetail}`);
+            showNotification('error', 'Extraction Failed', errorDetail);
             return;
         }
     } catch (error) {
-        showNotification('Error', `Error extracting content: ${error.message}. Try reloading the page.`);
+        showNotification('error', 'Extraction Error', `${error.message}. Try reloading the page.`);
         return;
     }
 
@@ -110,7 +113,7 @@ async function sendCurrentPageToBackend(tabId, tab, backendUrl, authToken) {
     };
 
     try {
-        showNotification('Sending...', 'Sending to backend...');
+        showNotification('info', 'Sending', 'Uploading to Supernote...');
         const response = await fetch(`${backendUrl}/api/queue_article`, {
             method: 'POST',
             headers: {
@@ -123,23 +126,43 @@ async function sendCurrentPageToBackend(tabId, tab, backendUrl, authToken) {
         const responseData = await response.json();
 
         if (response.ok) {
-            showNotification('Success', responseData.message || 'Article queued!');
+            showNotification('success', 'Sent to Supernote', responseData.message || 'Article queued!');
         } else {
             const errorMsg = responseData.detail || response.statusText || 'Unknown error';
-            showNotification('Error', errorMsg);
+            showNotification('error', 'Failed to Send', errorMsg);
         }
     } catch (error) {
-        showNotification('Error', `Network error: ${error.message}`);
+        showNotification('error', 'Network Error', error.message);
     }
 }
 
-function showNotification(title, message) {
-    chrome.notifications.create({
-        type: 'basic',
-        iconUrl: 'icon128.png',
-        title: `Send to Supernote: ${title}`,
-        message: message
-    });
+async function showNotification(type, title, message) {
+    if (currentTabId) {
+        try {
+            await chrome.tabs.sendMessage(currentTabId, {
+                action: 'showToast',
+                type: type,
+                title: title,
+                message: message
+            });
+        } catch (error) {
+            // Fallback to Chrome notification if content script not available
+            chrome.notifications.create({
+                type: 'basic',
+                iconUrl: 'icon128.png',
+                title: `Supernote: ${title}`,
+                message: message
+            });
+        }
+    } else {
+        // Fallback to Chrome notification
+        chrome.notifications.create({
+            type: 'basic',
+            iconUrl: 'icon128.png',
+            title: `Supernote: ${title}`,
+            message: message
+        });
+    }
 }
 
 function truncateUrl(url, maxLength = 50) {
