@@ -3,56 +3,63 @@
 // Toast notification system
 const TOAST_STYLES = `
   .supernote-toast-container {
-    position: fixed;
-    top: 20px;
-    right: 20px;
-    z-index: 2147483647;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    position: fixed !important;
+    top: 20px !important;
+    right: 20px !important;
+    left: auto !important;
+    bottom: auto !important;
+    z-index: 2147483647 !important;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+    pointer-events: none !important;
   }
   .supernote-toast {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 14px 18px;
-    margin-bottom: 10px;
-    border-radius: 8px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    font-size: 14px;
-    line-height: 1.4;
-    max-width: 360px;
-    animation: supernote-slide-in 0.3s ease-out;
-    transition: opacity 0.3s ease-out, transform 0.3s ease-out;
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+    padding: 14px 18px !important;
+    margin-bottom: 10px !important;
+    border-radius: 8px !important;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3) !important;
+    font-size: 14px !important;
+    line-height: 1.4 !important;
+    max-width: 360px !important;
+    min-width: 280px !important;
+    animation: supernote-slide-in 0.3s ease-out !important;
+    transition: opacity 0.3s ease-out, transform 0.3s ease-out !important;
+    pointer-events: auto !important;
+    opacity: 1 !important;
+    visibility: visible !important;
   }
   .supernote-toast.hiding {
-    opacity: 0;
-    transform: translateX(100%);
+    opacity: 0 !important;
+    transform: translateX(100%) !important;
   }
   .supernote-toast-success {
-    background: #065f46;
-    color: white;
+    background: #065f46 !important;
+    color: white !important;
   }
   .supernote-toast-error {
-    background: #991b1b;
-    color: white;
+    background: #991b1b !important;
+    color: white !important;
   }
   .supernote-toast-info {
-    background: #1e40af;
-    color: white;
+    background: #1e40af !important;
+    color: white !important;
   }
   .supernote-toast-icon {
-    font-size: 18px;
-    flex-shrink: 0;
+    font-size: 18px !important;
+    flex-shrink: 0 !important;
   }
   .supernote-toast-content {
-    flex: 1;
+    flex: 1 !important;
   }
   .supernote-toast-title {
-    font-weight: 600;
-    margin-bottom: 2px;
+    font-weight: 600 !important;
+    margin-bottom: 2px !important;
   }
   .supernote-toast-message {
-    opacity: 0.9;
-    font-size: 13px;
+    opacity: 0.9 !important;
+    font-size: 13px !important;
   }
   @keyframes supernote-slide-in {
     from {
@@ -111,7 +118,10 @@ function showToast(type, title, message, duration = 4000) {
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  console.log('[Supernote] Message received:', request.action);
+
   if (request.action === 'showToast') {
+    console.log('[Supernote] Showing toast:', request.type, request.title, request.message);
     showToast(request.type, request.title, request.message, request.duration);
     sendResponse({ success: true });
     return true;

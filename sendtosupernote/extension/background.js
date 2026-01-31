@@ -58,7 +58,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 async function sendUrlToBackend(url, backendUrl, authToken) {
-    showNotification('info', 'Sending to Supernote', truncateUrl(url));
+    await showNotification('info', 'Sending to Supernote', truncateUrl(url));
 
     const payload = {
         url: url,
@@ -78,18 +78,18 @@ async function sendUrlToBackend(url, backendUrl, authToken) {
         const responseData = await response.json();
 
         if (response.ok) {
-            showNotification('success', 'Sent to Supernote', responseData.message || 'Article queued!');
+            await showNotification('success', 'Sent to Supernote', responseData.message || 'Article queued!');
         } else {
             const errorMsg = responseData.detail || response.statusText || 'Unknown error';
-            showNotification('error', 'Failed to Send', errorMsg);
+            await showNotification('error', 'Failed to Send', errorMsg);
         }
     } catch (error) {
-        showNotification('error', 'Network Error', error.message);
+        await showNotification('error', 'Network Error', error.message);
     }
 }
 
 async function sendCurrentPageToBackend(tabId, tab, backendUrl, authToken) {
-    showNotification('info', 'Processing', 'Extracting page content...');
+    await showNotification('info', 'Processing', 'Extracting page content...');
 
     let extractedHtmlResponse;
     try {
@@ -98,11 +98,11 @@ async function sendCurrentPageToBackend(tabId, tab, backendUrl, authToken) {
             const errorDetail = extractedHtmlResponse
                 ? (extractedHtmlResponse.error || 'Content script indicated failure.')
                 : 'No response from content script.';
-            showNotification('error', 'Extraction Failed', errorDetail);
+            await showNotification('error', 'Extraction Failed', errorDetail);
             return;
         }
     } catch (error) {
-        showNotification('error', 'Extraction Error', `${error.message}. Try reloading the page.`);
+        await showNotification('error', 'Extraction Error', `${error.message}. Try reloading the page.`);
         return;
     }
 
@@ -113,7 +113,7 @@ async function sendCurrentPageToBackend(tabId, tab, backendUrl, authToken) {
     };
 
     try {
-        showNotification('info', 'Sending', 'Uploading to Supernote...');
+        await showNotification('info', 'Sending', 'Uploading to Supernote...');
         const response = await fetch(`${backendUrl}/api/queue_article`, {
             method: 'POST',
             headers: {
@@ -126,26 +126,29 @@ async function sendCurrentPageToBackend(tabId, tab, backendUrl, authToken) {
         const responseData = await response.json();
 
         if (response.ok) {
-            showNotification('success', 'Sent to Supernote', responseData.message || 'Article queued!');
+            await showNotification('success', 'Sent to Supernote', responseData.message || 'Article queued!');
         } else {
             const errorMsg = responseData.detail || response.statusText || 'Unknown error';
-            showNotification('error', 'Failed to Send', errorMsg);
+            await showNotification('error', 'Failed to Send', errorMsg);
         }
     } catch (error) {
-        showNotification('error', 'Network Error', error.message);
+        await showNotification('error', 'Network Error', error.message);
     }
 }
 
 async function showNotification(type, title, message) {
+    console.log('[Supernote BG] showNotification called:', type, title, message, 'tabId:', currentTabId);
     if (currentTabId) {
         try {
-            await chrome.tabs.sendMessage(currentTabId, {
+            const result = await chrome.tabs.sendMessage(currentTabId, {
                 action: 'showToast',
                 type: type,
                 title: title,
                 message: message
             });
+            console.log('[Supernote BG] Toast message sent, result:', result);
         } catch (error) {
+            console.log('[Supernote BG] Toast failed, using Chrome notification:', error.message);
             // Fallback to Chrome notification if content script not available
             chrome.notifications.create({
                 type: 'basic',
@@ -155,6 +158,7 @@ async function showNotification(type, title, message) {
             });
         }
     } else {
+        console.log('[Supernote BG] No tabId, using Chrome notification');
         // Fallback to Chrome notification
         chrome.notifications.create({
             type: 'basic',
