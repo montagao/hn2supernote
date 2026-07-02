@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>plane-tui — terminal client for Plane.so · design prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   plane-tui — a terminal client for Plane.so boards.
+   TERMINAL DISCIPLINE: one font, one size. Hierarchy comes from
+   bold, dim, color, and reverse-video only. Square corners. No
+   shadows, no gradients, no tweened motion. Everything drawn here
+   could be drawn with curses; every mutation maps to one call in
+   the plane-api skill (create / list / update + states / labels).
+   Data is real: workspace translatemom @ todo.translate.mom,
+   project TMOM — 120 work items, 88 in backlog, 86 unprioritized.
+   ============================================================ */
+:root{
+  /* cool charcoal — Plane is indigo, so the terminal leans blue-black */
+  --bg:        oklch(0.16 0.012 265);
+  --bg-raise:  oklch(0.20 0.014 265);
+  --bg-cell:   oklch(0.185 0.013 265);
+  --ink:       oklch(0.13 0.012 265);
+  --paper:     oklch(0.92 0.008 90);
+  --dim:       oklch(0.58 0.012 265);
+  --dimmer:    oklch(0.40 0.012 265);
+  --line:      oklch(0.30 0.014 265);
+  --accent:    oklch(0.64 0.17 268);   /* plane indigo */
+  --accent-dim:oklch(0.42 0.10 268);
+  --red:       oklch(0.66 0.19 25);
+  --amber:     oklch(0.75 0.15 70);
+  --yellow:    oklch(0.83 0.13 95);
+  --green:     oklch(0.72 0.15 150);
+  --blue:      oklch(0.70 0.12 230);
+  --violet:    oklch(0.70 0.13 300);
+}
+*{margin:0;padding:0;box-sizing:border-box;border-radius:0 !important;}
+html,body{height:100%;}
+body{
+  background: oklch(0.11 0.01 265);
+  font-family:'IBM Plex Mono',monospace;
+  font-size:13px; line-height:1.45;
+  color:var(--paper);
+  display:flex; align-items:center; justify-content:center;
+  padding:18px;
+}
+/* ---------- terminal window chrome (meta, not part of the TUI) ---------- */
+#term{
+  width:min(1560px,100%); height:min(920px,calc(100vh - 36px));
+  background:var(--bg); border:1px solid oklch(0.32 0.014 265);
+  display:flex; flex-direction:column; overflow:hidden;
+}
+#titlebar{
+  flex:0 0 30px; display:flex; align-items:center; gap:8px; padding:0 12px;
+  background:oklch(0.14 0.012 265); border-bottom:1px solid var(--line);
+  color:var(--dim); font-size:12px; user-select:none;
+}
+.tl{width:10px;height:10px;border:1px solid var(--dimmer);}
+#titlebar .ttl{flex:1;text-align:center;}
+/* ---------- app grid ---------- */
+#app{flex:1;display:flex;flex-direction:column;min-height:0;position:relative;}
+#header{
+  flex:0 0 auto; display:flex; align-items:center; gap:0; padding:3px 0;
+  border-bottom:1px solid var(--line); white-space:nowrap; overflow:hidden;
+}
+.seg{padding:1px 10px;}
+.seg.logo{background:var(--accent);color:var(--ink);font-weight:600;margin-left:0;}
+.seg.tab{color:var(--dim);cursor:pointer;}
+.seg.tab b{color:var(--paper);font-weight:500;}
+.seg.tab .tk{color:var(--dimmer);}
+.seg.tab.on{background:var(--paper);color:var(--ink);}
+.seg.tab.on b,.seg.tab.on .tk{color:var(--ink);}
+.hsep{color:var(--dimmer);}
+#hright{margin-left:auto;display:flex;align-items:center;}
+#hright .seg{color:var(--dim);}
+#hright .jobseg{color:var(--amber);}
+#hright .connseg .dot{color:var(--green);}
+/* ---------- main ---------- */
+#main{flex:1;display:flex;min-height:0;}
+#boardwrap{flex:1;min-width:0;display:flex;flex-direction:column;}
+#board{flex:1;display:flex;min-height:0;overflow-x:hidden;}
+.col{
+  flex:1 1 0; min-width:0; display:flex; flex-direction:column;
+  border-right:1px solid var(--line);
+}
+.colhead{
+  flex:0 0 auto; padding:4px 10px 3px; border-bottom:1px solid var(--line);
+  display:flex; gap:8px; align-items:baseline; white-space:nowrap;
+}
+.colhead .cnt{color:var(--dim);}
+.colhead .shown{margin-left:auto;color:var(--dimmer);}
+.colbody{flex:1;overflow-y:auto;padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
+.colbody::-webkit-scrollbar{width:8px;}
+.colbody::-webkit-scrollbar-thumb{background:var(--line);}
+.more{color:var(--dimmer);padding:2px;text-align:center;}
+/* ---------- cards: fixed geometry — 1 status row, 2 title rows, 1 meta row ---------- */
+.card{
+  border:1px solid var(--line); background:var(--bg-cell);
+  padding:3px 7px 4px; cursor:pointer; flex:0 0 auto;
+}
+.card .crow{display:flex;gap:6px;align-items:baseline;white-space:nowrap;}
+.card .mk{width:1ch;color:var(--accent);font-weight:600;}
+.card .key{color:var(--dim);}
+.card .sp{flex:1;}
+.card .title{
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+  min-height:calc(2 * 1.45em); word-break:break-word;
+}
+.card .meta{display:flex;gap:8px;white-space:nowrap;overflow:hidden;color:var(--dim);}
+.card .meta .age{margin-left:auto;color:var(--dimmer);}
+.card.cur{border-color:var(--accent);}
+.card.cur .title{background:var(--accent);color:var(--ink);font-weight:500;}
+.card.marked{border-left:3px solid var(--accent);}
+.lbl{white-space:nowrap;}
+.due{white-space:nowrap;}
+.due.soon{color:var(--red);font-weight:500;}
+/* ---------- list view ---------- */
+#list{flex:1;overflow-y:auto;min-height:0;}
+.lrow{
+  display:grid; grid-template-columns:3ch 2ch 10ch 1fr 15ch 17ch 7ch 9ch;
+  gap:0 8px; padding:1px 10px; white-space:nowrap; cursor:pointer;
+  align-items:baseline;
+}
+.lrow>*{overflow:hidden;text-overflow:ellipsis;}
+.lrow .num{font-variant-numeric:tabular-nums;}
+.lrow.cur{background:var(--accent);color:var(--ink);}
+.lrow.cur *{color:var(--ink) !important;}
+.lrow .lkey{color:var(--dim);}
+.lrow .lst{}
+.lrow .lup{color:var(--dimmer);text-align:right;}
+.lrow .ldue{text-align:right;}
+.lhead{
+  display:grid; grid-template-columns:3ch 2ch 10ch 1fr 15ch 17ch 7ch 9ch;
+  gap:0 8px; padding:2px 10px; color:var(--dimmer); border-bottom:1px solid var(--line);
+  white-space:nowrap;
+}
+/* ---------- inspector ---------- */
+#inspector{
+  flex:0 0 46ch; border-left:1px solid var(--line); padding:6px 12px;
+  overflow-y:auto; min-height:0;
+}
+#inspector .ikey{display:flex;gap:8px;align-items:baseline;}
+#inspector .ikey .k{color:var(--dim);}
+#inspector h2{font-size:inherit;font-weight:600;margin:2px 0 6px;word-break:break-word;}
+.irule{border:none;border-top:1px solid var(--line);margin:7px 0;}
+.ifield{display:flex;gap:2ch;}
+.ifield .fk{flex:0 0 9ch;color:var(--dimmer);}
+.ifield .fv{flex:1;min-width:0;word-break:break-word;}
+.isect{color:var(--dimmer);}
+.idesc{color:var(--dim);white-space:pre-wrap;word-break:break-word;}
+.iact{color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.iurl{color:var(--accent);word-break:break-all;}
+/* ---------- api drawer ---------- */
+#apidrawer{
+  flex:0 0 auto; max-height:13em; overflow-y:auto; display:none;
+  border-top:1px solid var(--line); padding:2px 0 4px;
+}
+body.api-on #apidrawer{display:block;}
+#apidrawer .ahead{padding:1px 10px;color:var(--dimmer);}
+.arow{display:grid;grid-template-columns:9ch 6ch 1fr 5ch 7ch;gap:0 10px;padding:0 10px;white-space:nowrap;}
+.arow>*{overflow:hidden;text-overflow:ellipsis;}
+.arow .t{color:var(--dimmer);}
+.arow .m{font-weight:600;}
+.arow .m.get{color:var(--blue);} .arow .m.post{color:var(--green);} .arow .m.patch{color:var(--amber);}
+.arow .p{color:var(--dim);}
+.arow .s{text-align:right;} .arow .s.ok{color:var(--green);} .arow .s.pend{color:var(--amber);}
+.arow .ms{color:var(--dimmer);text-align:right;font-variant-numeric:tabular-nums;}
+/* ---------- footer stack ---------- */
+#footer{flex:0 0 auto;border-top:1px solid var(--line);}
+#batchbar{display:none;background:var(--accent);color:var(--ink);padding:1px 10px;white-space:nowrap;overflow:hidden;}
+#batchbar b{font-weight:600;}
+#batchbar .bk{background:var(--ink);color:var(--paper);padding:0 4px;margin:0 2px 0 10px;}
+body.has-marks #batchbar{display:block;}
+#palettebox{display:none;border-bottom:1px solid var(--line);max-height:16em;overflow:hidden;}
+body.palette-on #palettebox{display:block;}
+.prow{display:flex;gap:2ch;padding:0 10px;white-space:nowrap;}
+.prow .pn{flex:0 0 16ch;color:var(--paper);}
+.prow .pd{flex:1;color:var(--dim);overflow:hidden;text-overflow:ellipsis;}
+.prow .pk{color:var(--dimmer);}
+.prow.sel{background:var(--accent);color:var(--ink);}
+.prow.sel .pn,.prow.sel .pd,.prow.sel .pk{color:var(--ink);}
+#menubar{display:none;padding:1px 10px;white-space:nowrap;overflow:hidden;background:var(--bg-raise);}
+body.menu-on #menubar{display:block;}
+#menubar .mtag{background:var(--paper);color:var(--ink);padding:0 6px;font-weight:600;margin-right:10px;}
+#menubar .mkey{color:var(--accent);font-weight:600;}
+#menubar .mlab{color:var(--dim);margin-right:14px;}
+#cmdline{display:flex;gap:0;padding:1px 10px;white-space:nowrap;overflow:hidden;align-items:baseline;}
+#cmdline .prompt{color:var(--accent);font-weight:600;}
+#cmdline .typed{}
+#cmdline .cursor{background:var(--paper);color:var(--ink);animation:blink 1.06s steps(1) infinite;}
+@keyframes blink{50%{background:transparent;color:var(--paper);}}
+#cmdline .statusmsg{color:var(--dim);}
+#cmdline .statusmsg b{color:var(--paper);font-weight:500;}
+#cmdline .jobline{margin-left:auto;color:var(--amber);padding-left:2ch;}
+#cmdline .pos{color:var(--dimmer);padding-left:2ch;}
+#hints{padding:1px 10px 3px;color:var(--dimmer);white-space:nowrap;overflow:hidden;}
+#hints b{color:var(--dim);font-weight:500;}
+/* ---------- overlays: bordered boxes, title in the border ---------- */
+.overlay{
+  display:none; position:absolute; inset:0; z-index:30;
+  background:oklch(0.16 0.012 265 / .72);
+  align-items:center; justify-content:center;
+}
+.overlay.on{display:flex;}
+.obox{
+  background:var(--bg); border:1px solid var(--paper);
+  min-width:74ch; max-width:92ch; max-height:80%; overflow-y:auto;
+  padding:0 0 8px; position:relative;
+}
+.obox .otitle{
+  margin:-1px -1px 8px; padding:1px 10px; background:var(--paper); color:var(--ink);
+  font-weight:600;
+}
+.obox .osec{padding:0 14px;}
+.krow{display:flex;gap:2ch;padding:0 14px;}
+.krow .kk{flex:0 0 12ch;color:var(--accent);font-weight:500;}
+.krow .kd{color:var(--dim);}
+.ksec{padding:6px 14px 2px;color:var(--dimmer);}
+/* triage */
+#triagebox .titem{padding:0 14px;margin:4px 0 8px;}
+#triagebox .titem .tkey{color:var(--dim);}
+#triagebox .titem .ttl2{font-weight:600;word-break:break-word;}
+#triagebox .meter{color:var(--accent);}
+#triagebox .trow{display:flex;gap:1ch;padding:0 14px;white-space:nowrap;}
+#triagebox .trow .tk{flex:0 0 10ch;color:var(--dimmer);}
+#triagebox .trow .to{margin-right:2ch;}
+#triagebox .trow .to b{color:var(--accent);font-weight:600;}
+#triagebox .trow .to span{color:var(--dim);}
+/* ---------- shared color utility classes ---------- */
+.c-red{color:var(--red);} .c-amber{color:var(--amber);} .c-yellow{color:var(--yellow);}
+.c-green{color:var(--green);} .c-blue{color:var(--blue);} .c-violet{color:var(--violet);}
+.c-dim{color:var(--dim);} .c-dimmer{color:var(--dimmer);} .c-acc{color:var(--accent);}
+.b{font-weight:600;}
+/* ============================================================
+   design-notes acetate ("!") — red-pen markup OVER the terminal.
+   Deliberately serif: it is annotation, not part of the TUI.
+   ============================================================ */
+#notespanel{
+  display:none; position:absolute; top:0; right:0; bottom:0; width:420px; z-index:60;
+  background:oklch(0.97 0.01 90); color:oklch(0.25 0.01 60);
+  font-family:'Instrument Serif',serif; font-size:16px; line-height:1.4;
+  padding:22px 26px; overflow-y:auto; border-left:1px solid oklch(0.8 0.02 60);
+}
+body.notes-on #notespanel{display:block;}
+#notespanel h3{font-size:22px;font-style:italic;margin-bottom:4px;}
+#notespanel .sub{color:oklch(0.5 0.02 60);margin-bottom:14px;font-style:italic;}
+#notespanel ol{padding-left:22px;}
+#notespanel li{margin-bottom:10px;}
+#notespanel li::marker{color:oklch(0.55 0.2 25);font-weight:bold;}
+#notespanel .np{color:oklch(0.55 0.2 25);}
+.pin{
+  display:none; position:absolute; z-index:55; width:22px; height:22px;
+  background:oklch(0.55 0.2 25); color:white; font-family:'Instrument Serif',serif;
+  font-size:14px; text-align:center; line-height:22px; font-weight:bold;
+  border:1px solid oklch(0.35 0.15 25);
+}
+body.notes-on .pin{display:block;}
+</style>
+</head>
+<body>
+<div id="term">
+  <div id="titlebar">
+    <span class="tl"></span><span class="tl"></span><span class="tl"></span>
+    <span class="ttl">plane-tui — kitty · todo.translate.mom — 214×54</span>
+    <span style="width:44px"></span>
+  </div>
+  <div id="app">
+    <div id="header"></div>
+    <div id="main">
+      <div id="boardwrap">
+        <div id="board"></div>
+        <div id="list" style="display:none"></div>
+      </div>
+      <div id="inspector"></div>
+    </div>
+    <div id="apidrawer"></div>
+    <div id="footer">
+      <div id="batchbar"></div>
+      <div id="palettebox"></div>
+      <div id="menubar"></div>
+      <div id="cmdline"></div>
+      <div id="hints"></div>
+    </div>
+
+    <!-- keys overlay -->
+    <div class="overlay" id="keysoverlay"><div class="obox">
+      <div class="otitle"> keys </div>
+      <div class="ksec">navigate</div>
+      <div class="krow"><span class="kk">j / k</span><span class="kd">move down / up within a column or list</span></div>
+      <div class="krow"><span class="kk">h / l</span><span class="kd">move between board columns</span></div>
+      <div class="krow"><span class="kk">gg / G</span><span class="kd">jump to first / last item</span></div>
+      <div class="krow"><span class="kk">1 2 3</span><span class="kd">switch project — TMOM · TMIOS · MKT</span></div>
+      <div class="krow"><span class="kk">v</span><span class="kd">toggle board ⇄ list view</span></div>
+      <div class="ksec">act on the item under the cursor (or on marks)</div>
+      <div class="krow"><span class="kk">s</span><span class="kd">set state — backlog / todo / in-progress / done / cancelled</span></div>
+      <div class="krow"><span class="kk">p</span><span class="kd">set priority — urgent / high / medium / low / none</span></div>
+      <div class="krow"><span class="kk">t</span><span class="kd">toggle labels</span></div>
+      <div class="krow"><span class="kk">o</span><span class="kd">open in browser — canonical /browse/TMOM-n URL</span></div>
+      <div class="krow"><span class="kk">n</span><span class="kd">new work item (:new &lt;title&gt; → POST)</span></div>
+      <div class="ksec">marks &amp; batch</div>
+      <div class="krow"><span class="kk">m / I / U</span><span class="kd">mark · invert marks · clear marks — s/p/t then act on all marks</span></div>
+      <div class="ksec">modes</div>
+      <div class="krow"><span class="kk">T</span><span class="kd">triage sweep — one keystroke per backlog item, auto-advance</span></div>
+      <div class="krow"><span class="kk">/ · :</span><span class="kd">search · command line with wildmenu</span></div>
+      <div class="krow"><span class="kk">f · S</span><span class="kd">cycle filter · cycle sort</span></div>
+      <div class="krow"><span class="kk">x · R</span><span class="kd">api call log · refresh from server</span></div>
+      <div class="krow"><span class="kk">? · !</span><span class="kd">this help · design notes</span></div>
+    </div></div>
+
+    <!-- triage overlay -->
+    <div class="overlay" id="triageoverlay"><div class="obox" id="triagebox"></div></div>
+
+    <div id="notespanel">
+      <h3>Design notes <span class="np">— plane-tui</span></h3>
+      <div class="sub">press ! to dismiss · numbered pins on the terminal</div>
+      <ol>
+        <li><b>The board tells the truth.</b> Real counts from the API: 88 of 120 TMOM items sit in Backlog, 86 have no priority. The whole design optimizes for digging out of that.</li>
+        <li><b>Projects are tabs, one keystroke away.</b> 1/2/3 switches TMOM · TMIOS · MKT. No workspace-picker ceremony; the workspace is in the prompt.</li>
+        <li><b>Priority is a one-cell glyph</b> (‼ ↑ − ↓ ·) in a fixed column — scannable down a whole list without reading a word.</li>
+        <li><b>Cursor ≠ marks.</b> Reverse-video indigo is <i>where you are</i>; the ✓ column and left bar are <i>what you've marked</i>. Batch bar appears only when marks exist.</li>
+        <li><b>Triage mode (T) is the killer feature.</b> One bordered box, one item at a time, one keystroke per decision — priority or state, auto-advance, live progress meter. 88 items becomes ten minutes.</li>
+        <li><b>Every mutation is a visible API call.</b> Cards update optimistically; the header job segment spins (⣾) until the PATCH confirms with latency. Nothing mutates silently.</li>
+        <li><b>The API drawer (x) teaches the REST API</b> — method, path, payload, status, ms — the exact calls the plane-api skill makes. The TUI is a front-end for the API, and it shows its work.</li>
+        <li><b>Inspector = everything without leaving home row.</b> State, priority, labels, dates as relative + absolute, description, session activity, and the canonical <i>/browse/TMOM-n</i> URL (never the legacy /issues/ route).</li>
+        <li><b>Single-key menus on the command line</b> for state/priority/label — no popup dialogs; the prompt row becomes the menu, vim-style.</li>
+        <li><b>The command line teaches keys.</b> Every :command in the wildmenu shows its direct key, so the palette makes itself obsolete.</li>
+        <li><b>Honest pagination.</b> Columns show "… n more on server" instead of pretending the page is the world; R fetches the next page.</li>
+        <li><b>Still a terminal, deliberately.</b> One font, one size; bold/dim/color/reverse-video; square corners; braille spinners and ▰▱ meters. Every element maps to curses calls.</li>
+      </ol>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ================= data — fetched live from todo.translate.mom ================= */
+const NOW = Date.UTC(2026,6,2,17,30);  // fixed clock: 2026-07-02
+const D = (s)=>Date.parse(s+'T12:00:00Z');
+
+const STATE_ORDER = ['backlog','todo','started','done'];
+const STATE = {
+  backlog:  {name:'Backlog',     g:'◌', c:'c-dim'},
+  todo:     {name:'Todo',        g:'○', c:''},
+  started:  {name:'In Progress', g:'◐', c:'c-amber'},
+  done:     {name:'Done',        g:'●', c:'c-green'},
+  cancelled:{name:'Cancelled',   g:'✕', c:'c-red'},
+};
+const PRIO_ORDER = ['urgent','high','medium','low','none'];
+const PRIO = {
+  urgent:{g:'‼',c:'c-red',w:0}, high:{g:'↑',c:'c-amber',w:1},
+  medium:{g:'−',c:'c-yellow',w:2}, low:{g:'↓',c:'c-blue',w:3},
+  none:{g:'·',c:'c-dimmer',w:4},
+};
+const LABELS = {  // real labels + real hex, nudged for dark bg
+  'claw_inbox':'#a97fd6','maintenance':'#7bdcb5','growth':'#ff7b7b',
+  'Backend work':'#ff8f8f','bot work':'#2fd898','fullstack work':'#b98af0',
+  'marketing':'#fcb900','Front End Work':'#4fb3ef',
+};
+
+/* it(seq, title, state, prio, labels, due, created, updated, desc) */
+function it(seq,title,st,pr,lb,due,cr,up,desc){return {seq,title,st,pr:pr||'none',lb:lb||[],due:due||null,cr:D(cr),up:D(up||'2026-07-01'),desc:desc||''};}
+
+const TMOM_ITEMS = [
+  // in progress (all 3, real)
+  it(599,'One input / file -> multiple language outputs','started','none',['fullstack work'],null,'2026-07-01','2026-07-01',
+     'Single upload should fan out to N target languages in one pass instead of re-running the pipeline per language.'),
+  it(407,'experiment with TT and warm up accounts','started','none',['growth'],null,'2026-01-09','2026-07-01'),
+  it(424,'spam pornhub jav, erome comments?','started','none',['growth'],null,'2026-02-26','2026-07-01'),
+  // todo (all 7, real)
+  it(264,'fix AI tab (ai transform only does one line and summary could use work)','todo','urgent',['fullstack work'],'2026-07-04','2025-05-05','2026-07-01',
+     'AI transform only processes the first subtitle line; summary output is thin. Rework the transform loop and the summary prompt.'),
+  it(310,'Create backups of everything','todo','high',['maintenance'],'2026-07-10','2025-05-15','2026-07-01'),
+  it(393,'bucket security issues?','todo','high',['Backend work'],null,'2025-12-28','2026-07-01'),
+  it(362,'speaker diarization','todo','medium',[],null,'2025-07-09','2026-07-01'),
+  it(80,'think more about default font settings','todo','medium',['Front End Work'],null,'2024-10-11','2026-07-01'),
+  it(414,'fix fullscreen translatemom behaviour','todo','none',[],null,'2026-01-14','2026-07-01'),
+  it(415,'EXHAUSTIVE TEST SUITE FOR PIPELINE with demo recordings use $create-demo skill for each feature/regression testing','todo','none',[],null,'2026-01-14','2026-07-01'),
+  // backlog (18 of 88 loaded, real)
+  it(582,'improve upload file experience (finalizing step too long?)','backlog','urgent',[],null,'2026-07-01','2026-07-01'),
+  it(580,'Transactional Emails with Resend','backlog','urgent',['Backend work'],null,'2026-07-01','2026-07-01'),
+  it(563,'fix sometimes transcription is truncated (scribe api issue??)','backlog','urgent',[],null,'2026-07-01','2026-07-01'),
+  it(554,'Upload to transcription/embed link one click','backlog','urgent',[],null,'2026-07-01','2026-07-01'),
+  it(552,'fix subtitle alignment, and final srtRefiner output see github.com/baxtree/subaligner','backlog','urgent',[],null,'2026-07-01','2026-07-01'),
+  it(585,'trial -> upgrade to paid flow should work properly','backlog','high',[],null,'2026-07-01','2026-07-01'),
+  it(575,'Evaluate subtitletools.com tools to replicate','backlog','high',['growth'],null,'2026-07-01','2026-07-01'),
+  it(566,'Improve dual subtitles mode','backlog','high',[],null,'2026-07-01','2026-07-01'),
+  it(588,'Collect dispute evidence','backlog','medium',[],null,'2026-07-01','2026-07-01'),
+  it(577,'Fix Caching Issues','backlog','medium',['Backend work'],null,'2026-07-01','2026-07-01'),
+  it(576,"Translatemom: add new command 'verify translation'",'backlog','medium',[],null,'2026-07-01','2026-07-01'),
+  it(570,'Fix caching for transcriptions','backlog','medium',[],null,'2026-07-01','2026-07-01'),
+  it(598,'Clean up Cloudflare billable usage','backlog','none',['maintenance'],null,'2026-07-01','2026-07-01'),
+  it(594,'Automate production deploy from main with PM2 and health check','backlog','none',[],null,'2026-07-01','2026-07-01'),
+  it(592,'Investigate email-with-periods account/credits mismatch bug','backlog','none',[],null,'2026-07-01','2026-07-01'),
+  it(589,'AI tab becomes an agent chat window','backlog','none',[],null,'2026-07-01','2026-07-01'),
+  it(571,'Speed up karaoke renderer','backlog','none',[],null,'2026-07-01','2026-07-01'),
+  it(513,'Smart captioning styling?','backlog','none',['claw_inbox'],null,'2026-03-26','2026-06-11'),
+  // done (8 of 22 loaded, real)
+  it(496,'Research Qwen3-ASR and Qwen3-ForcedAligner open-source release','done','medium',[],null,'2026-03-18','2026-06-11'),
+  it(510,"Follow-up for TMOM-508: Observe Plausible + add What's New dialog",'done','medium',[],null,'2026-03-24','2026-06-30'),
+  it(511,'Expose presets to Telegram bot','done','medium',['bot work'],null,'2026-03-25','2026-06-30'),
+  it(481,'threads.net translatemom bot','done','high',['bot work'],null,'2026-03-14','2026-06-28'),
+  it(535,'Add emphasis yellow highlight styling','done','none',['Front End Work'],null,'2026-04-08','2026-06-27'),
+  it(536,'Fix hamburger menu on landing page','done','none',['Front End Work'],null,'2026-04-08','2026-06-26'),
+  it(541,'more i18n on ui for japan','done','none',[],null,'2026-04-12','2026-06-25'),
+  it(428,'Improve performance of /app/task/<taskId> (profiling + optimization)','done','none',['Backend work'],null,'2026-02-27','2026-06-24'),
+];
+
+const TMIOS_ITEMS = [
+  it(30,'Hold TranslateMom iOS 1.0 for manual App Store release','started','high',[],null,'2026-05-20','2026-07-01'),
+  it(56,'Fix current app state/push new update','started','none',[],null,'2026-06-28','2026-07-01'),
+  it(41,'Set App Store metadata for search-friendly iOS launch','todo','high',['marketing'],null,'2026-06-02','2026-07-01'),
+  it(54,'Rewrite iOS launch positioning away from companion-app framing','todo','high',['marketing'],null,'2026-06-25','2026-07-01'),
+  it(46,'Draft X launch post and product-showing thread','todo','high',['marketing'],null,'2026-06-10','2026-07-01'),
+  it(22,'iOS: figure out how to get renderer working on iOS','backlog','medium',[],null,'2026-04-20','2026-07-01'),
+  it(43,'Generate App Store campaign links before launch posts','backlog','none',[],null,'2026-06-05','2026-07-01'),
+  it(13,'TranslateMom iOS: make purchase success screen more obvious','backlog','none',[],null,'2026-03-30','2026-07-01'),
+  it(57,'integrate ios posthog equivalent?','backlog','none',[],null,'2026-06-29','2026-07-01'),
+  it(55,'Expanded Onboarding (copy brainrot, other viral apps)','backlog','none',[],null,'2026-06-26','2026-07-01'),
+  it(11,'TranslateMom iOS: evaluate paywall options (RevenueCat vs off-the-shelf)','backlog','none',[],null,'2026-03-28','2026-07-01'),
+  it(15,'iOS app: add copy transcript button (SRT/TEXT)','backlog','none',[],null,'2026-04-02','2026-07-01'),
+];
+const MKT_ITEMS = [
+  it(24,'remove unnecessary spend - affiliates, ahrefs, rewardful','started','none',['maintenance'],null,'2026-04-15','2026-07-01'),
+  it(36,'add a better demo on landing page','todo','urgent',['marketing'],null,'2026-05-12','2026-07-01'),
+  it(31,'free tool watermark embedder seo page','todo','urgent',['growth'],null,'2026-05-01','2026-07-01'),
+  it(23,'Fix this blog post — how-to-translate-x-t…','todo','urgent',['marketing'],null,'2026-04-14','2026-07-01'),
+  it(73,'Founder email sent to all 54 scheduled cancellations','done','urgent',['growth'],null,'2026-06-30','2026-07-01'),
+  it(71,'Ask Fable about comprehensive ad campaigns','backlog','none',[],null,'2026-06-29','2026-07-01'),
+  it(45,'More Automation for TranslateMom Socials','backlog','none',['marketing'],null,'2026-05-25','2026-07-01'),
+  it(33,'periodic user reminder campaign email after inactive for x months','backlog','low',['growth'],null,'2026-05-05','2026-07-01'),
+  it(72,'launch translatemom ios on producthunt other sites','backlog','none',['marketing'],null,'2026-06-30','2026-07-01'),
+  it(20,'translatemombot video + link as reply underneath + backlink','backlog','none',['bot work'],null,'2026-04-10','2026-07-01'),
+  it(21,'Add Free Tools','backlog','none',['growth'],null,'2026-04-11','2026-07-01'),
+  it(22,'Social Media post automator edit caption style','backlog','none',[],null,'2026-04-12','2026-07-01'),
+];
+
+const PROJECTS = [
+  {key:'TMOM', name:'Product', total:120, counts:{backlog:88,todo:7,started:3,done:22,cancelled:0}, items:TMOM_ITEMS},
+  {key:'TMIOS',name:'iOS',     total:36,  counts:{backlog:26,todo:5,started:2,done:3,cancelled:0},  items:TMIOS_ITEMS},
+  {key:'MKT',  name:'Growth',  total:68,  counts:{backlog:47,todo:12,started:1,done:7,cancelled:1}, items:MKT_ITEMS},
+];
+
+/* ================= state ================= */
+const S = {
+  proj:0, view:'board',
+  col:1, row:0,          // board cursor (start on Todo column)
+  cursor:0,              // list cursor
+  marked:new Set(),      // 'TMOM-264'
+  search:'', prevSearch:'',
+  filter:'all',          // all | fire | untriaged
+  sort:'prio',           // prio | updated | created | key
+  mode:null, itext:'',   // command line: null|'search'|'cmd'
+  menu:null,             // null|'state'|'prio'|'label'
+  jobs:[], jobseq:0, apilog:[],
+  triage:null,           // {queue:[...ids], idx, decided, promoted}
+  palSel:0, status:'', lastg:0, frame:0,
+};
+const FRAMES=['⣾','⣽','⣻','⢿','⡿','⣟','⣯','⣷'];
+
+/* ================= helpers ================= */
+const esc = s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function proj(){return PROJECTS[S.proj];}
+function key(w){return proj().key+'-'+w.seq;}
+function byKey(k){return proj().items.find(w=>key(w)===k);}
+function timeAgo(ts){
+  const d=Math.max(0,NOW-ts), day=864e5;
+  if(d<day) return 'today';
+  if(d<2*day) return '1d ago';
+  if(d<32*day) return Math.round(d/day)+'d ago';
+  if(d<370*day) return Math.round(d/(30.4*day))+'mo ago';
+  return (d/(365*day)).toFixed(1)+'y ago';
+}
+function absDate(ts){const d=new Date(ts);return d.toISOString().slice(0,10);}
+function dueText(due){
+  if(!due) return null;
+  const days=Math.round((D(due)-NOW)/864e5);
+  if(days<0) return {t:'⚑ '+(-days)+'d over',soon:true};
+  if(days<=3) return {t:'⚑ '+days+'d',soon:true};
+  return {t:'⚑ '+days+'d',soon:false};
+}
+function midTrunc(s,n){if(s.length<=n)return s;const h=Math.floor((n-1)/2);return s.slice(0,n-1-h)+'…'+s.slice(s.length-h);}
+function meter(pct,w){const f=Math.round(pct*w);return '▰'.repeat(f)+'▱'.repeat(w-f);}
+function matches(w){
+  if(S.search && !w.title.toLowerCase().includes(S.search.toLowerCase()) && !String(w.seq).includes(S.search)) return false;
+  if(S.filter==='fire' && !(w.pr==='urgent'||w.pr==='high')) return false;
+  if(S.filter==='untriaged' && w.pr!=='none') return false;
+  return true;
+}
+function colItems(st){
+  const arr=proj().items.filter(w=>w.st===st&&matches(w));
+  if(S.sort==='prio') arr.sort((a,b)=>PRIO[a.pr].w-PRIO[b.pr].w||b.up-a.up);
+  if(S.sort==='updated') arr.sort((a,b)=>b.up-a.up);
+  if(S.sort==='created') arr.sort((a,b)=>b.cr-a.cr);
+  if(S.sort==='key') arr.sort((a,b)=>b.seq-a.seq);
+  return arr;
+}
+function flatItems(){return STATE_ORDER.flatMap(st=>colItems(st));}
+function curItem(){
+  if(S.view==='board'){const c=colItems(STATE_ORDER[S.col]);return c[Math.min(S.row,c.length-1)]||null;}
+  const f=flatItems();return f[Math.min(S.cursor,f.length-1)]||null;
+}
+function targets(){ // marked items, else cursor item
+  if(S.marked.size) return [...S.marked].map(byKey).filter(Boolean);
+  const c=curItem(); return c?[c]:[];
+}
+
+/* ================= jobs + api log ================= */
+function stamp(){const d=new Date(NOW+(S.jobseq*1300));return d.toISOString().slice(11,19);}
+function api(method,path,payload,note){
+  const e={t:stamp(),method,path,payload:payload||'',status:'…',ms:null,note:note||''};
+  S.apilog.unshift(e); if(S.apilog.length>40)S.apilog.pop();
+  return e;
+}
+function addJob(label,apiEntry,dur){
+  const j={id:++S.jobseq,label,state:'running',p:0,api:apiEntry,dur:dur||900+((S.jobseq*137)%700)};
+  S.jobs.push(j);
+  const t0=performance.now();
+  const iv=setInterval(()=>{
+    j.p=Math.min(1,(performance.now()-t0)/j.dur);
+    if(j.p>=1){
+      clearInterval(iv); j.state='done';
+      if(j.api){j.api.status=j.api.method==='POST'?'201':'200';j.api.ms=Math.round(j.dur*0.72);}
+      setTimeout(()=>{S.jobs=S.jobs.filter(x=>x!==j);render();},1200);
+    }
+    render();
+  },120);
+}
+function mutate(w,patch,desc){
+  if(patch.st&&patch.st!==w.st){proj().counts[w.st]--;proj().counts[patch.st]++;}
+  Object.assign(w,patch); w.up=NOW;
+  const e=api('PATCH','…/work-items/'+key(w).toLowerCase()+'/',JSON.stringify(patch).slice(0,46),key(w));
+  addJob('PATCH '+key(w)+' '+desc,e);
+  const act='PATCH '+desc+' ✓';
+  (w.acts=w.acts||[]).unshift(stamp()+' '+act);
+}
+
+/* ================= rendering ================= */
+function labelHTML(w,max){
+  return w.lb.slice(0,max).map(l=>'<span class="lbl" style="color:'+LABELS[l]+'">▪'+esc(midTrunc(l,10))+'</span>').join(' ');
+}
+function renderHeader(){
+  const p=proj();
+  const running=S.jobs.filter(j=>j.state==='running');
+  const tabs=PROJECTS.map((pp,i)=>
+    '<span class="seg tab'+(i===S.proj?' on':'')+'" data-tab="'+i+'"><span class="tk">'+(i+1)+':</span><b>'+pp.key+'</b> '+pp.name+'</span>'
+  ).join('<span class="hsep">·</span>');
+  const filt = S.filter==='all'?'':'<span class="seg c-acc">f:'+(S.filter==='fire'?'urgent+high':'untriaged')+'</span>';
+  const srch = S.search?'<span class="seg c-acc">/'+esc(S.search)+'</span>':'';
+  document.getElementById('header').innerHTML=
+    '<span class="seg logo"> plane-tui </span>'+
+    '<span class="seg c-dim">translatemom</span><span class="hsep">│</span>'+tabs+
+    '<div id="hright">'+ srch + filt +
+    '<span class="seg c-dimmer">sort:'+S.sort+'</span>'+
+    (running.length?'<span class="seg jobseg">J '+running.length+' '+FRAMES[S.frame]+'</span>':'<span class="seg c-dimmer">J 0</span>')+
+    '<span class="seg connseg c-dim">todo.translate.mom <span class="dot">●</span></span>'+
+    '</div>';
+  document.querySelectorAll('.seg.tab').forEach(el=>el.onclick=()=>{switchProj(+el.dataset.tab);});
+}
+function cardHTML(w,isCur){
+  const mk=S.marked.has(key(w));
+  const pr=PRIO[w.pr];
+  const due=dueText(w.due);
+  return '<div class="card'+(isCur?' cur':'')+(mk?' marked':'')+'" data-k="'+key(w)+'">'+
+    '<div class="crow"><span class="mk">'+(mk?'✓':' ')+'</span>'+
+    '<span class="key">'+key(w)+'</span><span class="sp"></span>'+
+    '<span class="'+pr.c+' b">'+pr.g+'</span></div>'+
+    '<div class="title">'+esc(w.title)+'</div>'+
+    '<div class="meta">'+labelHTML(w,2)+
+    (due?'<span class="due'+(due.soon?' soon':'')+'">'+due.t+'</span>':'')+
+    '<span class="age">'+timeAgo(w.up)+'</span></div></div>';
+}
+function renderBoard(){
+  const p=proj();
+  const html=STATE_ORDER.map((st,ci)=>{
+    const items=colItems(st);
+    const total=p.counts[st];
+    const more=total-proj().items.filter(w=>w.st===st).length;
+    const cur=(ci===S.col)?Math.min(S.row,Math.max(0,items.length-1)):-1;
+    return '<div class="col"><div class="colhead">'+
+      '<span class="'+STATE[st].c+'">'+STATE[st].g+'</span><span class="b">'+STATE[st].name+'</span>'+
+      '<span class="cnt">'+total+'</span>'+
+      (ci===S.col?'<span class="shown">'+(items.length?(cur+1)+'/'+items.length:'0/0')+'</span>':'')+
+      '</div><div class="colbody" data-col="'+ci+'">'+
+      items.map((w,i)=>cardHTML(w,i===cur)).join('')+
+      (more>0?'<div class="more">… '+more+' more on server · R fetch</div>':'')+
+      '</div></div>';
+  }).join('');
+  document.getElementById('board').innerHTML=html;
+  document.querySelectorAll('.card').forEach(el=>el.onclick=()=>{jumpTo(el.dataset.k);});
+  const curEl=document.querySelector('.card.cur');
+  if(curEl)curEl.scrollIntoView({block:'nearest'});
+}
+function renderList(){
+  const f=flatItems();
+  const cur=Math.min(S.cursor,Math.max(0,f.length-1));
+  let html='<div class="lhead"><span></span><span>p</span><span>key</span><span>title</span><span>state</span><span>labels</span><span style="text-align:right">due</span><span style="text-align:right">updated</span></div>';
+  html+=f.map((w,i)=>{
+    const mk=S.marked.has(key(w)); const pr=PRIO[w.pr]; const st=STATE[w.st]; const due=dueText(w.due);
+    return '<div class="lrow'+(i===cur?' cur':'')+'" data-k="'+key(w)+'">'+
+      '<span class="c-acc b">'+(mk?'✓':'')+'</span>'+
+      '<span class="'+pr.c+' b">'+pr.g+'</span>'+
+      '<span class="lkey num">'+key(w)+'</span>'+
+      '<span>'+esc(w.title)+'</span>'+
+      '<span class="lst '+st.c+'">'+st.g+' '+st.name.toLowerCase()+'</span>'+
+      '<span>'+labelHTML(w,2)+'</span>'+
+      '<span class="ldue '+(due&&due.soon?'c-red':'c-dim')+'">'+(due?due.t:'')+'</span>'+
+      '<span class="lup num">'+timeAgo(w.up)+'</span></div>';
+  }).join('');
+  document.getElementById('list').innerHTML=html;
+  document.querySelectorAll('.lrow').forEach(el=>el.onclick=()=>{jumpTo(el.dataset.k);});
+  const curEl=document.querySelector('.lrow.cur');
+  if(curEl)curEl.scrollIntoView({block:'nearest'});
+}
+function renderInspector(){
+  const w=curItem(); const el=document.getElementById('inspector');
+  if(!w){el.innerHTML='<div class="c-dimmer">no item</div>';return;}
+  const pr=PRIO[w.pr]; const st=STATE[w.st]; const due=dueText(w.due);
+  const url='todo.translate.mom/translatemom/browse/'+key(w);
+  el.innerHTML=
+    '<div class="ikey"><span class="k b">'+key(w)+'</span><span class="'+pr.c+'">'+pr.g+' '+w.pr+'</span><span style="margin-left:auto" class="'+st.c+'">'+st.g+' '+st.name.toLowerCase()+'</span></div>'+
+    '<h2>'+esc(w.title)+'</h2>'+
+    '<hr class="irule">'+
+    '<div class="ifield"><span class="fk">state</span><span class="fv '+st.c+'">'+st.g+' '+st.name+' <span class="c-dimmer">· s to move</span></span></div>'+
+    '<div class="ifield"><span class="fk">priority</span><span class="fv '+pr.c+'">'+pr.g+' '+w.pr+' <span class="c-dimmer">· p to set</span></span></div>'+
+    '<div class="ifield"><span class="fk">labels</span><span class="fv">'+(w.lb.length?labelHTML(w,4):'<span class="c-dimmer">none · t to add</span>')+'</span></div>'+
+    '<div class="ifield"><span class="fk">due</span><span class="fv">'+(w.due?(w.due+' <span class="'+(due.soon?'c-red':'c-dim')+'">· '+due.t+'</span>'):'<span class="c-dimmer">none · d to set</span>')+'</span></div>'+
+    '<div class="ifield"><span class="fk">created</span><span class="fv c-dim">'+absDate(w.cr)+' · '+timeAgo(w.cr)+'</span></div>'+
+    '<div class="ifield"><span class="fk">updated</span><span class="fv c-dim">'+absDate(w.up)+' · '+timeAgo(w.up)+'</span></div>'+
+    '<div class="ifield"><span class="fk">url</span><span class="fv iurl">'+url+' <span class="c-dimmer">· o</span></span></div>'+
+    '<hr class="irule">'+
+    '<div class="isect">description</div>'+
+    '<div class="idesc">'+(w.desc?esc(w.desc):'(no description · e to edit)')+'</div>'+
+    '<hr class="irule">'+
+    '<div class="isect">activity — this session</div>'+
+    ((w.acts&&w.acts.length)?w.acts.slice(0,5).map(a=>'<div class="iact">'+esc(a)+'</div>').join(''):'<div class="iact c-dimmer">no changes yet</div>');
+}
+function renderApi(){
+  const el=document.getElementById('apidrawer');
+  if(!document.body.classList.contains('api-on'))return;
+  el.innerHTML='<div class="ahead">api · '+
+    'base <span class="c-dim">todo.translate.mom</span> · workspace <span class="c-dim">translatemom</span> · auth <span class="c-dim">X-API-Key ••••</span> · contract <span class="c-dim">~/.codex/skills/plane-api</span> · x to close</div>'+
+    S.apilog.map(e=>'<div class="arow"><span class="t">'+e.t+'</span>'+
+      '<span class="m '+e.method.toLowerCase()+'">'+e.method+'</span>'+
+      '<span class="p">'+esc(e.path)+' <span class="c-dimmer">'+esc(e.payload)+'</span></span>'+
+      '<span class="s '+(e.status==='…'?'pend':'ok')+'">'+(e.status==='…'?FRAMES[S.frame]:e.status)+'</span>'+
+      '<span class="ms">'+(e.ms!==null?e.ms+'ms':'')+'</span></div>').join('');
+}
+function renderFooter(){
+  // batch bar
+  document.body.classList.toggle('has-marks',S.marked.size>0);
+  document.getElementById('batchbar').innerHTML=
+    '<b>'+S.marked.size+' marked</b><span class="bk">s</span>state<span class="bk">p</span>priority<span class="bk">t</span>label<span class="bk">o</span>open<span class="bk">I</span>invert<span class="bk">U</span>clear';
+  // quick menu
+  document.body.classList.toggle('menu-on',!!S.menu);
+  const mb=document.getElementById('menubar');
+  const nT=S.marked.size||1;
+  if(S.menu==='state') mb.innerHTML='<span class="mtag">state → '+nT+' item'+(nT>1?'s':'')+'</span>'+
+    Object.keys(STATE).map((st,i)=>'<span class="mkey">'+(i+1)+'</span><span class="mlab"> '+STATE[st].g+' '+STATE[st].name.toLowerCase()+'</span>').join('')+
+    '<span class="c-dimmer">esc cancel</span>';
+  if(S.menu==='prio') mb.innerHTML='<span class="mtag">priority → '+nT+' item'+(nT>1?'s':'')+'</span>'+
+    PRIO_ORDER.map(p=>'<span class="mkey">'+p[0]+'</span><span class="mlab"> '+PRIO[p].g+' '+p+'</span>').join('')+
+    '<span class="c-dimmer">esc cancel</span>';
+  if(S.menu==='label') mb.innerHTML='<span class="mtag">toggle label → '+nT+' item'+(nT>1?'s':'')+'</span>'+
+    Object.keys(LABELS).map((l,i)=>'<span class="mkey">'+(i+1)+'</span><span class="mlab" style="color:'+LABELS[l]+'"> ▪'+esc(midTrunc(l,12))+'</span>').join('')+
+    '<span class="c-dimmer">esc done</span>';
+  // command line
+  const cl=document.getElementById('cmdline');
+  const running=S.jobs.filter(j=>j.state==='running');
+  const jobline=running.length?
+    '<span class="jobline">'+FRAMES[S.frame]+' '+esc(midTrunc(running[0].label,44))+' '+meter(running[0].p,8)+'</span>':'';
+  const f=S.view==='board'?colItems(STATE_ORDER[S.col]):flatItems();
+  const curN=S.view==='board'?Math.min(S.row,Math.max(0,f.length-1)):Math.min(S.cursor,Math.max(0,f.length-1));
+  const pos='<span class="pos">'+(f.length?curN+1:0)+'/'+f.length+(S.view==='board'?' · '+STATE[STATE_ORDER[S.col]].name.toLowerCase():'')+'</span>';
+  if(S.mode){
+    cl.innerHTML='<span class="prompt">'+(S.mode==='search'?'/':':')+'</span><span class="typed">'+esc(S.itext)+'</span><span class="cursor">█</span>'+jobline;
+  }else{
+    cl.innerHTML='<span class="statusmsg">'+(S.status||('<b>'+proj().key+'</b> '+proj().name+' · '+proj().total+' work items'))+'</span>'+jobline+pos;
+  }
+  // palette
+  document.body.classList.toggle('palette-on',S.mode==='cmd');
+  if(S.mode==='cmd')renderPalette();
+  // hints
+  document.getElementById('hints').innerHTML=
+    '<b>j/k h/l</b> move · <b>⏎</b> detail · <b>m</b> mark · <b>s</b> state · <b>p</b> priority · <b>t</b> label · <b>T</b> triage · <b>v</b> view · <b>/</b> search · <b>:</b> cmd · <b>x</b> api · <b>1-3</b> project · <b>?</b> keys';
+}
+/* ---------- command palette (wildmenu) ---------- */
+const COMMANDS=[
+  {n:'new',        d:'create work item — :new <title> → POST /work-items/', k:'n',  run:(a)=>{cmdNew(a);}},
+  {n:'triage',     d:'sweep untriaged backlog, one keystroke per item',     k:'T',  run:()=>startTriage()},
+  {n:'state',      d:'move item(s) between states',                         k:'s',  run:()=>{S.menu='state';}},
+  {n:'priority',   d:'set priority on item(s)',                             k:'p',  run:()=>{S.menu='prio';}},
+  {n:'label',      d:'toggle labels on item(s)',                            k:'t',  run:()=>{S.menu='label';}},
+  {n:'open',       d:'open canonical /browse/ URL in browser',              k:'o',  run:()=>openItems()},
+  {n:'view',       d:'toggle board ⇄ list',                                 k:'v',  run:()=>{S.view=S.view==='board'?'list':'board';}},
+  {n:'project',    d:'switch project — :project 2 or key 1/2/3',            k:'1-3',run:(a)=>{const i=parseInt(a)-1;if(PROJECTS[i]!==undefined)switchProj(i);}},
+  {n:'filter fire',d:'show only urgent + high',                             k:'f',  run:()=>{S.filter='fire';}},
+  {n:'filter untriaged',d:'show only items with no priority',               k:'f',  run:()=>{S.filter='untriaged';}},
+  {n:'filter clear',d:'show everything',                                    k:'f',  run:()=>{S.filter='all';}},
+  {n:'sort',       d:'cycle sort — priority / updated / created / key',     k:'S',  run:()=>cycleSort()},
+  {n:'refresh',    d:'GET next page of work items from server',             k:'R',  run:()=>refresh()},
+  {n:'api',        d:'toggle the api call log drawer',                      k:'x',  run:()=>{document.body.classList.toggle('api-on');}},
+  {n:'marks clear',d:'clear all marks',                                     k:'U',  run:()=>{S.marked.clear();}},
+  {n:'help',       d:'show all key bindings',                               k:'?',  run:()=>{document.getElementById('keysoverlay').classList.add('on');}},
+];
+function palMatches(){
+  const q=S.itext.toLowerCase().split(' ')[0];
+  return COMMANDS.filter(c=>c.n.startsWith(q)||c.n.includes(q));
+}
+function renderPalette(){
+  const m=palMatches();
+  S.palSel=Math.min(S.palSel,Math.max(0,m.length-1));
+  document.getElementById('palettebox').innerHTML=m.map((c,i)=>
+    '<div class="prow'+(i===S.palSel?' sel':'')+'"><span class="pn">:'+c.n+'</span><span class="pd">'+c.d+'</span><span class="pk">'+c.k+'</span></div>'
+  ).join('')||'<div class="prow"><span class="pd c-dimmer">no matching command</span></div>';
+}
+/* ---------- triage ---------- */
+function startTriage(){
+  const q=proj().items.filter(w=>w.st==='backlog'&&w.pr==='none').map(w=>key(w));
+  if(!q.length){flash('nothing untriaged in loaded page — R to fetch more');return;}
+  const untriagedTotal = proj().key==='TMOM'?76:q.length; // server-side count of backlog∧no-priority
+  S.triage={queue:q,idx:0,decided:0,promoted:0,dropped:0,total:untriagedTotal};
+  renderTriage();
+  document.getElementById('triageoverlay').classList.add('on');
+}
+function renderTriage(){
+  const t=S.triage; if(!t)return;
+  const box=document.getElementById('triagebox');
+  if(t.idx>=t.queue.length){
+    box.innerHTML='<div class="otitle"> triage · backlog sweep </div>'+
+      '<div class="osec"><span class="meter">'+meter(t.decided/t.total,24)+'</span>  '+t.decided+'/'+t.total+' triaged</div>'+
+      '<div class="osec" style="margin-top:8px">local page drained — <span class="c-acc b">'+t.promoted+' promoted</span> · <span class="c-red">'+t.dropped+' dropped</span> · '+(t.decided-t.promoted-t.dropped)+' prioritized in place</div>'+
+      '<div class="osec c-dim" style="margin-top:8px">'+(t.total-t.decided)+' more on the server · <span class="c-acc">R</span> fetch next page and continue · <span class="c-acc">q</span> done</div>';
+    return;
+  }
+  const w=byKey(t.queue[t.idx]);
+  box.innerHTML='<div class="otitle"> triage · backlog sweep — one keystroke per item </div>'+
+    '<div class="osec"><span class="meter">'+meter(t.decided/t.total,24)+'</span>  '+t.decided+'/'+t.total+' triaged · '+t.promoted+' promoted · '+t.dropped+' dropped</div>'+
+    '<div class="titem"><div class="tkey">'+key(w)+' · created '+timeAgo(w.cr)+' · no priority</div>'+
+    '<div class="ttl2">'+esc(w.title)+'</div></div>'+
+    '<div class="trow"><span class="tk">priority</span>'+PRIO_ORDER.map(p=>'<span class="to"><b>'+p[0]+'</b><span> '+p+'</span></span>').join('')+'</div>'+
+    '<div class="trow"><span class="tk">state</span><span class="to"><b>2</b><span> todo</span></span><span class="to"><b>3</b><span> in-progress</span></span><span class="to"><b>5</b><span> cancelled</span></span></div>'+
+    '<div class="trow" style="margin-top:6px"><span class="tk"></span><span class="to"><b>⏎</b><span> keep · skip</span></span><span class="to"><b>q</b><span> finish sweep</span></span></div>';
+}
+function triageKey(e){
+  const t=S.triage;
+  if(e.key==='q'||e.key==='Escape'){S.triage=null;document.getElementById('triageoverlay').classList.remove('on');flash('triage: '+t.decided+' decisions this sweep');render();return;}
+  if(t.idx>=t.queue.length){if(e.key==='R'){flash('GET next page — prototype has one page loaded');}return;}
+  const w=byKey(t.queue[t.idx]);
+  const pk={u:'urgent',h:'high',m:'medium',l:'low',n:'none'}[e.key];
+  if(pk){if(pk!=='none'){mutate(w,{pr:pk},'priority→'+pk);}t.decided++;t.idx++;}
+  else if(e.key==='2'){mutate(w,{st:'todo'},'state→todo');t.decided++;t.promoted++;t.idx++;}
+  else if(e.key==='3'){mutate(w,{st:'started'},'state→in-progress');t.decided++;t.promoted++;t.idx++;}
+  else if(e.key==='5'){mutate(w,{st:'cancelled'},'state→cancelled');t.decided++;t.dropped++;t.idx++;}
+  else if(e.key==='Enter'){t.decided++;t.idx++;}
+  else return;
+  renderTriage(); render();
+}
+/* ---------- actions ---------- */
+function flash(msg){S.status=msg;clearTimeout(S._ft);S._ft=setTimeout(()=>{S.status='';render();},3200);}
+function jumpTo(k){
+  const w=byKey(k); if(!w)return;
+  if(S.view==='board'){S.col=STATE_ORDER.indexOf(w.st);S.row=colItems(w.st).findIndex(x=>key(x)===k);}
+  else S.cursor=flatItems().findIndex(x=>key(x)===k);
+  render();
+}
+function switchProj(i){
+  S.proj=i;S.col=1;S.row=0;S.cursor=0;S.marked.clear();S.search='';S.filter='all';
+  const p=PROJECTS[i];
+  const e=api('GET','…/projects/'+p.key.toLowerCase()+'…/work-items/?per_page=100','',p.key);
+  addJob('GET '+p.key+' work-items',e,700);
+  flash('project → '+p.key+' '+p.name+' · '+p.total+' items');
+}
+function applyState(idx){
+  const st=Object.keys(STATE)[idx];
+  if(!st)return;
+  targets().forEach(w=>mutate(w,{st},'state→'+st));
+  S.menu=null;S.marked.clear();
+}
+function applyPrio(ch){
+  const p={u:'urgent',h:'high',m:'medium',l:'low',n:'none'}[ch];
+  if(!p)return;
+  targets().forEach(w=>mutate(w,{pr:p},'priority→'+p));
+  S.menu=null;S.marked.clear();
+}
+function applyLabel(idx){
+  const l=Object.keys(LABELS)[idx];
+  if(!l)return;
+  targets().forEach(w=>{
+    const has=w.lb.includes(l);
+    w.lb=has?w.lb.filter(x=>x!==l):[...w.lb,l];
+    mutate(w,{},'labels '+(has?'−':'+')+l);
+  });
+}
+function openItems(){
+  targets().forEach(w=>{
+    addJob('open browse/'+key(w),null,500);
+  });
+  flash('opening '+targets().length+' item(s) at todo.translate.mom/translatemom/browse/…');
+}
+function cmdNew(title){
+  title=(title||'').trim();
+  if(!title){flash(':new needs a title — :new fix onboarding copy');return;}
+  const p=proj();
+  const maxSeq=Math.max(...p.items.map(w=>w.seq));
+  const w=it(maxSeq+1,title,'backlog','none',[],null,'2026-07-02','2026-07-02');
+  p.items.unshift(w);p.counts.backlog++;p.total++;
+  const e=api('POST','…/work-items/','{"name":"'+title.slice(0,28)+'…"}',key(w));
+  addJob('POST '+key(w)+' create',e);
+  flash('created '+key(w)+' in backlog');
+  jumpTo(key(w));
+}
+function cycleSort(){
+  const order=['prio','updated','created','key'];
+  S.sort=order[(order.indexOf(S.sort)+1)%order.length];
+  flash('sort → '+S.sort);
+}
+function cycleFilter(){
+  const order=['all','fire','untriaged'];
+  S.filter=order[(order.indexOf(S.filter)+1)%order.length];
+  flash('filter → '+(S.filter==='all'?'everything':S.filter==='fire'?'urgent + high only':'no-priority only'));
+}
+function refresh(){
+  const e=api('GET','…/work-items/?per_page=100&cursor=100:1:0','','page 2');
+  addJob('GET work-items page 2',e,1400);
+  flash('fetching next 100 of '+proj().total+' — prototype holds one page');
+}
+/* ---------- command line ---------- */
+function enterMode(m){S.mode=m;S.itext='';S.palSel=0;}
+function exitMode(commit){
+  if(S.mode==='search'){
+    if(commit)S.prevSearch=S.itext;
+    S.search=commit?S.itext:'';
+  }
+  if(S.mode==='cmd'&&commit){
+    const m=palMatches();
+    const c=m[S.palSel];
+    if(c){const arg=S.itext.split(' ').slice(1).join(' ');c.run(arg);}
+  }
+  S.mode=null;S.itext='';
+}
+function handleModeKey(e){
+  if(e.key==='Escape'){exitMode(false);}
+  else if(e.key==='Enter'){exitMode(true);}
+  else if(e.key==='Backspace'){S.itext=S.itext.slice(0,-1);if(S.mode==='search')S.search=S.itext;}
+  else if(e.key==='ArrowDown'||(e.ctrlKey&&e.key==='n')){S.palSel++;}
+  else if(e.key==='ArrowUp'||(e.ctrlKey&&e.key==='p')){S.palSel=Math.max(0,S.palSel-1);}
+  else if(e.key==='Tab'){e.preventDefault();const m=palMatches();if(m[S.palSel])S.itext=m[S.palSel].n+' ';}
+  else if(e.key.length===1&&!e.metaKey&&!e.ctrlKey){S.itext+=e.key;if(S.mode==='search')S.search=S.itext;S.palSel=0;}
+  else return;
+  e.preventDefault();render();
+}
+/* ---------- global keys ---------- */
+document.addEventListener('keydown',e=>{
+  if(document.body.classList.contains('notes-on')){if(e.key==='!'||e.key==='Escape'){document.body.classList.remove('notes-on');}return;}
+  if(document.getElementById('keysoverlay').classList.contains('on')){if(e.key==='?'||e.key==='Escape'||e.key==='q'){document.getElementById('keysoverlay').classList.remove('on');}return;}
+  if(S.triage){triageKey(e);e.preventDefault();return;}
+  if(S.menu){
+    if(e.key==='Escape'||(S.menu==='label'&&e.key==='Enter')){S.menu=null;render();return;}
+    if(S.menu==='state'&&/[1-5]/.test(e.key)){applyState(+e.key-1);}
+    else if(S.menu==='prio'){applyPrio(e.key);}
+    else if(S.menu==='label'&&/[1-8]/.test(e.key)){applyLabel(+e.key-1);}
+    render();return;
+  }
+  if(S.mode){handleModeKey(e);return;}
+  const f=S.view==='board'?colItems(STATE_ORDER[S.col]):flatItems();
+  const max=Math.max(0,f.length-1);
+  switch(e.key){
+    case 'j': case 'ArrowDown': if(S.view==='board')S.row=Math.min(max,S.row+1);else S.cursor=Math.min(max,S.cursor+1);break;
+    case 'k': case 'ArrowUp':   if(S.view==='board')S.row=Math.max(0,S.row-1);else S.cursor=Math.max(0,S.cursor-1);break;
+    case 'h': case 'ArrowLeft': if(S.view==='board'){S.col=Math.max(0,S.col-1);S.row=Math.min(S.row,Math.max(0,colItems(STATE_ORDER[S.col]).length-1));}break;
+    case 'l': case 'ArrowRight':if(S.view==='board'){S.col=Math.min(STATE_ORDER.length-1,S.col+1);S.row=Math.min(S.row,Math.max(0,colItems(STATE_ORDER[S.col]).length-1));}break;
+    case 'g': if(performance.now()-S.lastg<400){if(S.view==='board')S.row=0;else S.cursor=0;}S.lastg=performance.now();break;
+    case 'G': if(S.view==='board')S.row=max;else S.cursor=max;break;
+    case 'm': {const w=curItem();if(w){const k=key(w);S.marked.has(k)?S.marked.delete(k):S.marked.add(k);if(S.view==='board')S.row=Math.min(max,S.row+1);else S.cursor=Math.min(max,S.cursor+1);}break;}
+    case 'I': {const all=flatItems().map(key);const nw=new Set(all.filter(k=>!S.marked.has(k)));S.marked=nw;break;}
+    case 'U': S.marked.clear();break;
+    case 'v': S.view=S.view==='board'?'list':'board';break;
+    case 's': if(curItem())S.menu='state';break;
+    case 'p': if(curItem())S.menu='prio';break;
+    case 't': if(curItem())S.menu='label';break;
+    case 'o': openItems();break;
+    case 'n': enterMode('cmd');S.itext='new ';break;
+    case 'T': startTriage();break;
+    case 'R': refresh();break;
+    case 'x': document.body.classList.toggle('api-on');break;
+    case 'f': cycleFilter();break;
+    case 'S': cycleSort();break;
+    case '/': enterMode('search');e.preventDefault();break;
+    case ':': enterMode('cmd');e.preventDefault();break;
+    case '1': case '2': case '3': switchProj(+e.key-1);break;
+    case '?': document.getElementById('keysoverlay').classList.add('on');break;
+    case '!': document.body.classList.add('notes-on');break;
+    case 'Enter': break; // detail already always visible in inspector
+    default: return;
+  }
+  e.preventDefault();render();
+});
+/* ---------- render root ---------- */
+function render(){
+  renderHeader();
+  document.getElementById('board').style.display=S.view==='board'?'flex':'none';
+  document.getElementById('list').style.display=S.view==='list'?'block':'none';
+  if(S.view==='board')renderBoard();else renderList();
+  renderInspector();
+  renderApi();
+  renderFooter();
+}
+/* ---------- design-notes pins ---------- */
+const PINS=[
+  {n:1,x:'8%',y:'54px'},        // backlog column count
+  {n:2,x:'23%',y:'6px'},        // project tabs
+  {n:3,x:'33%',y:'112px'},      // priority glyph on card
+  {n:4,x:'30%',y:'170px'},      // cursor vs marks
+  {n:5,x:'44%',y:'44%'},        // triage (center-ish)
+  {n:6,x:'71%',y:'6px'},        // jobs segment
+  {n:7,x:'62%',y:'calc(100% - 92px)'}, // api drawer region
+  {n:8,x:'calc(100% - 440px)',y:'70px'}, // inspector
+  {n:9,x:'34%',y:'calc(100% - 66px)'},   // menus/cmdline
+  {n:10,x:'12%',y:'calc(100% - 44px)'},  // hints
+  {n:11,x:'9%',y:'calc(100% - 130px)'},  // more-on-server
+];
+PINS.forEach(p=>{
+  const el=document.createElement('div');el.className='pin';el.textContent=p.n;
+  el.style.left=p.x;el.style.top=p.y;document.getElementById('app').appendChild(el);
+});
+/* ---------- boot: seed api log like a real startup ---------- */
+[['GET','/api/v1/workspaces/translatemom/projects/','','7 projects',84],
+ ['GET','…/projects/302657e0…/states/','','5 states',67],
+ ['GET','…/projects/302657e0…/labels/','','8 labels',71],
+ ['GET','…/projects/302657e0…/work-items/?per_page=100&order_by=-updated_at','','100 of 120',412],
+].reverse().forEach(([m,p,pl,note,ms])=>{const e=api(m,p,pl,note);e.status='200';e.ms=ms;});
+setInterval(()=>{S.frame=(S.frame+1)%FRAMES.length;
+  if(S.jobs.some(j=>j.state==='running')||document.body.classList.contains('api-on'))render();
+},130);
+addJob('GET cycles + modules',api('GET','…/projects/302657e0…/cycles/','','0 cycles'),1100);
+flash('connected · translatemom @ todo.translate.mom · TMOM 120 items — 88 backlog, 86 unprioritized · T to triage');
+render();
+</script>
+</body>
+</html>
