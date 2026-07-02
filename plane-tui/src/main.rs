@@ -2391,11 +2391,10 @@ impl App {
         }
         let frame = LayoutFrame::new(width, height);
         draw_outer_frame(&mut stdout, frame)?;
-        self.draw_titlebar(&mut stdout, frame, width, height)?;
-        self.draw_header(&mut stdout, frame.x, frame.width, frame.y + 1)?;
+        self.draw_header(&mut stdout, frame.x, frame.width, frame.y)?;
         let footer_height = if self.api_open { 8 } else { 3 };
-        let body_top = frame.y + 2;
-        let body_height = frame.height.saturating_sub(2 + footer_height);
+        let body_top = frame.y + 1;
+        let body_height = frame.height.saturating_sub(1 + footer_height);
         let inspector_width = if frame.width >= 130 {
             46
         } else if frame.width >= 105 {
@@ -2442,52 +2441,6 @@ impl App {
         }
         queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
         stdout.flush()?;
-        Ok(())
-    }
-
-    fn draw_titlebar(
-        &self,
-        out: &mut io::Stdout,
-        frame: LayoutFrame,
-        term_width: u16,
-        term_height: u16,
-    ) -> Result<()> {
-        draw_cell(
-            out,
-            frame.x,
-            frame.y,
-            frame.width,
-            "",
-            DIM,
-            Some(BG_RAISE),
-            false,
-        )?;
-        let mut x = frame.x + 2;
-        for _ in 0..3 {
-            draw_span(out, &mut x, frame.y, "□", DIM, Some(BG_RAISE), false)?;
-            x += 1;
-        }
-        let title = format!(
-            "plane-tui — kitty · {} — {}x{}",
-            self.client
-                .config
-                .base_url
-                .replace("https://", "")
-                .replace("http://", ""),
-            term_width,
-            term_height
-        );
-        if frame.width as usize > title.width() {
-            let title_x = frame.x + frame.width.saturating_sub(title.width() as u16) / 2;
-            queue!(
-                out,
-                MoveTo(title_x, frame.y),
-                SetForegroundColor(DIM),
-                SetBackgroundColor(BG_RAISE),
-                Print(title),
-                ResetColor
-            )?;
-        }
         Ok(())
     }
 
