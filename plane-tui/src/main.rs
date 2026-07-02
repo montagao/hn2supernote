@@ -3192,6 +3192,9 @@ impl App {
         width: u16,
         height: u16,
     ) -> Result<()> {
+        let content_x = x.saturating_add(1);
+        let content_width = width.saturating_sub(1);
+        clear_area(out, content_x, y, content_width, height, Some(BG))?;
         for row in 0..height {
             queue!(
                 out,
@@ -3202,12 +3205,19 @@ impl App {
             )?;
         }
         let Some(item) = self.current_item() else {
-            draw_cell(out, x + 1, y, width - 1, "no item", DIM, None, false)?;
+            draw_cell(
+                out,
+                content_x,
+                y,
+                content_width,
+                "no item",
+                DIM,
+                None,
+                false,
+            )?;
             return Ok(());
         };
         let mut row = y;
-        let content_x = x + 1;
-        let content_width = width.saturating_sub(1);
         draw_cell(out, content_x, row, content_width, "", DIM, None, false)?;
         let mut cursor = content_x;
         draw_span(out, &mut cursor, row, &item.key, DIM, Some(BG), true)?;
