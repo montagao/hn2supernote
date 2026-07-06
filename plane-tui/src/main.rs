@@ -3,7 +3,7 @@ use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
@@ -68,6 +68,22 @@ fn agent_wip() -> usize {
     env_u64("PLANE_TUI_AGENT_WIP", 3).max(1) as usize
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoSource {
+    Default,      // --repo-dir: always available, can't be removed here
+    Env,          // PLANE_TUI_REPOS: managed outside the TUI
+    Saved,        // repos.tsv: the wizard's own entries
+    Unregistered, // discovered but not yet a dispatch target
+}
+
+#[derive(Debug, Clone)]
+struct RepoPick {
+    name: String,
+    path: PathBuf,
+    kind: &'static str, // "repo" | "submodule"
+    source: RepoSource,
+}
+
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
@@ -77,35 +93,77 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Repos agents can be dispatched into. Entry 0 is --repo-dir; more come
-/// from PLANE_TUI_REPOS="mono=~/projects/translatemom-mono,apps=~/x".
+fn env_repos() -> Vec<(String, PathBuf)> {
+    let Ok(raw) = std::env::var("PLANE_TUI_REPOS") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|pair| {
+            let (name, path) = pair.split_once('=')?;
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name, expand_tilde(path.trim())))
+        })
+        .collect()
+}
+
+fn repos_registry_path() -> Result<PathBuf> {
+    Ok(plane_tui_data_dir()?.join("repos.tsv"))
+}
+
+fn saved_repos() -> Vec<(String, PathBuf)> {
+    let Ok(path) = repos_registry_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|line| {
+            let (name, path) = line.split_once('\t')?;
+            Some((name.to_owned(), PathBuf::from(path)))
+        })
+        .collect()
+}
+
+fn save_repos(repos: &[(String, PathBuf)]) -> Result<()> {
+    let path = repos_registry_path()?;
+    let body = repos
+        .iter()
+        .map(|(name, path)| format!("{name}\t{}\n", path.display()))
+        .collect::<String>();
+    fs::write(path, body).context("writing repos.tsv")
+}
+
+/// Repos agents can be dispatched into: --repo-dir first, then the wizard's
+/// persisted picks (repos.tsv, managed via :repos), then PLANE_TUI_REPOS.
 /// The chosen repo decides everything downstream: worktree, branch, push
 /// target, and where `P` opens the PR — dispatch notes never can.
 fn repo_registry(config: &Config) -> Vec<(String, PathBuf)> {
     let mut repos: Vec<(String, PathBuf)> = Vec::new();
+    let push = |name: String, path: PathBuf, repos: &mut Vec<(String, PathBuf)>| {
+        if !repos
+            .iter()
+            .any(|(have, have_path)| *have == name || *have_path == path)
+        {
+            repos.push((name, path));
+        }
+    };
     if let Some(dir) = &config.repo_dir {
         let path = expand_tilde(dir);
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_owned());
-        repos.push((name, path));
+        push(name, path, &mut repos);
     }
-    if let Ok(raw) = std::env::var("PLANE_TUI_REPOS") {
-        for pair in raw.split(',') {
-            let Some((name, path)) = pair.split_once('=') else {
-                continue;
-            };
-            let name = name.trim().to_owned();
-            let path = expand_tilde(path.trim());
-            if !name.is_empty()
-                && !repos
-                    .iter()
-                    .any(|(have, have_path)| *have == name || *have_path == path)
-            {
-                repos.push((name, path));
-            }
-        }
+    for (name, path) in saved_repos() {
+        push(name, path, &mut repos);
+    }
+    for (name, path) in env_repos() {
+        push(name, path, &mut repos);
     }
     repos
 }
@@ -1038,6 +1096,8 @@ struct App {
     dispatch_interactive: bool,
     dispatch_brief: bool,
     dispatch_repo: usize,
+    repo_wizard: Option<Vec<RepoPick>>,
+    repo_wizard_sel: usize,
     feedback_job: Option<String>,
     feedback_backend: Option<AgentBackend>,
     land_job: Option<String>,
@@ -1166,6 +1226,8 @@ impl App {
             dispatch_interactive: false,
             dispatch_brief: false,
             dispatch_repo: 0,
+            repo_wizard: None,
+            repo_wizard_sel: 0,
             feedback_job: None,
             feedback_backend: None,
             land_job: None,
@@ -1660,6 +1722,240 @@ impl App {
     }
 
     // ------------------------------------------------------ agent cockpit
+
+    /// `:repos` / `R` in the dispatch menu: discover git repos and manage
+    /// which ones are dispatch targets.
+    fn open_repo_wizard(&mut self) {
+        let picks = self.discover_repos();
+        if picks.is_empty() {
+            self.status =
+                "no git repos found — set --repo-dir or PLANE_TUI_PROJECTS_DIR".to_owned();
+            return;
+        }
+        self.repo_wizard = Some(picks);
+        self.repo_wizard_sel = 0;
+        self.force_clear = true;
+    }
+
+    /// Candidates: everything registered, plus sibling git repos under the
+    /// projects dir (PLANE_TUI_PROJECTS_DIR, default --repo-dir's parent),
+    /// plus initialized submodules of --repo-dir.
+    fn discover_repos(&self) -> Vec<RepoPick> {
+        let config = &self.client.config;
+        let default_path = config.repo_dir.as_deref().map(expand_tilde);
+        let env_pairs = env_repos();
+        let saved = saved_repos();
+        let mut picks: Vec<RepoPick> = Vec::new();
+        let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+        let push = |name: String, path: PathBuf, kind: &'static str, picks: &mut Vec<RepoPick>, seen: &mut BTreeSet<PathBuf>| {
+            if !seen.insert(path.clone()) {
+                return;
+            }
+            let source = if default_path.as_ref() == Some(&path) {
+                RepoSource::Default
+            } else if env_pairs.iter().any(|(_, have)| *have == path) {
+                RepoSource::Env
+            } else if saved.iter().any(|(_, have)| *have == path) {
+                RepoSource::Saved
+            } else {
+                RepoSource::Unregistered
+            };
+            picks.push(RepoPick {
+                name,
+                path,
+                kind,
+                source,
+            });
+        };
+        for (name, path) in repo_registry(config) {
+            push(name, path, "repo", &mut picks, &mut seen);
+        }
+        // submodules of the default repo — the case a note can't reach
+        if let Some(repo) = &default_path {
+            let mut submodules = Command::new("git");
+            submodules
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "config",
+                    "--file",
+                    ".gitmodules",
+                    "--get-regexp",
+                    r"^submodule\..*\.path$",
+                ])
+                .stdin(Stdio::null());
+            if let Ok(output) = submodules.output() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let Some((_, rel)) = line.split_once(' ') else {
+                        continue;
+                    };
+                    let path = repo.join(rel.trim());
+                    if path.join(".git").exists() {
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| rel.trim().to_owned());
+                        push(name, path, "submodule", &mut picks, &mut seen);
+                    }
+                }
+            }
+        }
+        // sibling repos under the projects dir
+        let projects_dir = std::env::var("PLANE_TUI_PROJECTS_DIR")
+            .map(|raw| expand_tilde(&raw))
+            .ok()
+            .or_else(|| default_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)))
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|home| PathBuf::from(home).join("projects"))
+            });
+        if let Some(projects_dir) = projects_dir {
+            if let Ok(entries) = fs::read_dir(&projects_dir) {
+                let mut siblings: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir() && path.join(".git").exists())
+                    .collect();
+                siblings.sort();
+                for path in siblings {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "repo".to_owned());
+                    push(name, path, "repo", &mut picks, &mut seen);
+                }
+            }
+        }
+        picks
+    }
+
+    fn handle_repo_wizard_key(&mut self, key: KeyEvent) -> Result<()> {
+        let len = self.repo_wizard.as_ref().map(Vec::len).unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.repo_wizard = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.repo_wizard_sel = min(self.repo_wizard_sel + 1, len.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.repo_wizard_sel = self.repo_wizard_sel.saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let sel = self.repo_wizard_sel;
+                let Some(pick) = self
+                    .repo_wizard
+                    .as_ref()
+                    .and_then(|picks| picks.get(sel))
+                    .cloned()
+                else {
+                    return Ok(());
+                };
+                match pick.source {
+                    RepoSource::Default => {
+                        self.status = format!("{} is --repo-dir — always available", pick.name);
+                    }
+                    RepoSource::Env => {
+                        self.status = format!(
+                            "{} comes from PLANE_TUI_REPOS — manage it there",
+                            pick.name
+                        );
+                    }
+                    RepoSource::Saved => {
+                        let mut saved = saved_repos();
+                        saved.retain(|(_, path)| *path != pick.path);
+                        let result = save_repos(&saved);
+                        self.soft(result);
+                        if let Some(picks) = &mut self.repo_wizard {
+                            picks[sel].source = RepoSource::Unregistered;
+                        }
+                        self.status = format!("{} removed from dispatch targets", pick.name);
+                    }
+                    RepoSource::Unregistered => {
+                        let mut saved = saved_repos();
+                        let mut name = pick.name.clone();
+                        let taken = |name: &str, saved: &[(String, PathBuf)]| {
+                            saved.iter().any(|(have, _)| have == name)
+                                || env_repos().iter().any(|(have, _)| have == name)
+                        };
+                        let mut n = 2;
+                        while taken(&name, &saved) {
+                            name = format!("{}-{n}", pick.name);
+                            n += 1;
+                        }
+                        saved.push((name.clone(), pick.path.clone()));
+                        let result = save_repos(&saved);
+                        self.soft(result);
+                        if let Some(picks) = &mut self.repo_wizard {
+                            picks[sel].source = RepoSource::Saved;
+                        }
+                        self.status =
+                            format!("{name} added — r in the dispatch menu selects it");
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.force_clear = true;
+        Ok(())
+    }
+
+    fn draw_repo_wizard(&self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+        let Some(picks) = &self.repo_wizard else {
+            return Ok(());
+        };
+        let box_width = min(width.saturating_sub(6), 100);
+        let box_height = min(height.saturating_sub(4), (picks.len() as u16 + 6).max(10));
+        let x = width.saturating_sub(box_width) / 2;
+        let y = height.saturating_sub(box_height) / 2;
+        draw_modal_shell(out, x, y, box_width, box_height, "repos · dispatch targets")?;
+        let inner_x = x + 2;
+        let inner_width = box_width.saturating_sub(4);
+        let mut row = y + 2;
+        let visible = box_height.saturating_sub(5) as usize;
+        let start = self.repo_wizard_sel.saturating_sub(visible.saturating_sub(1));
+        for (position, pick) in picks.iter().enumerate().skip(start).take(visible) {
+            let selected = position == self.repo_wizard_sel;
+            let mark = match pick.source {
+                RepoSource::Unregistered => "[ ]",
+                _ => "[✓]",
+            };
+            let origin = match pick.source {
+                RepoSource::Default => "--repo-dir",
+                RepoSource::Env => "env",
+                RepoSource::Saved => "saved",
+                RepoSource::Unregistered => "",
+            };
+            let text = format!(
+                " {mark} {:<18} {:<9} {:<10} {}",
+                truncate(&pick.name, 18),
+                pick.kind,
+                origin,
+                truncate(&pick.path.display().to_string(), 48),
+            );
+            let (fg, bg) = if selected {
+                (Color::Black, Some(PAPER))
+            } else if pick.source == RepoSource::Unregistered {
+                (DIM, Some(BG))
+            } else {
+                (TEXT, Some(BG))
+            };
+            draw_cell(out, inner_x, row, inner_width, &text, fg, bg, selected)?;
+            row += 1;
+        }
+        draw_cell(
+            out,
+            inner_x,
+            y + box_height.saturating_sub(2),
+            inner_width,
+            "enter/space add·remove · j/k move · esc close · r in dispatch menu cycles these",
+            DIM,
+            Some(BG),
+            false,
+        )?;
+        Ok(())
+    }
 
     /// `d` on the selected item: choose an executor, then an optional note.
     fn start_dispatch(&mut self) {
@@ -2910,6 +3206,9 @@ impl App {
             }
             return Ok(());
         }
+        if self.repo_wizard.is_some() {
+            return self.handle_repo_wizard_key(key);
+        }
         if self.jobs_open {
             return self.handle_jobs_key(key);
         }
@@ -3301,6 +3600,14 @@ impl App {
                         self.force_clear = true;
                         None
                     }
+                    KeyCode::Char('R') => {
+                        self.menu = None;
+                        self.dispatch_item = None;
+                        self.open_repo_wizard();
+                        self.status =
+                            "repo wizard — press d again after picking".to_owned();
+                        None
+                    }
                     _ => None,
                 };
                 if let Some(backend) = chosen {
@@ -3666,6 +3973,10 @@ impl App {
             "api" => {
                 self.api_open = !self.api_open;
                 self.force_clear = true;
+                false
+            }
+            "repos" => {
+                self.open_repo_wizard();
                 false
             }
             "help" => {
@@ -4798,6 +5109,9 @@ impl App {
         }
         if self.jobs_open {
             self.draw_jobs_overlay(&mut stdout, width, height)?;
+        }
+        if self.repo_wizard.is_some() {
+            self.draw_repo_wizard(&mut stdout, width, height)?;
         }
         queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
         stdout.flush()?;
@@ -8024,7 +8338,7 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         value_x,
         row,
         "/  :  f  S",
-        "search · command (:new, :project, :backend) · filter · sort",
+        "search · command (:new, :project, :backend, :repos) · filter · sort",
     )?;
     row += 1;
     draw_shortcut_row(out, left, value_x, row, "? / q / esc", "close this panel")?;
