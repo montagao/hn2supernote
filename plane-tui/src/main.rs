@@ -68,6 +68,48 @@ fn agent_wip() -> usize {
     env_u64("PLANE_TUI_AGENT_WIP", 3).max(1) as usize
 }
 
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Repos agents can be dispatched into. Entry 0 is --repo-dir; more come
+/// from PLANE_TUI_REPOS="mono=~/projects/translatemom-mono,apps=~/x".
+/// The chosen repo decides everything downstream: worktree, branch, push
+/// target, and where `P` opens the PR — dispatch notes never can.
+fn repo_registry(config: &Config) -> Vec<(String, PathBuf)> {
+    let mut repos: Vec<(String, PathBuf)> = Vec::new();
+    if let Some(dir) = &config.repo_dir {
+        let path = expand_tilde(dir);
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_owned());
+        repos.push((name, path));
+    }
+    if let Ok(raw) = std::env::var("PLANE_TUI_REPOS") {
+        for pair in raw.split(',') {
+            let Some((name, path)) = pair.split_once('=') else {
+                continue;
+            };
+            let name = name.trim().to_owned();
+            let path = expand_tilde(path.trim());
+            if !name.is_empty()
+                && !repos
+                    .iter()
+                    .any(|(have, have_path)| *have == name || *have_path == path)
+            {
+                repos.push((name, path));
+            }
+        }
+    }
+    repos
+}
+
 /// The fixed working-rules envelope every executor prompt ends with — the
 /// autonomy line in text form: commit but never publish, stop-and-ask via
 /// a leading `QUESTION:` when blocked.
@@ -995,6 +1037,7 @@ struct App {
     dispatch_backend: AgentBackend,
     dispatch_interactive: bool,
     dispatch_brief: bool,
+    dispatch_repo: usize,
     feedback_job: Option<String>,
     feedback_backend: Option<AgentBackend>,
     land_job: Option<String>,
@@ -1122,6 +1165,7 @@ impl App {
             dispatch_backend: AgentBackend::Codex,
             dispatch_interactive: false,
             dispatch_brief: false,
+            dispatch_repo: 0,
             feedback_job: None,
             feedback_backend: None,
             land_job: None,
@@ -1619,9 +1663,9 @@ impl App {
 
     /// `d` on the selected item: choose an executor, then an optional note.
     fn start_dispatch(&mut self) {
-        if self.client.config.repo_dir.is_none() {
+        if repo_registry(&self.client.config).is_empty() {
             self.status =
-                "dispatch needs --repo-dir / PLANE_TUI_REPO_DIR (the repo agents work in)"
+                "dispatch needs --repo-dir / PLANE_TUI_REPO_DIR or PLANE_TUI_REPOS (the repos agents work in)"
                     .to_owned();
             return;
         }
@@ -1640,6 +1684,7 @@ impl App {
         }
         self.dispatch_backend = label_executor(&item.labels).unwrap_or(AgentBackend::Codex);
         self.dispatch_interactive = false;
+        self.dispatch_repo = 0;
         self.dispatch_item = Some(key);
         self.menu = Some(MenuMode::Dispatch);
         self.force_clear = true;
@@ -1655,13 +1700,12 @@ impl App {
         };
         let item = self.project().items[index].clone();
         let project_id = self.project().id.clone();
-        let repo = PathBuf::from(
-            self.client
-                .config
-                .repo_dir
-                .clone()
-                .context("--repo-dir required")?,
-        );
+        let registry = repo_registry(&self.client.config);
+        let (repo_label, repo) = registry
+            .get(self.dispatch_repo)
+            .or_else(|| registry.first())
+            .cloned()
+            .context("no dispatch repo configured (--repo-dir or PLANE_TUI_REPOS)")?;
         let slug = item
             .title
             .to_lowercase()
@@ -1775,7 +1819,9 @@ impl App {
                 let job = self.agent_jobs[index].job.clone();
                 self.deep_dive_job(&job);
             } else {
-                self.status = format!("{item_key} dispatched → {backend} on {branch} · J fleet");
+                self.status = format!(
+                    "{item_key} dispatched → {backend} on {branch} in {repo_label} · J fleet"
+                );
             }
         } else {
             self.status = format!(
@@ -3246,6 +3292,12 @@ impl App {
                     }
                     KeyCode::Char('b') => {
                         self.dispatch_brief = !self.dispatch_brief;
+                        self.force_clear = true;
+                        None
+                    }
+                    KeyCode::Char('r') => {
+                        let count = repo_registry(&self.client.config).len().max(1);
+                        self.dispatch_repo = (self.dispatch_repo + 1) % count;
                         self.force_clear = true;
                         None
                     }
@@ -5877,24 +5929,25 @@ impl App {
                         self.project().total_for(StateKind::Started),
                         self.wip_limit()
                     ),
-                    MenuMode::Dispatch => format!(
-                        "dispatch {} → enter {}  1 codex  2 claude  i interactive:{}  b brief:{}  esc",
-                        self.dispatch_item.as_deref().unwrap_or("?"),
-                        match self.dispatch_backend {
-                            AgentBackend::Codex => "codex",
-                            AgentBackend::Claude => "claude",
-                        },
-                        if self.dispatch_interactive {
-                            "on"
-                        } else {
-                            "off"
-                        },
-                        if self.dispatch_brief {
-                            "fable-5"
-                        } else {
-                            "envelope"
-                        },
-                    ),
+                    MenuMode::Dispatch => {
+                        let registry = repo_registry(&self.client.config);
+                        let repo_label = registry
+                            .get(self.dispatch_repo)
+                            .or_else(|| registry.first())
+                            .map(|(name, _)| name.as_str())
+                            .unwrap_or("?");
+                        format!(
+                            "dispatch {} → enter {}  1 codex  2 claude  i int:{}  b brief:{}  r repo:{}  esc",
+                            self.dispatch_item.as_deref().unwrap_or("?"),
+                            match self.dispatch_backend {
+                                AgentBackend::Codex => "codex",
+                                AgentBackend::Claude => "claude",
+                            },
+                            if self.dispatch_interactive { "on" } else { "off" },
+                            if self.dispatch_brief { "fable-5" } else { "env" },
+                            repo_label,
+                        )
+                    }
                     MenuMode::Feedback => {
                         let (key, backend) = self
                             .feedback_job
@@ -7910,7 +7963,7 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         value_x,
         row,
         "d",
-        "dispatch agent → enter default · 1 codex · 2 claude · i interactive · b brief",
+        "dispatch agent → enter default · 1 codex · 2 claude · i interactive · b brief · r repo",
     )?;
     row += 1;
     draw_shortcut_row(
