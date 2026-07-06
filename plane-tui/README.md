@@ -121,9 +121,16 @@ Configuration (flag / env var):
 ## Agent cockpit (`d` / `J`)
 
 `d` on a work item dispatches a coding agent to actually do the work (distinct
-from `a`, which only writes a brief). Pick the executor (`1`/`enter` codex,
-`2` claude), optionally type a note that is appended to the brief, and the
-cockpit:
+from `a`, which only writes a brief). The dispatch menu: `enter` takes the
+default executor (codex, or the item's label default via
+`PLANE_TUI_LABEL_EXECUTORS="frontend=claude,infra=codex"`), `1` codex,
+`2` claude, `i` an **interactive** claude session (the pane is a live claude
+TUI with the brief preloaded — dispatching deep-dives you straight into it;
+human-paced, so exempt from stall/timeout supervision), and `b` toggles
+**two-stage briefing**: instead of the fast envelope prompt, the item first
+goes to the `a`-flow brief generator (fable-5, repo-grounded) and the job
+waits in BRIEFING until that brief becomes its prompt. Then type an optional
+note and the cockpit:
 
 1. creates a git worktree `$PLANE_TUI_WORKTREE_ROOT/<repo>-<key>` (default
    `~/projects/worktrees`) on branch `<key>-<slug>`, off `--repo-dir`'s HEAD;
@@ -164,7 +171,14 @@ starting with `QUESTION:` shows as `?` instead. In the fleet (`J`):
 - `c`: cancel a running job / remove a queued one · `r`: retry a failure ·
   `x`: discard (worktree removed, branch deleted)
 
-Other env vars: `PLANE_TUI_WORKTREE_ROOT` (default `~/projects/worktrees`)
-and `PLANE_TUI_CLAUDE_PERM` (executor permission mode, default `acceptEdits`;
+Headless claude runs use `--output-format stream-json`, so the fleet tail
+shows structured verbs (`→ Edit services/upload/queue.py`) instead of raw
+text, and the final message is recovered from the event log
+(`PLANE_TUI_STREAM_JSON=0` reverts to plain text if your claude CLI
+misbehaves with it).
+
+Other env vars: `PLANE_TUI_WORKTREE_ROOT` (default `~/projects/worktrees`),
+`PLANE_TUI_CLAUDE_PERM` (executor permission mode, default `acceptEdits`;
 set `bypassPermissions` if the agent should run tests unattended in its
-disposable worktree).
+disposable worktree), and `PLANE_TUI_LABEL_EXECUTORS` (per-label executor
+defaults).

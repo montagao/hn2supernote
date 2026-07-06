@@ -67,6 +67,36 @@ fn env_u64(name: &str, default: u64) -> u64 {
 fn agent_wip() -> usize {
     env_u64("PLANE_TUI_AGENT_WIP", 3).max(1) as usize
 }
+
+/// The fixed working-rules envelope every executor prompt ends with — the
+/// autonomy line in text form: commit but never publish, stop-and-ask via
+/// a leading `QUESTION:` when blocked.
+fn executor_envelope(branch: &str) -> String {
+    format!(
+        "\n## working rules\n- you are in a disposable git worktree on branch `{branch}`; commit as you go with clear messages — do NOT push or open PRs\n- run the tests you touch; add a regression test for any bug you fix\n- if you are blocked, the task is ambiguous, or it turns out to be already done: STOP editing and end your final message with a line starting `QUESTION:`\n\n## definition of done\n- changes committed and the relevant tests pass\n- your final message is a reviewer-facing summary: root cause, what changed, how it was verified\n"
+    )
+}
+
+/// PLANE_TUI_LABEL_EXECUTORS="frontend=claude,infra=codex" — per-label default
+/// executor, matched case-insensitively against the item's label names.
+fn label_executor(labels: &[String]) -> Option<AgentBackend> {
+    let raw = std::env::var("PLANE_TUI_LABEL_EXECUTORS").ok()?;
+    for pair in raw.split(',') {
+        let mut parts = pair.splitn(2, '=');
+        let (Some(label), Some(backend)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let label = label.trim().to_lowercase();
+        if labels.iter().any(|have| have.to_lowercase() == label) {
+            return match backend.trim().to_lowercase().as_str() {
+                "claude" => Some(AgentBackend::Claude),
+                "codex" => Some(AgentBackend::Codex),
+                _ => None,
+            };
+        }
+    }
+    None
+}
 const BUSINESS_CONTEXT: &str = include_str!("business_context.md");
 const BG: Color = Color::Rgb { r: 9, g: 12, b: 17 };
 const BG_RAISE: Color = Color::Rgb {
@@ -881,6 +911,9 @@ struct CodexJob {
     pid: u32,
     started: Instant,
     rx: mpsc::Receiver<CodexOutcome>,
+    /// Some(job id): this run is generating a dispatch brief — on completion
+    /// the text becomes that job's prompt.md instead of a prompt overlay.
+    for_dispatch: Option<String>,
 }
 
 struct CodexOutcome {
@@ -960,6 +993,8 @@ struct App {
     jobs_sel: usize,
     dispatch_item: Option<String>,
     dispatch_backend: AgentBackend,
+    dispatch_interactive: bool,
+    dispatch_brief: bool,
     feedback_job: Option<String>,
     feedback_backend: Option<AgentBackend>,
     land_job: Option<String>,
@@ -1085,6 +1120,8 @@ impl App {
             jobs_sel: 0,
             dispatch_item: None,
             dispatch_backend: AgentBackend::Codex,
+            dispatch_interactive: false,
+            dispatch_brief: false,
             feedback_job: None,
             feedback_backend: None,
             land_job: None,
@@ -1304,6 +1341,10 @@ impl App {
             Err(TryRecvError::Disconnected) => {
                 let job = self.codex_job.take().expect("codex job present");
                 self.busy = None;
+                if let Some(job_id) = &job.for_dispatch {
+                    let job_id = job_id.clone();
+                    self.fail_dispatch_brief(&job_id, "brief worker stopped unexpectedly");
+                }
                 self.status = format!(
                     "{} worker for {} stopped unexpectedly",
                     job.backend.name(),
@@ -1315,6 +1356,10 @@ impl App {
     }
 
     fn finish_codex_job(&mut self, job: CodexJob, outcome: CodexOutcome) {
+        if let Some(job_id) = job.for_dispatch.clone() {
+            self.finish_dispatch_brief(&job.key, &job_id, outcome);
+            return;
+        }
         let prompt = match outcome.prompt {
             Ok(prompt) => prompt,
             Err(err) => {
@@ -1390,6 +1435,10 @@ impl App {
                 .stderr(Stdio::null())
                 .status();
             self.busy = None;
+            if let Some(job_id) = &job.for_dispatch {
+                let job_id = job_id.clone();
+                self.fail_dispatch_brief(&job_id, "brief generation cancelled");
+            }
             self.status = format!("{} cancelled for {}", job.backend.name(), job.key);
         }
     }
@@ -1589,6 +1638,8 @@ impl App {
             self.status = format!("{key} already has an active job — J opens the fleet");
             return;
         }
+        self.dispatch_backend = label_executor(&item.labels).unwrap_or(AgentBackend::Codex);
+        self.dispatch_interactive = false;
         self.dispatch_item = Some(key);
         self.menu = Some(MenuMode::Dispatch);
         self.force_clear = true;
@@ -1681,15 +1732,45 @@ impl App {
             status: jobs::JobStatus::Queued,
             created_at: created.to_rfc3339(),
             started_at: None,
+            mode: if self.dispatch_interactive {
+                jobs::JobMode::Interactive
+            } else {
+                jobs::JobMode::Headless
+            },
         };
+        // two-stage briefing: hand the item to the fable-5 brief generator
+        // first; the job sits in BRIEFING until the brief becomes prompt.md
+        let brief_stage = self.dispatch_brief && self.codex_job.is_none();
+        if self.dispatch_brief && !brief_stage {
+            self.status = "brief generator busy — dispatching with the envelope prompt".to_owned();
+        }
+        let mut job = job;
+        if brief_stage {
+            job.status = jobs::JobStatus::Briefing;
+        }
         jobs::save(&dir, &job)?;
         let prompt = self.build_executor_prompt(&item, &extra, &job);
-        fs::write(dir.join("prompt.md"), prompt)?;
+        if !brief_stage {
+            fs::write(dir.join("prompt.md"), prompt)?;
+        }
+        let job_id = job.id.clone();
+        let interactive = job.mode == jobs::JobMode::Interactive;
         self.agent_jobs.push(jobs::JobHandle::new(dir, job));
         let index = self.agent_jobs.len() - 1;
-        if self.running_agents() < agent_wip() {
+        if brief_stage {
+            self.generate_dispatch_brief(&item, &extra, job_id);
+            self.status =
+                format!("{item_key} briefing with {} — executes when the brief is ready",
+                    self.client.config.agent_backend.name());
+        } else if self.running_agents() < agent_wip() {
             self.spawn_agent_job(index)?;
-            self.status = format!("{item_key} dispatched → {backend} on {branch} · J fleet");
+            if interactive {
+                let job = self.agent_jobs[index].job.clone();
+                self.deep_dive_job(&job);
+            } else {
+                self.status =
+                    format!("{item_key} dispatched → {backend} on {branch} · J fleet");
+            }
         } else {
             self.status = format!(
                 "{item_key} queued ({}/{} agents busy) — starts when a slot frees",
@@ -1925,14 +2006,131 @@ impl App {
             format!("\n## reviewer note\n{extra}\n")
         };
         format!(
-            "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}\n## business context\n{context}\n\n## working rules\n- you are in a disposable git worktree on branch `{branch}`; commit as you go with clear messages — do NOT push or open PRs\n- run the tests you touch; add a regression test for any bug you fix\n- if you are blocked, the task is ambiguous, or it turns out to be already done: STOP editing and end your final message with a line starting `QUESTION:`\n\n## definition of done\n- changes committed and the relevant tests pass\n- your final message is a reviewer-facing summary: root cause, what changed, how it was verified\n",
+            "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}\n## business context\n{context}\n{envelope}",
             key = item.key,
             title = item.title,
             state = item.state,
             priority = item.priority.as_plane(),
             context = self.executor_business_context(),
-            branch = job.branch,
+            envelope = executor_envelope(&job.branch),
         )
+    }
+
+    /// Kick off the fable-5 brief for a two-stage dispatch; the job waits in
+    /// BRIEFING and finish_codex_job turns the brief into its prompt.md.
+    fn generate_dispatch_brief(&mut self, item: &WorkItem, extra: &str, job_id: String) {
+        let mut meta_prompt = self.build_meta_prompt(item);
+        if !extra.is_empty() {
+            meta_prompt.push_str(&format!(
+                "\n\nReviewer note — reflect this in the brief: {extra}\n"
+            ));
+        }
+        let item_key = item.key.clone();
+        let config = &self.client.config;
+        let backend = config.agent_backend;
+        let out_file = std::env::temp_dir().join(format!(
+            "plane-tui-dispatch-brief-{}-{item_key}.md",
+            std::process::id()
+        ));
+        let child = match spawn_agent(config, &out_file) {
+            Ok(child) => child,
+            Err(err) => {
+                self.fail_dispatch_brief(&job_id, &format!("brief spawn failed: {err:#}"));
+                return;
+            }
+        };
+        let pid = child.id();
+        let agent_bin = config.agent_bin().to_owned();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let t0 = Instant::now();
+            let prompt = complete_agent(child, backend, &agent_bin, &out_file, &meta_prompt);
+            let _ = tx.send(CodexOutcome {
+                prompt,
+                comment: None,
+                elapsed_ms: t0.elapsed().as_millis(),
+            });
+        });
+        self.codex_job = Some(CodexJob {
+            key: item_key,
+            backend,
+            comment_path: String::new(),
+            pid,
+            started: Instant::now(),
+            rx,
+            for_dispatch: Some(job_id),
+        });
+    }
+
+    fn fail_dispatch_brief(&mut self, job_id: &str, note: &str) {
+        if let Some(index) = self.job_index_by_id(job_id) {
+            self.agent_jobs[index].job.status = jobs::JobStatus::Failed;
+            self.agent_jobs[index].tail.push(note.to_owned());
+            let _ = jobs::save(&self.agent_jobs[index].dir, &self.agent_jobs[index].job);
+            self.status = format!(
+                "✗ {}: {note} — x discards, or d to dispatch again",
+                self.agent_jobs[index].job.item_key
+            );
+            self.force_clear = true;
+        }
+    }
+
+    fn finish_dispatch_brief(&mut self, key: &str, job_id: &str, outcome: CodexOutcome) {
+        let Some(index) = self.job_index_by_id(job_id) else {
+            return;
+        };
+        match outcome.prompt {
+            Ok(brief) => {
+                let dir = self.agent_jobs[index].dir.clone();
+                let branch = self.agent_jobs[index].job.branch.clone();
+                let prompt = format!("{}\n{}", brief.trim(), executor_envelope(&branch));
+                if let Err(err) = fs::write(dir.join("prompt.md"), prompt) {
+                    self.fail_dispatch_brief(job_id, &format!("brief write failed: {err:#}"));
+                    return;
+                }
+                self.agent_jobs[index].job.status = jobs::JobStatus::Queued;
+                let _ = jobs::save(&self.agent_jobs[index].dir, &self.agent_jobs[index].job);
+                self.api_log.push(ApiLog::new(
+                    "AGENT",
+                    key,
+                    "dispatch brief",
+                    "ok",
+                    outcome.elapsed_ms,
+                ));
+                self.status = format!("brief ready — {key} queued for execution");
+                self.force_clear = true;
+            }
+            Err(err) => {
+                self.api_log.push(ApiLog::new(
+                    "AGENT",
+                    key,
+                    "dispatch brief",
+                    "err",
+                    outcome.elapsed_ms,
+                ));
+                self.fail_dispatch_brief(job_id, &format!("brief generation failed: {err:#}"));
+            }
+        }
+    }
+
+    /// Enter a job's tmux pane: switch-client when resident, spawned terminal
+    /// otherwise, clipboard as the last resort.
+    fn deep_dive_job(&mut self, job: &jobs::Job) {
+        let terminal_cmd = std::env::var("PLANE_TUI_TERMINAL_CMD").ok();
+        let template = terminal_cmd.as_deref().unwrap_or("kitty -e {cmd}");
+        match jobs::deep_dive(job, Some(template)) {
+            Ok(jobs::DeepDive::Switched) => {
+                self.status = format!("deep dive → {}", job.tmux_session);
+            }
+            Ok(jobs::DeepDive::SpawnedTerminal(cmd)) => {
+                self.status = format!("deep dive → {cmd}");
+            }
+            Ok(jobs::DeepDive::CopyCommand(cmd)) => {
+                let _ = copy_to_clipboard(&cmd);
+                self.status = format!("attach command copied · {cmd}");
+            }
+            Err(err) => self.status = format!("deep dive failed: {err:#}"),
+        }
     }
 
     /// One tick of fleet supervision: tail logs, settle finished jobs,
@@ -1962,8 +2160,13 @@ impl App {
                 break;
             };
             let key = self.agent_jobs[next].job.item_key.clone();
+            let interactive = self.agent_jobs[next].job.mode == jobs::JobMode::Interactive;
             changed = true;
             match self.spawn_agent_job(next) {
+                Ok(()) if interactive => {
+                    self.status =
+                        format!("▶ interactive session for {key} started — J then t to enter");
+                }
                 Ok(()) => self.status = format!("▶ {key} started — agent slot freed"),
                 Err(err) => self.status = format!("could not start {key}: {err:#}"),
             }
@@ -1975,6 +2178,9 @@ impl App {
         for handle in &mut self.agent_jobs {
             if handle.job.status != jobs::JobStatus::Running {
                 continue;
+            }
+            if handle.job.mode == jobs::JobMode::Interactive {
+                continue; // human-paced: no stall or timeout supervision
             }
             let timed_out = timeout_min > 0
                 && handle
@@ -2117,6 +2323,7 @@ impl App {
             .rev()
             .find(|handle| handle.job.item_key == key && handle.job.status.is_active())?;
         Some(match handle.job.status {
+            jobs::JobStatus::Briefing => ("✎", AMBER),
             jobs::JobStatus::Queued => ("●", DIMMER),
             jobs::JobStatus::Running if handle.stalled => ("⚠", AMBER),
             jobs::JobStatus::Running => ("⚑", GREEN),
@@ -2136,9 +2343,10 @@ impl App {
                 jobs::JobStatus::Failed => 2,
                 jobs::JobStatus::Orphaned => 3,
                 jobs::JobStatus::Running => 4,
-                jobs::JobStatus::Queued => 5,
-                jobs::JobStatus::Landed => 6,
-                jobs::JobStatus::Discarded => 7,
+                jobs::JobStatus::Briefing => 5,
+                jobs::JobStatus::Queued => 6,
+                jobs::JobStatus::Landed => 7,
+                jobs::JobStatus::Discarded => 8,
             }
         }
         let mut order: Vec<usize> = (0..self.agent_jobs.len()).collect();
@@ -2167,21 +2375,7 @@ impl App {
             KeyCode::Char('t') => {
                 if let Some(&index) = order.get(self.jobs_sel) {
                     let job = self.agent_jobs[index].job.clone();
-                    let terminal_cmd = std::env::var("PLANE_TUI_TERMINAL_CMD").ok();
-                    let template = terminal_cmd.as_deref().unwrap_or("kitty -e {cmd}");
-                    match jobs::deep_dive(&job, Some(template)) {
-                        Ok(jobs::DeepDive::Switched) => {
-                            self.status = format!("deep dive → {}", job.tmux_session);
-                        }
-                        Ok(jobs::DeepDive::SpawnedTerminal(cmd)) => {
-                            self.status = format!("deep dive → {cmd}");
-                        }
-                        Ok(jobs::DeepDive::CopyCommand(cmd)) => {
-                            let _ = copy_to_clipboard(&cmd);
-                            self.status = format!("attach command copied · {cmd}");
-                        }
-                        Err(err) => self.status = format!("deep dive failed: {err:#}"),
-                    }
+                    self.deep_dive_job(&job);
                 }
             }
             KeyCode::Enter => {
@@ -2247,6 +2441,13 @@ impl App {
                         handle.job.status,
                         jobs::JobStatus::Failed | jobs::JobStatus::Orphaned
                     ) {
+                        if !handle.dir.join("prompt.md").exists() {
+                            self.status =
+                                "no prompt on this job (its brief failed) — x discard, then d again"
+                                    .to_owned();
+                            self.force_clear = true;
+                            return Ok(());
+                        }
                         jobs::kill_session(&handle.job);
                         let _ = fs::remove_file(handle.dir.join("exit"));
                         let _ = fs::remove_file(handle.dir.join("result.md"));
@@ -2382,6 +2583,7 @@ impl App {
                 "⚠"
             } else {
                 match job.status {
+                    jobs::JobStatus::Briefing => "✎",
                     jobs::JobStatus::Queued => "●",
                     jobs::JobStatus::Running => FRAMES[self.frame],
                     jobs::JobStatus::Review => "⚑",
@@ -2392,18 +2594,24 @@ impl App {
                 }
             };
             let label = if stalled { "STALLED?" } else { job.status.label() };
-            let tail_hint = handle
-                .tail
-                .last()
-                .map(|line| truncate(line, 40))
-                .unwrap_or_default();
+            let interactive = job.mode == jobs::JobMode::Interactive;
+            let tail_hint = if interactive && job.status == jobs::JobStatus::Running {
+                "live session — t to enter".to_owned()
+            } else {
+                handle
+                    .tail
+                    .last()
+                    .map(|line| truncate(line, 40))
+                    .unwrap_or_default()
+            };
+            let model_col = if interactive {
+                "interactive".to_owned()
+            } else {
+                format!("{}·{}", job.backend, truncate(&job.model, 9))
+            };
             let text = format!(
                 " {glyph} {:<9} {:<9} {:<15} a{} {}",
-                label,
-                job.item_key,
-                format!("{}·{}", job.backend, truncate(&job.model, 9)),
-                job.attempt,
-                tail_hint
+                label, job.item_key, model_col, job.attempt, tail_hint
             );
             let (fg, bg) = if selected {
                 (Color::Black, Some(PAPER))
@@ -2413,7 +2621,9 @@ impl App {
                 } else {
                     match job.status {
                         jobs::JobStatus::Running | jobs::JobStatus::Landed => GREEN,
-                        jobs::JobStatus::Review | jobs::JobStatus::Question => AMBER,
+                        jobs::JobStatus::Review
+                        | jobs::JobStatus::Question
+                        | jobs::JobStatus::Briefing => AMBER,
                         jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => RED,
                         jobs::JobStatus::Queued | jobs::JobStatus::Discarded => DIMMER,
                     }
@@ -2455,6 +2665,10 @@ impl App {
                         lines.push("diff:".to_owned());
                         lines.extend(diff.lines().map(str::to_owned));
                     }
+                }
+                jobs::JobStatus::Running if job.mode == jobs::JobMode::Interactive => {
+                    lines.push("interactive claude session — press t to enter the pane".to_owned());
+                    lines.push("(no log tail: the pane scrollback is the record)".to_owned());
                 }
                 _ => {
                     let available = detail_bottom.saturating_sub(row) as usize;
@@ -2944,13 +3158,21 @@ impl App {
                 }
             }
             MenuMode::Dispatch => {
-                let backend = match key.code {
-                    KeyCode::Char('1') | KeyCode::Enter => Some(AgentBackend::Codex),
-                    KeyCode::Char('2') => Some(AgentBackend::Claude),
+                let chosen = match key.code {
+                    KeyCode::Enter => Some((self.dispatch_backend, self.dispatch_interactive)),
+                    KeyCode::Char('1') => Some((AgentBackend::Codex, false)),
+                    KeyCode::Char('2') => Some((AgentBackend::Claude, false)),
+                    KeyCode::Char('i') => Some((AgentBackend::Claude, true)),
+                    KeyCode::Char('b') => {
+                        self.dispatch_brief = !self.dispatch_brief;
+                        self.force_clear = true;
+                        None
+                    }
                     _ => None,
                 };
-                if let Some(backend) = backend {
+                if let Some((backend, interactive)) = chosen {
                     self.dispatch_backend = backend;
+                    self.dispatch_interactive = interactive;
                     self.menu = None;
                     self.input_mode = Some(InputMode::DispatchExtra);
                     self.input.clear();
@@ -4306,6 +4528,7 @@ impl App {
             pid,
             started: Instant::now(),
             rx,
+            for_dispatch: None,
         });
         self.busy = Some(format!(
             "{} · agent prompt for {item_key} · esc cancels",
@@ -5575,9 +5798,15 @@ impl App {
                         self.wip_limit()
                     ),
                     MenuMode::Dispatch => format!(
-                        "dispatch {} → 1/enter codex · gpt-5.5   2 claude · {}   esc cancel",
+                        "dispatch {} → enter {}{}   1 codex   2 claude · {}   i interactive   b brief:{}   esc",
                         self.dispatch_item.as_deref().unwrap_or("?"),
-                        self.client.config.claude_model
+                        match self.dispatch_backend {
+                            AgentBackend::Codex => "codex",
+                            AgentBackend::Claude => "claude",
+                        },
+                        if self.dispatch_interactive { " (interactive)" } else { "" },
+                        self.client.config.claude_model,
+                        if self.dispatch_brief { "fable-5" } else { "envelope" },
                     ),
                     MenuMode::Feedback => {
                         let (key, backend) = self

@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,6 +18,8 @@ pub const TAIL_LINES: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
+    /// Waiting for the fable-5 brief generator; promoted to Queued when done.
+    Briefing,
     Queued,
     Running,
     Review,
@@ -34,6 +37,7 @@ impl JobStatus {
 
     pub fn label(self) -> &'static str {
         match self {
+            JobStatus::Briefing => "BRIEFING",
             JobStatus::Queued => "QUEUED",
             JobStatus::Running => "RUNNING",
             JobStatus::Review => "REVIEW",
@@ -44,6 +48,16 @@ impl JobStatus {
             JobStatus::Discarded => "DISCARDED",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobMode {
+    #[default]
+    Headless,
+    /// Full interactive claude session in the tmux pane — deep dive is a
+    /// conversation. Human-paced: exempt from stall/timeout supervision.
+    Interactive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +84,8 @@ pub struct Job {
     /// RFC3339 of the most recent spawn (set per attempt); None while queued.
     #[serde(default)]
     pub started_at: Option<String>,
+    #[serde(default)]
+    pub mode: JobMode,
 }
 
 /// Runtime view of a job: the serialized Job plus tailing state.
@@ -182,6 +198,18 @@ pub fn scan(root: &Path) -> Vec<JobHandle> {
             let job = load(&dir).ok()?;
             let mut handle = JobHandle::new(dir, job);
             pump(&mut handle); // replay log into the tail, settle status
+            if handle.job.status == JobStatus::Briefing {
+                // the brief generator died with the previous TUI process
+                if handle.dir.join("prompt.md").exists() {
+                    handle.job.status = JobStatus::Queued;
+                } else {
+                    handle.job.status = JobStatus::Failed;
+                    handle
+                        .tail
+                        .push("brief was lost when the TUI exited — x discard, then d again".to_owned());
+                }
+                let _ = save(&handle.dir, &handle.job);
+            }
             if matches!(handle.job.status, JobStatus::Review | JobStatus::Question) {
                 handle.diff_stat = Some(diff_stat(&handle.job));
             }
@@ -374,21 +402,39 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+fn stream_json_enabled() -> bool {
+    std::env::var("PLANE_TUI_STREAM_JSON")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
 fn agent_command(job: &Job, dir: &Path, claude_permission_mode: &str) -> String {
     let prompt = shell_quote(&dir.join("prompt.md").display().to_string());
     let result = shell_quote(&dir.join("result.md").display().to_string());
-    match job.backend.as_str() {
-        "codex" => format!(
+    if job.backend.as_str() == "codex" {
+        return format!(
             "{} exec --sandbox workspace-write --output-last-message {result} < {prompt}",
             shell_quote(&job.model_binary()),
-        ),
-        _ => format!(
-            "{} -p \"$(cat {prompt})\" --model {} --effort {} --permission-mode {} < /dev/null | tee {result}",
-            shell_quote(&job.model_binary()),
-            shell_quote(&job.model),
-            shell_quote(&job.effort),
-            shell_quote(claude_permission_mode),
-        ),
+        );
+    }
+    let bin = shell_quote(&job.model_binary());
+    let model = shell_quote(&job.model);
+    let effort = shell_quote(&job.effort);
+    let perm = shell_quote(claude_permission_mode);
+    if job.mode == JobMode::Interactive {
+        // full claude TUI with the brief preloaded; the human drives it
+        return format!("{bin} --model {model} --effort {effort} --permission-mode {perm} \"$(cat {prompt})\"");
+    }
+    if stream_json_enabled() {
+        // structured tail: JSONL events on the pty; result extracted from the
+        // log after exit (extract_stream_result), so no tee here
+        format!(
+            "{bin} -p \"$(cat {prompt})\" --model {model} --effort {effort} --permission-mode {perm} --output-format stream-json --verbose < /dev/null"
+        )
+    } else {
+        format!(
+            "{bin} -p \"$(cat {prompt})\" --model {model} --effort {effort} --permission-mode {perm} < /dev/null | tee {result}"
+        )
     }
 }
 
@@ -411,6 +457,10 @@ pub fn spawn(job: &Job, dir: &Path, claude_permission_mode: &str) -> Result<()> 
         exit = shell_quote(&dir.join("exit").display().to_string()),
     );
     fs::write(dir.join("run.sh"), script)?;
+    // interactive sessions skip pipe-pane: the claude TUI's redraws would
+    // bloat log.txt with escape soup, and the pane scrollback
+    // (remain-on-exit) is the real record for a human-driven session
+    let log = (job.mode == JobMode::Headless).then(|| dir.join("log.txt"));
     spawn_raw(
         &job.tmux_socket,
         &job.tmux_session,
@@ -419,7 +469,7 @@ pub fn spawn(job: &Job, dir: &Path, claude_permission_mode: &str) -> Result<()> 
             "bash {}",
             shell_quote(&dir.join("run.sh").display().to_string())
         ),
-        &dir.join("log.txt"),
+        log.as_deref(),
     )
 }
 
@@ -431,20 +481,22 @@ pub fn spawn_raw(
     session: &str,
     cwd: &Path,
     command: &str,
-    log: &Path,
+    log: Option<&Path>,
 ) -> Result<()> {
     let mut tmux = tmux_command(socket);
     tmux.args(["new-session", "-d", "-s", session, "-c"])
         .arg(cwd)
         .arg(command)
         .arg(";")
-        .args(["set-option", "-t", session, "-w", "remain-on-exit", "on"])
-        .arg(";")
-        .args(["pipe-pane", "-t", session, "-o"])
-        .arg(format!(
-            "cat >> {}",
-            shell_quote(&log.display().to_string())
-        ));
+        .args(["set-option", "-t", session, "-w", "remain-on-exit", "on"]);
+    if let Some(log) = log {
+        tmux.arg(";")
+            .args(["pipe-pane", "-t", session, "-o"])
+            .arg(format!(
+                "cat >> {}",
+                shell_quote(&log.display().to_string())
+            ));
+    }
     run_quiet(tmux).context("tmux new-session")
 }
 
@@ -481,6 +533,103 @@ pub fn read_result(dir: &Path) -> String {
     fs::read_to_string(dir.join("result.md")).unwrap_or_default()
 }
 
+/// How a raw log line should appear in the fleet tail.
+pub enum StreamLine {
+    /// Not a stream-json event — show the line as-is.
+    Raw,
+    /// A recognized event with nothing worth showing (tool results, etc.).
+    Skip,
+    /// A recognized event, rendered human-readable.
+    Show(String),
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        let cut: String = text.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+/// Render one `claude -p --output-format stream-json` event for the tail:
+/// tool calls become "→ Edit services/upload/queue.py", assistant text keeps
+/// its first line. Anything unrecognized falls back to Raw — codex output and
+/// plain-text claude pass straight through.
+pub fn format_stream_event(line: &str) -> StreamLine {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return StreamLine::Raw;
+    }
+    let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+        return StreamLine::Raw;
+    };
+    match event.get("type").and_then(Value::as_str) {
+        Some("system") => {
+            let model = event.get("model").and_then(Value::as_str).unwrap_or("?");
+            StreamLine::Show(format!("· session started — {model}"))
+        }
+        Some("assistant") => {
+            let Some(content) = event.pointer("/message/content").and_then(Value::as_array)
+            else {
+                return StreamLine::Skip;
+            };
+            for block in content {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("tool_use") => {
+                        let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let arg = block
+                            .get("input")
+                            .and_then(|input| {
+                                ["file_path", "command", "pattern", "path", "query", "url"]
+                                    .iter()
+                                    .find_map(|key| input.get(*key).and_then(Value::as_str))
+                            })
+                            .unwrap_or("");
+                        return StreamLine::Show(clip(&format!("→ {name} {arg}"), 90));
+                    }
+                    Some("text") => {
+                        let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                        let Some(first) = text.lines().find(|line| !line.trim().is_empty())
+                        else {
+                            return StreamLine::Skip;
+                        };
+                        return StreamLine::Show(clip(first.trim(), 90));
+                    }
+                    _ => {}
+                }
+            }
+            StreamLine::Skip
+        }
+        Some("result") => StreamLine::Show("── final result received ──".to_owned()),
+        Some(_) => StreamLine::Skip,
+        None => StreamLine::Raw,
+    }
+}
+
+/// stream-json mode has no tee'd result.md — recover the final message from
+/// the last `result` event in the log after the agent exits.
+pub fn extract_stream_result(dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(dir.join("log.txt")).ok()?;
+    for line in raw.lines().rev() {
+        let clean = strip_ansi(line);
+        let trimmed = clean.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) == Some("result") {
+            return event
+                .get("result")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
 /// One monitoring tick: tail new log bytes, then settle Running jobs into
 /// Review / Question / Failed / Orphaned. Returns true when anything changed.
 pub fn pump(handle: &mut JobHandle) -> bool {
@@ -491,9 +640,19 @@ pub fn pump(handle: &mut JobHandle) -> bool {
         for line in new.lines() {
             let clean = strip_ansi(line);
             let clean = clean.trim_end();
-            if !clean.is_empty() {
-                handle.tail.push(clean.to_owned());
-                changed = true;
+            if clean.is_empty() {
+                continue;
+            }
+            match format_stream_event(clean) {
+                StreamLine::Raw => {
+                    handle.tail.push(clean.to_owned());
+                    changed = true;
+                }
+                StreamLine::Show(rendered) => {
+                    handle.tail.push(rendered);
+                    changed = true;
+                }
+                StreamLine::Skip => {}
             }
         }
         if handle.tail.len() > TAIL_LINES {
@@ -515,6 +674,12 @@ pub fn pump(handle: &mut JobHandle) -> bool {
     // pid-first check would misread a just-finished job as orphaned
     let next = if let Some(code) = read_exit(&handle.dir) {
         if code == 0 {
+            if read_result(&handle.dir).trim().is_empty() {
+                // stream-json runs don't tee a result — recover it from the log
+                if let Some(result) = extract_stream_result(&handle.dir) {
+                    let _ = fs::write(handle.dir.join("result.md"), result);
+                }
+            }
             if read_result(&handle.dir)
                 .trim_start()
                 .starts_with("QUESTION:")
@@ -664,12 +829,60 @@ mod tests {
             status: JobStatus::Review,
             created_at: "2026-07-06T00:00:00Z".into(),
             started_at: None,
+            mode: JobMode::Headless,
         };
         let dir = std::env::temp_dir().join(format!("pti-job-test-{}", std::process::id()));
         save(&dir, &job).unwrap();
         let loaded = load(&dir).unwrap();
         assert_eq!(loaded.tmux_session, "pti-tm-201-a2");
         assert_eq!(loaded.status, JobStatus::Review);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_events_render_for_the_tail() {
+        let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"services/upload/queue.py"}}]}}"#;
+        match format_stream_event(tool) {
+            StreamLine::Show(line) => assert_eq!(line, "→ Edit services/upload/queue.py"),
+            _ => panic!("tool_use should render"),
+        }
+        let text = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Root cause found.\nDetails follow."}]}}"#;
+        match format_stream_event(text) {
+            StreamLine::Show(line) => assert_eq!(line, "Root cause found."),
+            _ => panic!("text should render"),
+        }
+        assert!(matches!(
+            format_stream_event(r#"{"type":"result","subtype":"success","result":"done"}"#),
+            StreamLine::Show(_)
+        ));
+        assert!(matches!(
+            format_stream_event("plain codex output line"),
+            StreamLine::Raw
+        ));
+        assert!(matches!(
+            format_stream_event(r#"{"type":"user","message":{}}"#),
+            StreamLine::Skip
+        ));
+    }
+
+    #[test]
+    fn stream_result_recovered_from_log() {
+        let dir = std::env::temp_dir().join(format!("pti-stream-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("log.txt"),
+            concat!(
+                "{\"type\":\"system\",\"model\":\"gpt\"}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[]}}\n",
+                "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Fixed the retry loop; 61 tests pass.\"}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            extract_stream_result(&dir).as_deref(),
+            Some("Fixed the retry loop; 61 tests pass.")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -752,6 +965,7 @@ mod tests {
             status: JobStatus::Review,
             created_at: String::new(),
             started_at: None,
+            mode: JobMode::Headless,
         };
         let target = land_merge(&job).unwrap();
         assert!(!target.is_empty());
@@ -840,6 +1054,7 @@ mod tests {
             status: JobStatus::Review,
             created_at: String::new(),
             started_at: None,
+            mode: JobMode::Headless,
         };
         assert!(diff_stat(&job).contains("fix.txt"));
         discard(&job).unwrap();
@@ -888,6 +1103,7 @@ mod tests {
             status: JobStatus::Running,
             created_at: String::new(),
             started_at: None,
+            mode: JobMode::Headless,
         };
         save(&dir, &job).unwrap();
         spawn_raw(
@@ -898,7 +1114,7 @@ mod tests {
                 "sh -c 'printf \"line-one\\nline-two\\n\"; sleep 0.3; echo 0 > {}'",
                 shell_quote(&dir.join("exit").display().to_string())
             ),
-            &dir.join("log.txt"),
+            Some(&dir.join("log.txt")),
         )
         .unwrap();
         fs::write(dir.join("result.md"), "did the thing").unwrap();
