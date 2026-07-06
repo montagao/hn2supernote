@@ -343,10 +343,12 @@ struct PlaneClient {
 
 impl PlaneClient {
     fn new(config: Config) -> Self {
-        Self {
-            http: Client::new(),
-            config,
-        }
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { http, config }
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -1213,6 +1215,11 @@ impl App {
     }
 
     fn on_tick(&mut self) -> Result<()> {
+        // keep the API drawer's memory bounded over long resident sessions
+        if self.api_log.len() > 600 {
+            let excess = self.api_log.len() - 500;
+            self.api_log.drain(..excess);
+        }
         let mut redraw = self.poll_codex_job();
         if let Some(job) = &self.codex_job {
             let elapsed = job.started.elapsed().as_secs();
@@ -1518,6 +1525,26 @@ impl App {
         current + incoming > limit
     }
 
+    /// Surface an error on the status line instead of letting it unwind the
+    /// event loop — a failed PATCH must never take the whole TUI down.
+    fn soft(&mut self, result: Result<()>) {
+        if let Err(err) = result {
+            self.status = format!("error: {err:#}");
+            self.force_clear = true;
+        }
+    }
+
+    fn soft_or<T>(&mut self, result: Result<T>, fallback: T) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => {
+                self.status = format!("error: {err:#}");
+                self.force_clear = true;
+                fallback
+            }
+        }
+    }
+
     fn run_busy<T, F>(&mut self, message: impl Into<String>, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -1657,7 +1684,10 @@ impl App {
                 self.input_cursor = self.input.len();
             }
             KeyCode::Char('T') => self.start_triage(),
-            KeyCode::Char('R') => self.refresh()?,
+            KeyCode::Char('R') => {
+                let result = self.refresh();
+                self.soft(result);
+            }
             KeyCode::Char('x') => {
                 self.api_open = !self.api_open;
                 self.force_clear = true;
@@ -1931,7 +1961,8 @@ impl App {
                                 self.force_clear = true;
                                 return Ok(());
                             }
-                            self.apply_state(state)?;
+                            let result = self.apply_state(state);
+                            self.soft(result);
                             self.menu = None;
                             self.marks.clear();
                             self.force_clear = true;
@@ -1941,7 +1972,8 @@ impl App {
             }
             MenuMode::ConfirmWip => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    self.apply_state(StateKind::Started)?;
+                    let result = self.apply_state(StateKind::Started);
+                    self.soft(result);
                     self.menu = None;
                     self.marks.clear();
                     self.force_clear = true;
@@ -1964,7 +1996,8 @@ impl App {
                         _ => None,
                     };
                     if let Some(priority) = priority {
-                        self.apply_priority(priority)?;
+                        let result = self.apply_priority(priority);
+                        self.soft(result);
                         self.menu = None;
                         self.marks.clear();
                         self.force_clear = true;
@@ -1986,7 +2019,8 @@ impl App {
                         return Ok(());
                     }
                     if let Some(index) = ch.to_digit(10).and_then(|n| n.checked_sub(1)) {
-                        self.toggle_label(index as usize)?;
+                        let result = self.toggle_label(index as usize);
+                        self.soft(result);
                     }
                 }
             }
@@ -2105,9 +2139,13 @@ impl App {
                         self.force_clear = true;
                         false
                     }
-                    InputMode::Command => self.run_command()?,
+                    InputMode::Command => {
+                        let result = self.run_command();
+                        self.soft_or(result, false)
+                    }
                     InputMode::NewLabel => {
-                        self.create_label_from_input()?;
+                        let result = self.create_label_from_input();
+                        self.soft(result);
                         false
                     }
                     InputMode::BackendModel => self.update_backend_wizard_model(),
@@ -2116,13 +2154,18 @@ impl App {
                         self.advance_project_wizard_name();
                         true
                     }
-                    InputMode::ProjectIdentifier => self.create_project_from_wizard()?,
+                    InputMode::ProjectIdentifier => {
+                        let result = self.create_project_from_wizard();
+                        self.soft_or(result, false)
+                    }
                     InputMode::EditTitle => {
-                        self.apply_title_edit()?;
+                        let result = self.apply_title_edit();
+                        self.soft(result);
                         false
                     }
                     InputMode::EditDue => {
-                        self.apply_due_edit()?;
+                        let result = self.apply_due_edit();
+                        self.soft(result);
                         false
                     }
                 };
@@ -2785,24 +2828,34 @@ impl App {
         match key.code {
             KeyCode::Enter => advance = true,
             KeyCode::Char('u') => {
-                self.with_single_target(&current_key, |app| app.apply_priority(Priority::Urgent))?;
+                let result =
+                    self.with_single_target(&current_key, |app| app.apply_priority(Priority::Urgent));
+                self.soft(result);
                 advance = true;
             }
             KeyCode::Char('h') => {
-                self.with_single_target(&current_key, |app| app.apply_priority(Priority::High))?;
+                let result =
+                    self.with_single_target(&current_key, |app| app.apply_priority(Priority::High));
+                self.soft(result);
                 advance = true;
             }
             KeyCode::Char('m') => {
-                self.with_single_target(&current_key, |app| app.apply_priority(Priority::Medium))?;
+                let result =
+                    self.with_single_target(&current_key, |app| app.apply_priority(Priority::Medium));
+                self.soft(result);
                 advance = true;
             }
             KeyCode::Char('l') => {
-                self.with_single_target(&current_key, |app| app.apply_priority(Priority::Low))?;
+                let result =
+                    self.with_single_target(&current_key, |app| app.apply_priority(Priority::Low));
+                self.soft(result);
                 advance = true;
             }
             KeyCode::Char('n') => advance = true,
             KeyCode::Char('2') => {
-                self.with_single_target(&current_key, |app| app.apply_state(StateKind::Todo))?;
+                let result =
+                    self.with_single_target(&current_key, |app| app.apply_state(StateKind::Todo));
+                self.soft(result);
                 advance = true;
                 promoted = true;
             }
@@ -2814,15 +2867,18 @@ impl App {
                         self.wip_limit()
                     );
                 } else {
-                    self.with_single_target(&current_key, |app| {
+                    let result = self.with_single_target(&current_key, |app| {
                         app.apply_state(StateKind::Started)
-                    })?;
+                    });
+                    self.soft(result);
                     advance = true;
                     promoted = true;
                 }
             }
             KeyCode::Char('5') => {
-                self.with_single_target(&current_key, |app| app.apply_state(StateKind::Cancelled))?;
+                let result = self
+                    .with_single_target(&current_key, |app| app.apply_state(StateKind::Cancelled));
+                self.soft(result);
                 advance = true;
                 dropped = true;
             }
