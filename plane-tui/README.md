@@ -124,9 +124,10 @@ Configuration (flag / env var):
 from `a`, which only writes a brief). The dispatch menu: `enter` takes the
 default executor (codex, or the item's label default via
 `PLANE_TUI_LABEL_EXECUTORS="frontend=claude,infra=codex"`), `1` codex,
-`2` claude, `i` an **interactive** claude session (the pane is a live claude
-TUI with the brief preloaded — dispatching deep-dives you straight into it;
-human-paced, so exempt from stall/timeout supervision), and `b` toggles
+`2` claude, `i` toggles **interactive** mode for whichever executor you pick
+(the pane runs the agent's own TUI — claude or codex — with the brief
+preloaded; dispatching deep-dives you straight into it; human-paced, so
+exempt from stall/timeout supervision), and `b` toggles
 **two-stage briefing**: instead of the fast envelope prompt, the item first
 goes to the `a`-flow brief generator (fable-5, repo-grounded) and the job
 waits in BRIEFING until that brief becomes its prompt. Then type an optional

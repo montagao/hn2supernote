@@ -2605,7 +2605,7 @@ impl App {
                     .unwrap_or_default()
             };
             let model_col = if interactive {
-                "interactive".to_owned()
+                format!("{}·int", job.backend)
             } else {
                 format!("{}·{}", job.backend, truncate(&job.model, 9))
             };
@@ -2667,7 +2667,10 @@ impl App {
                     }
                 }
                 jobs::JobStatus::Running if job.mode == jobs::JobMode::Interactive => {
-                    lines.push("interactive claude session — press t to enter the pane".to_owned());
+                    lines.push(format!(
+                        "interactive {} session — press t to enter the pane",
+                        job.backend
+                    ));
                     lines.push("(no log tail: the pane scrollback is the record)".to_owned());
                 }
                 _ => {
@@ -3159,10 +3162,14 @@ impl App {
             }
             MenuMode::Dispatch => {
                 let chosen = match key.code {
-                    KeyCode::Enter => Some((self.dispatch_backend, self.dispatch_interactive)),
-                    KeyCode::Char('1') => Some((AgentBackend::Codex, false)),
-                    KeyCode::Char('2') => Some((AgentBackend::Claude, false)),
-                    KeyCode::Char('i') => Some((AgentBackend::Claude, true)),
+                    KeyCode::Enter => Some(self.dispatch_backend),
+                    KeyCode::Char('1') => Some(AgentBackend::Codex),
+                    KeyCode::Char('2') => Some(AgentBackend::Claude),
+                    KeyCode::Char('i') => {
+                        self.dispatch_interactive = !self.dispatch_interactive;
+                        self.force_clear = true;
+                        None
+                    }
                     KeyCode::Char('b') => {
                         self.dispatch_brief = !self.dispatch_brief;
                         self.force_clear = true;
@@ -3170,9 +3177,8 @@ impl App {
                     }
                     _ => None,
                 };
-                if let Some((backend, interactive)) = chosen {
+                if let Some(backend) = chosen {
                     self.dispatch_backend = backend;
-                    self.dispatch_interactive = interactive;
                     self.menu = None;
                     self.input_mode = Some(InputMode::DispatchExtra);
                     self.input.clear();
@@ -5798,13 +5804,13 @@ impl App {
                         self.wip_limit()
                     ),
                     MenuMode::Dispatch => format!(
-                        "dispatch {} → enter {}{}  1 codex  2 claude  i interactive  b brief:{}  esc",
+                        "dispatch {} → enter {}  1 codex  2 claude  i interactive:{}  b brief:{}  esc",
                         self.dispatch_item.as_deref().unwrap_or("?"),
                         match self.dispatch_backend {
                             AgentBackend::Codex => "codex",
                             AgentBackend::Claude => "claude",
                         },
-                        if self.dispatch_interactive { "·i" } else { "" },
+                        if self.dispatch_interactive { "on" } else { "off" },
                         if self.dispatch_brief { "fable-5" } else { "envelope" },
                     ),
                     MenuMode::Feedback => {

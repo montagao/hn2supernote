@@ -411,6 +411,21 @@ fn stream_json_enabled() -> bool {
 fn agent_command(job: &Job, dir: &Path, claude_permission_mode: &str) -> String {
     let prompt = shell_quote(&dir.join("prompt.md").display().to_string());
     let result = shell_quote(&dir.join("result.md").display().to_string());
+    if job.mode == JobMode::Interactive {
+        // full agent TUI with the brief preloaded; the human drives it —
+        // works with either backend, they both take an initial prompt arg
+        let bin = shell_quote(&job.model_binary());
+        return if job.backend.as_str() == "codex" {
+            format!("{bin} --sandbox workspace-write \"$(cat {prompt})\"")
+        } else {
+            format!(
+                "{bin} --model {} --effort {} --permission-mode {} \"$(cat {prompt})\"",
+                shell_quote(&job.model),
+                shell_quote(&job.effort),
+                shell_quote(claude_permission_mode),
+            )
+        };
+    }
     if job.backend.as_str() == "codex" {
         return format!(
             "{} exec --sandbox workspace-write --output-last-message {result} < {prompt}",
@@ -421,10 +436,6 @@ fn agent_command(job: &Job, dir: &Path, claude_permission_mode: &str) -> String 
     let model = shell_quote(&job.model);
     let effort = shell_quote(&job.effort);
     let perm = shell_quote(claude_permission_mode);
-    if job.mode == JobMode::Interactive {
-        // full claude TUI with the brief preloaded; the human drives it
-        return format!("{bin} --model {model} --effort {effort} --permission-mode {perm} \"$(cat {prompt})\"");
-    }
     if stream_json_enabled() {
         // structured tail: JSONL events on the pty; result extracted from the
         // log after exit (extract_stream_result), so no tee here
