@@ -1025,6 +1025,72 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Worktree slot allocation: a leftover holding commits is preserved
+    /// (new job suffixed -2); a clean empty leftover is reclaimed.
+    #[test]
+    fn allocate_worktree_suffixes_and_reclaims() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("pti-alloc-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut init = Command::new("git");
+        init.arg("init").arg("-q").arg(&repo);
+        run_quiet(init).unwrap();
+        fs::write(repo.join("README.md"), "hello").unwrap();
+        let mut add = Command::new("git");
+        add.arg("-C").arg(&repo).args(["add", "."]);
+        run_quiet(add).unwrap();
+        let mut commit = Command::new("git");
+        commit.arg("-C").arg(&repo).args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        run_quiet(commit).unwrap();
+
+        // leftover WITH work → preserved, allocation suffixes
+        let base = root.join("wt-item");
+        create_worktree(&repo, &base, "tm-9-fix").unwrap();
+        fs::write(base.join("work.txt"), "unlanded").unwrap();
+        let mut add = Command::new("git");
+        add.arg("-C").arg(&base).args(["add", "work.txt"]);
+        run_quiet(add).unwrap();
+        let mut commit = Command::new("git");
+        commit.arg("-C").arg(&base).args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "work",
+        ]);
+        run_quiet(commit).unwrap();
+        let (worktree, branch, note) = allocate_worktree(&repo, &base, "tm-9-fix").unwrap();
+        assert_eq!(worktree, PathBuf::from(format!("{}-2", base.display())));
+        assert_eq!(branch, "tm-9-fix-2");
+        assert!(note.unwrap().contains("kept"));
+        assert!(base.exists(), "worktree with work must survive");
+
+        // leftover WITHOUT work → reclaimed, base name reused
+        let empty = root.join("wt-empty");
+        create_worktree(&repo, &empty, "tm-8-fix").unwrap();
+        let (worktree, branch, note) = allocate_worktree(&repo, &empty, "tm-8-fix").unwrap();
+        assert_eq!(worktree, empty);
+        assert_eq!(branch, "tm-8-fix");
+        assert!(note.unwrap().contains("reclaimed"));
+        assert!(!worktree.exists(), "reclaimed slot is free to create");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Full `m`-landing on a scratch repo: rebase, ff-merge, branch and
     /// worktree cleanup — the file the "agent" committed ends up on main.
     #[test]
