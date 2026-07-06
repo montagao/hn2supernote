@@ -208,12 +208,28 @@ fn repo_registry(config: &Config) -> Vec<(String, PathBuf)> {
     repos
 }
 
-/// The fixed working-rules envelope every executor prompt ends with — the
-/// autonomy line in text form: commit but never publish, stop-and-ask via
-/// a leading `QUESTION:` when blocked.
-fn executor_envelope(branch: &str) -> String {
+/// Whether the repo self-documents its conventions — agent CLIs auto-load
+/// these from the worktree, so the prompt must not restate (or contradict)
+/// them.
+fn repo_has_agent_docs(repo: &Path) -> bool {
+    ["CLAUDE.md", "AGENTS.md"]
+        .iter()
+        .any(|name| repo.join(name).exists())
+}
+
+/// The envelope every executor prompt ends with. Deliberately minimal: only
+/// the cockpit's own contract (worktree plumbing, the QUESTION: sentinel it
+/// parses, the summary that becomes the Plane comment). Everything about
+/// *how* to work belongs to the repo's CLAUDE.md/AGENTS.md and the agent's
+/// judgment — repeating it here just creates drift.
+fn executor_envelope(branch: &str, repo_has_docs: bool) -> String {
+    let docs_line = if repo_has_docs {
+        "The repo's own CLAUDE.md / AGENTS.md conventions apply as usual — they aren't repeated here.\n"
+    } else {
+        ""
+    };
     format!(
-        "\n## working rules\n- you are in a disposable git worktree on branch `{branch}`; commit as you go with clear messages — do NOT push or open PRs\n- run the tests you touch; add a regression test for any bug you fix\n- if you are blocked, the task is ambiguous, or it turns out to be already done: STOP editing and end your final message with a line starting `QUESTION:`\n\n## definition of done\n- changes committed and the relevant tests pass\n- your final message is a reviewer-facing summary: root cause, what changed, how it was verified\n"
+        "\n## ground rules (the cockpit's, not the repo's)\n{docs_line}- You're in a disposable git worktree on branch `{branch}`. Commit your work; don't push or open PRs — a human reviews and lands from here.\n- Approach, scope, and style are your call. If something adjacent looks broken, note it in your summary rather than expanding the task.\n- If you're blocked, the task is ambiguous, or it turns out to be already done: stop and end your final message with a line starting `QUESTION:` — asking is a good outcome here, not a failure.\n\n## when you finish\nEnd with a short reviewer-facing summary — what you found, what changed, how you verified it. It is posted back to the Plane work item.\n"
     )
 }
 
@@ -2454,14 +2470,23 @@ impl App {
         } else {
             format!("\n## reviewer note\n{extra}\n")
         };
+        // a self-documenting repo carries its own product/engineering context
+        // (CLAUDE.md / AGENTS.md, auto-loaded by the agent CLIs from the
+        // worktree) — only inject the embedded dossier when it doesn't, or
+        // when the user explicitly pointed --context-file at one
+        let repo_has_docs = repo_has_agent_docs(&job.repo);
+        let context = if repo_has_docs && config.context_file.is_none() {
+            String::new()
+        } else {
+            format!("\n## business context\n{}\n", self.executor_business_context())
+        };
         format!(
-            "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}\n## business context\n{context}\n{envelope}",
+            "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}{context}{envelope}",
             key = item.key,
             title = item.title,
             state = item.state,
             priority = item.priority.as_plane(),
-            context = self.executor_business_context(),
-            envelope = executor_envelope(&job.branch),
+            envelope = executor_envelope(&job.branch, repo_has_docs),
         )
     }
 
@@ -2532,7 +2557,12 @@ impl App {
             Ok(brief) => {
                 let dir = self.agent_jobs[index].dir.clone();
                 let branch = self.agent_jobs[index].job.branch.clone();
-                let prompt = format!("{}\n{}", brief.trim(), executor_envelope(&branch));
+                let repo_has_docs = repo_has_agent_docs(&self.agent_jobs[index].job.repo);
+                let prompt = format!(
+                    "{}\n{}",
+                    brief.trim(),
+                    executor_envelope(&branch, repo_has_docs)
+                );
                 if let Err(err) = fs::write(dir.join("prompt.md"), prompt) {
                     self.fail_dispatch_brief(job_id, &format!("brief write failed: {err:#}"));
                     return;

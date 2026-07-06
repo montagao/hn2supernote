@@ -135,9 +135,13 @@ note and the cockpit:
 
 1. creates a git worktree `$PLANE_TUI_WORKTREE_ROOT/<repo>-<key>` (default
    `~/projects/worktrees`) on branch `<key>-<slug>`, off `--repo-dir`'s HEAD;
-2. writes the prompt (item fields + description + business context + working
-   rules: commit but never push; stop and ask with a leading `QUESTION:` line
-   when blocked) to `~/.local/share/plane-tui/jobs/<id>/prompt.md`;
+2. writes the prompt to `~/.local/share/plane-tui/jobs/<id>/prompt.md` —
+   item fields + description + a minimal cockpit contract (commit but never
+   push; stop and ask with a leading `QUESTION:` line when blocked; end with
+   a reviewer summary). Approach and conventions are left to the agent and
+   the repo's own `CLAUDE.md`/`AGENTS.md`, which agent CLIs auto-load from
+   the worktree; the embedded business-context dossier is injected only for
+   repos without such docs (or when `--context-file` is set);
 3. spawns the agent in a tmux session `pti-<key>-a<n>` — on the tmux server
    you're already inside when plane-tui runs in tmux (resident deployment),
    else on a dedicated `tmux -L plane-tui` socket. `remain-on-exit` keeps the
