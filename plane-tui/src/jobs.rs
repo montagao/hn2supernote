@@ -60,6 +60,17 @@ pub enum JobMode {
     Interactive,
 }
 
+/// What kind of work the prompt asks for — straight implementation, or a
+/// design/exploration pass (assumptions, unknowns, options) that must not
+/// touch the real code paths yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStance {
+    #[default]
+    Implement,
+    Explore,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
@@ -86,6 +97,8 @@ pub struct Job {
     pub started_at: Option<String>,
     #[serde(default)]
     pub mode: JobMode,
+    #[serde(default)]
+    pub stance: JobStance,
 }
 
 /// Runtime view of a job: the serialized Job plus tailing state.
@@ -962,6 +975,7 @@ mod tests {
             created_at: "2026-07-06T00:00:00Z".into(),
             started_at: None,
             mode: JobMode::Headless,
+            stance: JobStance::Implement,
         };
         let dir = std::env::temp_dir().join(format!("pti-job-test-{}", std::process::id()));
         save(&dir, &job).unwrap();
@@ -1169,6 +1183,7 @@ mod tests {
             created_at: String::new(),
             started_at: None,
             mode: JobMode::Headless,
+            stance: JobStance::Implement,
         };
         let target = land_merge(&job).unwrap();
         assert!(!target.is_empty());
@@ -1261,6 +1276,7 @@ mod tests {
             created_at: String::new(),
             started_at: None,
             mode: JobMode::Headless,
+            stance: JobStance::Implement,
         };
         assert!(diff_stat(&job).contains("fix.txt"));
         discard(&job).unwrap();
@@ -1310,6 +1326,7 @@ mod tests {
             created_at: String::new(),
             started_at: None,
             mode: JobMode::Headless,
+            stance: JobStance::Implement,
         };
         save(&dir, &job).unwrap();
         spawn_raw(

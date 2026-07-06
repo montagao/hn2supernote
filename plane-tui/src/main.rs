@@ -217,6 +217,17 @@ fn repo_has_agent_docs(repo: &Path) -> bool {
         .any(|name| repo.join(name).exists())
 }
 
+/// The explore stance: the user's design-first workflow made mechanical.
+/// Asks for exactly what a reviewer wants before implementation starts —
+/// assumptions, unknown unknowns, architecture-changing questions, options —
+/// and forbids touching the real code paths on this attempt.
+fn explore_stance_section(item_key: &str) -> String {
+    format!(
+        "\n## stance: explore before implementing\nThis dispatch wants design work, not implementation — do not wire changes into the real code paths yet.\nDeliver a design doc, committed in the worktree (follow the repo's conventions for where docs live; otherwise `docs/design/{key}.md`), covering:\n- your read of the problem and the relevant code\n- the assumptions you're making — each with what changes if it's wrong\n- risks and unknowns the reviewer probably hasn't considered\n- the questions whose answers would change the architecture, each with your recommended answer\n- two or three options, sketched or prototyped (scratch prototypes are welcome in a clearly separated area), with trade-offs and a recommendation\nYour final message is the executive summary: your recommendation, the load-bearing assumptions, and the questions you need answered.\nIf reviewer feedback on a later attempt asks for implementation, this exploration stance no longer applies — implement.\n",
+        key = item_key.to_lowercase(),
+    )
+}
+
 /// The envelope every executor prompt ends with. Deliberately minimal: only
 /// the cockpit's own contract (worktree plumbing, the QUESTION: sentinel it
 /// parses, the summary that becomes the Plane comment). Everything about
@@ -1151,6 +1162,7 @@ struct App {
     dispatch_backend: AgentBackend,
     dispatch_interactive: bool,
     dispatch_brief: bool,
+    dispatch_explore: bool,
     dispatch_repo: usize,
     repo_wizard: Option<Vec<RepoPick>>,
     repo_wizard_sel: usize,
@@ -1281,6 +1293,7 @@ impl App {
             dispatch_backend: AgentBackend::Codex,
             dispatch_interactive: false,
             dispatch_brief: false,
+            dispatch_explore: false,
             dispatch_repo: 0,
             repo_wizard: None,
             repo_wizard_sel: 0,
@@ -2074,6 +2087,7 @@ impl App {
         }
         self.dispatch_backend = label_executor(&item.labels).unwrap_or(AgentBackend::Codex);
         self.dispatch_interactive = false;
+        self.dispatch_explore = false;
         self.dispatch_repo = 0;
         self.dispatch_item = Some(key);
         self.menu = Some(MenuMode::Dispatch);
@@ -2176,6 +2190,11 @@ impl App {
                 jobs::JobMode::Interactive
             } else {
                 jobs::JobMode::Headless
+            },
+            stance: if self.dispatch_explore {
+                jobs::JobStance::Explore
+            } else {
+                jobs::JobStance::Implement
             },
         };
         // two-stage briefing: hand the item to the fable-5 brief generator
@@ -2474,6 +2493,10 @@ impl App {
         // (CLAUDE.md / AGENTS.md, auto-loaded by the agent CLIs from the
         // worktree) — only inject the embedded dossier when it doesn't, or
         // when the user explicitly pointed --context-file at one
+        let stance = match job.stance {
+            jobs::JobStance::Explore => explore_stance_section(&item.key),
+            jobs::JobStance::Implement => String::new(),
+        };
         let repo_has_docs = repo_has_agent_docs(&job.repo);
         let context = if repo_has_docs && config.context_file.is_none() {
             String::new()
@@ -2481,7 +2504,7 @@ impl App {
             format!("\n## business context\n{}\n", self.executor_business_context())
         };
         format!(
-            "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}{context}{envelope}",
+            "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}{stance}{context}{envelope}",
             key = item.key,
             title = item.title,
             state = item.state,
@@ -2498,6 +2521,15 @@ impl App {
             meta_prompt.push_str(&format!(
                 "\n\nReviewer note — reflect this in the brief: {extra}\n"
             ));
+        }
+        let explore = self
+            .job_index_by_id(&job_id)
+            .map(|index| self.agent_jobs[index].job.stance == jobs::JobStance::Explore)
+            .unwrap_or(false);
+        if explore {
+            meta_prompt.push_str(
+                "\n\nThis dispatch is a design/exploration pass, not implementation: the brief should ask the agent for assumptions, unknown unknowns, architecture-changing questions, and prototyped options with a recommendation — not code changes.\n",
+            );
         }
         let item_key = item.key.clone();
         let config = &self.client.config;
@@ -2558,8 +2590,14 @@ impl App {
                 let dir = self.agent_jobs[index].dir.clone();
                 let branch = self.agent_jobs[index].job.branch.clone();
                 let repo_has_docs = repo_has_agent_docs(&self.agent_jobs[index].job.repo);
+                let stance = match self.agent_jobs[index].job.stance {
+                    jobs::JobStance::Explore => {
+                        explore_stance_section(&self.agent_jobs[index].job.item_key)
+                    }
+                    jobs::JobStance::Implement => String::new(),
+                };
                 let prompt = format!(
-                    "{}\n{}",
+                    "{}\n{stance}{}",
                     brief.trim(),
                     executor_envelope(&branch, repo_has_docs)
                 );
@@ -3181,9 +3219,14 @@ impl App {
                 row,
                 inner_width,
                 &format!(
-                    "{} · {} · worktree {} · branch {}",
+                    "{} · {}{} · worktree {} · branch {}",
                     job.item_key,
                     truncate(&job.title, 40),
+                    if job.stance == jobs::JobStance::Explore {
+                        " · explore"
+                    } else {
+                        ""
+                    },
                     job.worktree.display(),
                     job.branch
                 ),
@@ -3712,6 +3755,11 @@ impl App {
                     }
                     KeyCode::Char('b') => {
                         self.dispatch_brief = !self.dispatch_brief;
+                        self.force_clear = true;
+                        None
+                    }
+                    KeyCode::Char('e') => {
+                        self.dispatch_explore = !self.dispatch_explore;
                         self.force_clear = true;
                         None
                     }
@@ -6372,7 +6420,7 @@ impl App {
                             .map(|(name, _)| name.as_str())
                             .unwrap_or("?");
                         format!(
-                            "dispatch {} → enter {}  1 codex  2 claude  i int:{}  b brief:{}  r repo:{}  esc",
+                            "dispatch {} → enter {}  1 codex  2 claude  i int:{}  b brief:{}  e stance:{}  r repo:{}  esc",
                             self.dispatch_item.as_deref().unwrap_or("?"),
                             match self.dispatch_backend {
                                 AgentBackend::Codex => "codex",
@@ -6380,6 +6428,7 @@ impl App {
                             },
                             if self.dispatch_interactive { "on" } else { "off" },
                             if self.dispatch_brief { "fable-5" } else { "env" },
+                            if self.dispatch_explore { "explore" } else { "impl" },
                             repo_label,
                         )
                     }
@@ -8398,7 +8447,7 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         value_x,
         row,
         "d",
-        "dispatch agent → enter default · 1 codex · 2 claude · i interactive · b brief · r repo",
+        "dispatch agent → enter default · 1/2 backend · i interactive · b brief · e explore · r repo",
     )?;
     row += 1;
     draw_shortcut_row(

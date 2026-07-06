@@ -124,7 +124,14 @@ Configuration (flag / env var):
 from `a`, which only writes a brief). The dispatch menu: `enter` takes the
 default executor (codex, or the item's label default via
 `PLANE_TUI_LABEL_EXECUTORS="frontend=claude,infra=codex"`), `1` codex,
-`2` claude, `i` toggles **interactive** mode for whichever executor you pick
+`2` claude, `e` toggles the **stance** — `impl` (default: straightforward
+implementation/bug fix) or `explore` (design-first: the agent must not touch
+the real code paths; it delivers a committed design doc with its assumptions,
+unknown unknowns, architecture-changing questions, and 2–3 prototyped options
+with a recommendation, and its summary posts to the item). Review an
+exploration, then `f` "go with option B — implement it" requeues into the
+same worktree with the design threaded into the prompt. `i` toggles
+**interactive** mode for whichever executor you pick
 (the pane runs the agent's own TUI — claude or codex — with the brief
 preloaded; dispatching deep-dives you straight into it; human-paced, so
 exempt from stall/timeout supervision), and `b` toggles
