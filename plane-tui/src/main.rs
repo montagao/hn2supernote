@@ -1,3 +1,4 @@
+mod jobs;
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -55,6 +56,8 @@ const LIST_DUE_WIDTH: u16 = 7;
 const LIST_UPDATED_WIDTH: u16 = 9;
 const MOUSE_SCROLL_LINES: isize = 3;
 const MAX_COALESCED_NAV_KEYS: usize = 256;
+/// Phase 1 of the agent cockpit: one dispatched agent at a time.
+const AGENT_WIP: usize = 1;
 const BUSINESS_CONTEXT: &str = include_str!("business_context.md");
 const BG: Color = Color::Rgb { r: 9, g: 12, b: 17 };
 const BG_RAISE: Color = Color::Rgb {
@@ -343,10 +346,12 @@ struct PlaneClient {
 
 impl PlaneClient {
     fn new(config: Config) -> Self {
-        Self {
-            http: Client::new(),
-            config,
-        }
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { http, config }
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -807,6 +812,7 @@ enum MenuMode {
     Label,
     Edit,
     ConfirmWip,
+    Dispatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -820,6 +826,7 @@ enum InputMode {
     ProjectIdentifier,
     EditTitle,
     EditDue,
+    DispatchExtra,
 }
 
 impl InputMode {
@@ -936,6 +943,12 @@ struct App {
     should_quit: bool,
     last_size: Option<(u16, u16)>,
     force_clear: bool,
+    agent_jobs: Vec<jobs::JobHandle>,
+    jobs_open: bool,
+    jobs_sel: usize,
+    dispatch_item: Option<String>,
+    dispatch_backend: AgentBackend,
+    post_results: Vec<mpsc::Receiver<(String, std::result::Result<(), String>)>>,
 }
 
 impl App {
@@ -1049,6 +1062,15 @@ impl App {
             should_quit: false,
             last_size: None,
             force_clear: true,
+            agent_jobs: plane_tui_data_dir()
+                .ok()
+                .map(|dir| jobs::scan(&jobs::jobs_root(&dir)))
+                .unwrap_or_default(),
+            jobs_open: false,
+            jobs_sel: 0,
+            dispatch_item: None,
+            dispatch_backend: AgentBackend::Codex,
+            post_results: Vec::new(),
         })
     }
 
@@ -1213,7 +1235,15 @@ impl App {
     }
 
     fn on_tick(&mut self) -> Result<()> {
+        // keep the API drawer's memory bounded over long resident sessions
+        if self.api_log.len() > 600 {
+            let excess = self.api_log.len() - 500;
+            self.api_log.drain(..excess);
+        }
         let mut redraw = self.poll_codex_job();
+        if self.pump_agent_jobs() {
+            redraw = true;
+        }
         if let Some(job) = &self.codex_job {
             let elapsed = job.started.elapsed().as_secs();
             self.busy = Some(format!(
@@ -1518,6 +1548,645 @@ impl App {
         current + incoming > limit
     }
 
+    // ------------------------------------------------------ agent cockpit
+
+    /// `d` on the selected item: choose an executor, then an optional note.
+    fn start_dispatch(&mut self) {
+        if self.client.config.repo_dir.is_none() {
+            self.status =
+                "dispatch needs --repo-dir / PLANE_TUI_REPO_DIR (the repo agents work in)"
+                    .to_owned();
+            return;
+        }
+        let Some(item) = self.current_item() else {
+            self.status = "no item selected".to_owned();
+            return;
+        };
+        let key = item.key.clone();
+        if self
+            .agent_jobs
+            .iter()
+            .any(|handle| handle.job.item_key == key && handle.job.status.is_active())
+        {
+            self.status = format!("{key} already has an active job — J opens the fleet");
+            return;
+        }
+        let running = self
+            .agent_jobs
+            .iter()
+            .filter(|handle| handle.job.status == jobs::JobStatus::Running)
+            .count();
+        if running >= AGENT_WIP {
+            self.status = format!("agent slot busy ({running}/{AGENT_WIP}) — J to check or cancel");
+            return;
+        }
+        self.dispatch_item = Some(key);
+        self.menu = Some(MenuMode::Dispatch);
+        self.force_clear = true;
+    }
+
+    fn dispatch_job(&mut self) -> Result<()> {
+        let Some(item_key) = self.dispatch_item.take() else {
+            bail!("no dispatch in progress");
+        };
+        let extra = self.input.trim().to_owned();
+        let Some(index) = self.find_index_by_key(&item_key) else {
+            bail!("{item_key} is no longer on the board");
+        };
+        let item = self.project().items[index].clone();
+        let project_id = self.project().id.clone();
+        let repo = PathBuf::from(
+            self.client
+                .config
+                .repo_dir
+                .clone()
+                .context("--repo-dir required")?,
+        );
+        let slug = item
+            .title
+            .to_lowercase()
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+            .collect::<String>();
+        let slug = slug
+            .split('-')
+            .filter(|part| !part.is_empty())
+            .take(4)
+            .collect::<Vec<_>>()
+            .join("-");
+        let branch = if slug.is_empty() {
+            format!("{}-agent", item_key.to_lowercase())
+        } else {
+            format!("{}-{slug}", item_key.to_lowercase())
+        };
+        let worktree_root = std::env::var("PLANE_TUI_WORKTREE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+                PathBuf::from(home).join("projects").join("worktrees")
+            });
+        let repo_name = repo
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_owned());
+        let worktree = worktree_root.join(format!("{repo_name}-{}", item_key.to_lowercase()));
+        let attempt = 1 + self
+            .agent_jobs
+            .iter()
+            .filter(|handle| handle.job.item_key == item_key)
+            .map(|handle| handle.job.attempt)
+            .max()
+            .unwrap_or(0);
+        let created = Utc::now();
+        let id = format!(
+            "{}-{}",
+            created.format("%Y%m%d-%H%M%S"),
+            item_key.to_lowercase()
+        );
+        let dir = jobs::jobs_root(&plane_tui_data_dir()?).join(&id);
+        let base_ref = jobs::create_worktree(&repo, &worktree, &branch)?;
+        let (backend, model, effort) = match self.dispatch_backend {
+            AgentBackend::Codex => ("codex".to_owned(), "gpt-5.5".to_owned(), String::new()),
+            AgentBackend::Claude => (
+                "claude".to_owned(),
+                self.client.config.claude_model.clone(),
+                self.client.config.claude_effort.clone(),
+            ),
+        };
+        let job = jobs::Job {
+            id,
+            item_key: item_key.clone(),
+            item_id: item.id.clone(),
+            project_id,
+            title: item.title.clone(),
+            backend: backend.clone(),
+            model,
+            effort,
+            attempt,
+            repo,
+            worktree,
+            branch: branch.clone(),
+            base_ref,
+            tmux_socket: jobs::default_socket(),
+            tmux_session: jobs::session_name(&item_key, attempt),
+            status: jobs::JobStatus::Running,
+            created_at: created.to_rfc3339(),
+        };
+        jobs::save(&dir, &job)?;
+        let prompt = self.build_executor_prompt(&item, &extra, &job);
+        fs::write(dir.join("prompt.md"), prompt)?;
+        let permission_mode =
+            std::env::var("PLANE_TUI_CLAUDE_PERM").unwrap_or_else(|_| "acceptEdits".to_owned());
+        jobs::spawn(&job, &dir, &permission_mode)?;
+        self.agent_jobs.push(jobs::JobHandle {
+            dir,
+            job,
+            log_offset: 0,
+            tail: Vec::new(),
+            diff_stat: None,
+        });
+        if item.state != StateKind::Started && item.state != StateKind::Done {
+            let result =
+                self.with_single_target(&item_key, |app| app.apply_state(StateKind::Started));
+            self.soft(result);
+        }
+        self.status = format!("{item_key} dispatched → {backend} on {branch} · J fleet");
+        self.force_clear = true;
+        Ok(())
+    }
+
+    fn executor_business_context(&self) -> String {
+        if let Some(path) = self.client.config.context_file.as_deref() {
+            if let Ok(text) = fs::read_to_string(path) {
+                return text;
+            }
+        }
+        BUSINESS_CONTEXT.to_owned()
+    }
+
+    fn build_executor_prompt(&self, item: &WorkItem, extra: &str, job: &jobs::Job) -> String {
+        let config = &self.client.config;
+        let url = format!(
+            "{}/{}/browse/{}",
+            config.base_url, config.workspace, item.key
+        );
+        let labels = if item.labels.is_empty() {
+            "none".to_owned()
+        } else {
+            item.labels.join(", ")
+        };
+        let due = item.due.clone().unwrap_or_else(|| "none".to_owned());
+        let description = if item.description.trim().is_empty() {
+            "(no description on the item)"
+        } else {
+            item.description.trim()
+        };
+        let reviewer_note = if extra.is_empty() {
+            String::new()
+        } else {
+            format!("\n## reviewer note\n{extra}\n")
+        };
+        format!(
+            "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}\n## business context\n{context}\n\n## working rules\n- you are in a disposable git worktree on branch `{branch}`; commit as you go with clear messages — do NOT push or open PRs\n- run the tests you touch; add a regression test for any bug you fix\n- if you are blocked, the task is ambiguous, or it turns out to be already done: STOP editing and end your final message with a line starting `QUESTION:`\n\n## definition of done\n- changes committed and the relevant tests pass\n- your final message is a reviewer-facing summary: root cause, what changed, how it was verified\n",
+            key = item.key,
+            title = item.title,
+            state = item.state,
+            priority = item.priority.as_plane(),
+            context = self.executor_business_context(),
+            branch = job.branch,
+        )
+    }
+
+    /// One tick of fleet supervision: tail logs, settle finished jobs,
+    /// drain background comment posts. Returns true when a redraw is due.
+    fn pump_agent_jobs(&mut self) -> bool {
+        let mut changed = false;
+        let mut transitions = Vec::new();
+        for (index, handle) in self.agent_jobs.iter_mut().enumerate() {
+            let before = handle.job.status;
+            if jobs::pump(handle) {
+                changed = true;
+            }
+            if handle.job.status != before {
+                transitions.push(index);
+            }
+        }
+        for index in transitions {
+            self.on_job_transition(index);
+        }
+        let mut posted = Vec::new();
+        self.post_results.retain(|rx| match rx.try_recv() {
+            Ok(outcome) => {
+                posted.push(outcome);
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+        for (key, outcome) in posted {
+            changed = true;
+            match outcome {
+                Ok(()) => self.api_log.push(ApiLog::new(
+                    "POST",
+                    &format!("agent summary comment → {key}"),
+                    "",
+                    "201",
+                    0,
+                )),
+                Err(err) => self.status = format!("comment post failed for {key}: {err}"),
+            }
+        }
+        changed
+    }
+
+    fn on_job_transition(&mut self, index: usize) {
+        let (key, status, dir, job) = {
+            let handle = &mut self.agent_jobs[index];
+            if matches!(
+                handle.job.status,
+                jobs::JobStatus::Review | jobs::JobStatus::Question
+            ) {
+                handle.diff_stat = Some(jobs::diff_stat(&handle.job));
+            }
+            (
+                handle.job.item_key.clone(),
+                handle.job.status,
+                handle.dir.clone(),
+                handle.job.clone(),
+            )
+        };
+        match status {
+            jobs::JobStatus::Review => {
+                self.status = format!("⚑ {key} agent finished — J to review");
+                self.post_result_comment(&job, &dir);
+            }
+            jobs::JobStatus::Question => {
+                self.status = format!("? {key} agent has a question — J to read");
+                self.post_result_comment(&job, &dir);
+            }
+            jobs::JobStatus::Failed => {
+                self.status = format!("✗ {key} agent failed — J for the log");
+            }
+            jobs::JobStatus::Orphaned => {
+                self.status = format!("{key} agent orphaned (tmux session gone) — J to retry");
+            }
+            _ => {}
+        }
+        self.force_clear = true;
+    }
+
+    /// Post the agent's result back to the Plane item as a comment, in the
+    /// background with retries — the spec's "TUI is the only Plane writer".
+    fn post_result_comment(&mut self, job: &jobs::Job, dir: &std::path::Path) {
+        let result = jobs::read_result(dir);
+        if result.trim().is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        let project_id = job.project_id.clone();
+        let item_id = job.item_id.clone();
+        let key = job.item_key.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let body = json!({
+                "comment_html": format!("<pre>{}</pre>", escape_html(result.trim())),
+            });
+            let mut outcome = Err("not attempted".to_owned());
+            for attempt in 0u32..3 {
+                match client.create_comment(&project_id, &item_id, body.clone()) {
+                    Ok(_) => {
+                        outcome = Ok(());
+                        break;
+                    }
+                    Err(err) => outcome = Err(format!("{err:#}")),
+                }
+                thread::sleep(Duration::from_secs(2u64 << attempt));
+            }
+            let _ = tx.send((key, outcome));
+        });
+        self.post_results.push(rx);
+    }
+
+    fn job_badge(&self, key: &str) -> Option<(&'static str, Color)> {
+        let handle = self
+            .agent_jobs
+            .iter()
+            .rev()
+            .find(|handle| handle.job.item_key == key && handle.job.status.is_active())?;
+        Some(match handle.job.status {
+            jobs::JobStatus::Running => ("⚑", GREEN),
+            jobs::JobStatus::Review => ("⚑", AMBER),
+            jobs::JobStatus::Question => ("?", AMBER),
+            jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => ("✗", RED),
+            _ => return None,
+        })
+    }
+
+    /// Fleet display order: things needing a human sort above things working.
+    fn fleet_order(&self) -> Vec<usize> {
+        fn rank(status: jobs::JobStatus) -> u8 {
+            match status {
+                jobs::JobStatus::Question => 0,
+                jobs::JobStatus::Review => 1,
+                jobs::JobStatus::Failed => 2,
+                jobs::JobStatus::Orphaned => 3,
+                jobs::JobStatus::Running => 4,
+                jobs::JobStatus::Landed => 5,
+                jobs::JobStatus::Discarded => 6,
+            }
+        }
+        let mut order: Vec<usize> = (0..self.agent_jobs.len()).collect();
+        order.sort_by(|&a, &b| {
+            let left = &self.agent_jobs[a];
+            let right = &self.agent_jobs[b];
+            rank(left.job.status)
+                .cmp(&rank(right.job.status))
+                .then(right.job.id.cmp(&left.job.id))
+        });
+        order
+    }
+
+    fn handle_jobs_key(&mut self, key: KeyEvent) -> Result<()> {
+        let order = self.fleet_order();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('J') | KeyCode::Char('q') => {
+                self.jobs_open = false;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.jobs_sel = min(self.jobs_sel + 1, order.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.jobs_sel = self.jobs_sel.saturating_sub(1);
+            }
+            KeyCode::Char('t') => {
+                if let Some(&index) = order.get(self.jobs_sel) {
+                    let job = self.agent_jobs[index].job.clone();
+                    let terminal_cmd = std::env::var("PLANE_TUI_TERMINAL_CMD").ok();
+                    let template = terminal_cmd.as_deref().unwrap_or("kitty -e {cmd}");
+                    match jobs::deep_dive(&job, Some(template)) {
+                        Ok(jobs::DeepDive::Switched) => {
+                            self.status = format!("deep dive → {}", job.tmux_session);
+                        }
+                        Ok(jobs::DeepDive::SpawnedTerminal(cmd)) => {
+                            self.status = format!("deep dive → {cmd}");
+                        }
+                        Ok(jobs::DeepDive::CopyCommand(cmd)) => {
+                            let _ = copy_to_clipboard(&cmd);
+                            self.status = format!("attach command copied · {cmd}");
+                        }
+                        Err(err) => self.status = format!("deep dive failed: {err:#}"),
+                    }
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(&index) = order.get(self.jobs_sel) {
+                    let handle = &mut self.agent_jobs[index];
+                    if handle.job.status == jobs::JobStatus::Running {
+                        jobs::kill_session(&handle.job);
+                        handle.job.status = jobs::JobStatus::Failed;
+                        handle.tail.push("── cancelled by you ──".to_owned());
+                        let _ = jobs::save(&handle.dir, &handle.job);
+                        self.status = format!("{} cancelled — r retries", handle.job.item_key);
+                    }
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(&index) = order.get(self.jobs_sel) {
+                    let handle = &mut self.agent_jobs[index];
+                    if matches!(
+                        handle.job.status,
+                        jobs::JobStatus::Failed | jobs::JobStatus::Orphaned
+                    ) {
+                        jobs::kill_session(&handle.job);
+                        let _ = fs::remove_file(handle.dir.join("exit"));
+                        let _ = fs::remove_file(handle.dir.join("result.md"));
+                        handle.job.attempt += 1;
+                        handle.job.tmux_session =
+                            jobs::session_name(&handle.job.item_key, handle.job.attempt);
+                        let permission_mode = std::env::var("PLANE_TUI_CLAUDE_PERM")
+                            .unwrap_or_else(|_| "acceptEdits".to_owned());
+                        match jobs::spawn(&handle.job, &handle.dir, &permission_mode) {
+                            Ok(()) => {
+                                handle.job.status = jobs::JobStatus::Running;
+                                handle
+                                    .tail
+                                    .push(format!("── attempt {} ──", handle.job.attempt));
+                                self.status = format!(
+                                    "{} retrying (attempt {})",
+                                    handle.job.item_key, handle.job.attempt
+                                );
+                            }
+                            Err(err) => self.status = format!("retry failed: {err:#}"),
+                        }
+                        let job_snapshot = self.agent_jobs[index].job.clone();
+                        let _ = jobs::save(&self.agent_jobs[index].dir, &job_snapshot);
+                    }
+                }
+            }
+            KeyCode::Char('l') => {
+                if let Some(&index) = order.get(self.jobs_sel) {
+                    let job = self.agent_jobs[index].job.clone();
+                    if matches!(
+                        job.status,
+                        jobs::JobStatus::Review | jobs::JobStatus::Question
+                    ) {
+                        match jobs::accept(&job) {
+                            Ok(()) => {
+                                self.agent_jobs[index].job.status = jobs::JobStatus::Landed;
+                                let _ = jobs::save(
+                                    &self.agent_jobs[index].dir,
+                                    &self.agent_jobs[index].job,
+                                );
+                                let item_key = job.item_key.clone();
+                                let result = self.with_single_target(&item_key, |app| {
+                                    app.apply_state(StateKind::Done)
+                                });
+                                self.soft(result);
+                                self.status = format!(
+                                    "{} landed · branch {} kept in the repo · worktree removed",
+                                    job.item_key, job.branch
+                                );
+                            }
+                            Err(err) => self.status = format!("land failed: {err:#}"),
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(&index) = order.get(self.jobs_sel) {
+                    let job = self.agent_jobs[index].job.clone();
+                    if matches!(
+                        job.status,
+                        jobs::JobStatus::Review
+                            | jobs::JobStatus::Question
+                            | jobs::JobStatus::Failed
+                            | jobs::JobStatus::Orphaned
+                    ) {
+                        match jobs::discard(&job) {
+                            Ok(()) => {
+                                self.agent_jobs[index].job.status = jobs::JobStatus::Discarded;
+                                let _ = jobs::save(
+                                    &self.agent_jobs[index].dir,
+                                    &self.agent_jobs[index].job,
+                                );
+                                self.status = format!(
+                                    "{} discarded · branch {} deleted",
+                                    job.item_key, job.branch
+                                );
+                            }
+                            Err(err) => self.status = format!("discard failed: {err:#}"),
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.force_clear = true;
+        Ok(())
+    }
+
+    fn draw_jobs_overlay(&self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+        let box_width = min(width.saturating_sub(6), 112);
+        let box_height = min(height.saturating_sub(4), 30);
+        if box_width < 60 || box_height < 12 {
+            return draw_overlay(
+                out,
+                width,
+                height,
+                &[" agents ", "terminal too small for the fleet view"],
+            );
+        }
+        let x = width.saturating_sub(box_width) / 2;
+        let y = height.saturating_sub(box_height) / 2;
+        let running = self
+            .agent_jobs
+            .iter()
+            .filter(|handle| handle.job.status == jobs::JobStatus::Running)
+            .count();
+        draw_modal_shell(
+            out,
+            x,
+            y,
+            box_width,
+            box_height,
+            &format!("agents · fleet · {running}/{AGENT_WIP} running"),
+        )?;
+        let inner_x = x + 2;
+        let inner_width = box_width.saturating_sub(4);
+        let order = self.fleet_order();
+        let mut row = y + 2;
+        if order.is_empty() {
+            draw_cell(
+                out,
+                inner_x,
+                row,
+                inner_width,
+                "no agents yet — press d on an item to dispatch one",
+                DIM,
+                Some(BG),
+                false,
+            )?;
+        }
+        let list_rows = min(order.len() as u16, 8);
+        for (position, &index) in order.iter().enumerate().take(list_rows as usize) {
+            let handle = &self.agent_jobs[index];
+            let job = &handle.job;
+            let selected = position == self.jobs_sel;
+            let glyph = match job.status {
+                jobs::JobStatus::Running => FRAMES[self.frame],
+                jobs::JobStatus::Review => "⚑",
+                jobs::JobStatus::Question => "?",
+                jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => "✗",
+                jobs::JobStatus::Landed => "✓",
+                jobs::JobStatus::Discarded => "·",
+            };
+            let tail_hint = handle
+                .tail
+                .last()
+                .map(|line| truncate(line, 40))
+                .unwrap_or_default();
+            let text = format!(
+                " {glyph} {:<9} {:<9} {:<15} a{} {}",
+                job.status.label(),
+                job.item_key,
+                format!("{}·{}", job.backend, truncate(&job.model, 9)),
+                job.attempt,
+                tail_hint
+            );
+            let (fg, bg) = if selected {
+                (Color::Black, Some(PAPER))
+            } else {
+                let color = match job.status {
+                    jobs::JobStatus::Running | jobs::JobStatus::Landed => GREEN,
+                    jobs::JobStatus::Review | jobs::JobStatus::Question => AMBER,
+                    jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => RED,
+                    jobs::JobStatus::Discarded => DIMMER,
+                };
+                (color, Some(BG))
+            };
+            draw_cell(out, inner_x, row, inner_width, &text, fg, bg, selected)?;
+            row += 1;
+        }
+        row += 1;
+        let detail_bottom = y + box_height.saturating_sub(3);
+        if let Some(&index) = order.get(self.jobs_sel) {
+            let handle = &self.agent_jobs[index];
+            let job = &handle.job;
+            draw_cell(
+                out,
+                inner_x,
+                row,
+                inner_width,
+                &format!(
+                    "{} · {} · worktree {} · branch {}",
+                    job.item_key,
+                    truncate(&job.title, 40),
+                    job.worktree.display(),
+                    job.branch
+                ),
+                DIM,
+                Some(BG),
+                false,
+            )?;
+            row += 1;
+            let mut lines: Vec<String> = Vec::new();
+            match job.status {
+                jobs::JobStatus::Review | jobs::JobStatus::Question => {
+                    let result = jobs::read_result(&handle.dir);
+                    lines.extend(result.trim().lines().take(8).map(str::to_owned));
+                    lines.push(String::new());
+                    if let Some(diff) = &handle.diff_stat {
+                        lines.push("diff:".to_owned());
+                        lines.extend(diff.lines().map(str::to_owned));
+                    }
+                }
+                _ => {
+                    let available = detail_bottom.saturating_sub(row) as usize;
+                    let start = handle.tail.len().saturating_sub(available);
+                    lines.extend(handle.tail[start..].iter().cloned());
+                }
+            }
+            for line in lines {
+                if row >= detail_bottom {
+                    break;
+                }
+                draw_cell(out, inner_x, row, inner_width, &line, TEXT, Some(BG), false)?;
+                row += 1;
+            }
+        }
+        draw_cell(
+            out,
+            inner_x,
+            y + box_height.saturating_sub(2),
+            inner_width,
+            "j/k select · t deep dive · c cancel · r retry · l land · x discard · esc close",
+            DIM,
+            Some(BG),
+            false,
+        )?;
+        Ok(())
+    }
+
+    /// Surface an error on the status line instead of letting it unwind the
+    /// event loop — a failed PATCH must never take the whole TUI down.
+    fn soft(&mut self, result: Result<()>) {
+        if let Err(err) = result {
+            self.status = format!("error: {err:#}");
+            self.force_clear = true;
+        }
+    }
+
+    fn soft_or<T>(&mut self, result: Result<T>, fallback: T) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => {
+                self.status = format!("error: {err:#}");
+                self.force_clear = true;
+                fallback
+            }
+        }
+    }
+
     fn run_busy<T, F>(&mut self, message: impl Into<String>, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -1588,6 +2257,9 @@ impl App {
             }
             return Ok(());
         }
+        if self.jobs_open {
+            return self.handle_jobs_key(key);
+        }
         if self.prompt_view.is_some() {
             return self.handle_prompt_view_key(key);
         }
@@ -1643,6 +2315,12 @@ impl App {
                 };
                 self.force_clear = true;
             }
+            KeyCode::Char('d') => self.start_dispatch(),
+            KeyCode::Char('J') => {
+                self.jobs_open = true;
+                self.jobs_sel = 0;
+                self.force_clear = true;
+            }
             KeyCode::Char('s') => self.menu = Some(MenuMode::State),
             KeyCode::Char('p') => self.menu = Some(MenuMode::Priority),
             KeyCode::Char('t') => self.menu = Some(MenuMode::Label),
@@ -1657,7 +2335,10 @@ impl App {
                 self.input_cursor = self.input.len();
             }
             KeyCode::Char('T') => self.start_triage(),
-            KeyCode::Char('R') => self.refresh()?,
+            KeyCode::Char('R') => {
+                let result = self.refresh();
+                self.soft(result);
+            }
             KeyCode::Char('x') => {
                 self.api_open = !self.api_open;
                 self.force_clear = true;
@@ -1907,6 +2588,7 @@ impl App {
     fn handle_menu_key(&mut self, menu: MenuMode, key: KeyEvent) -> Result<()> {
         if matches!(key.code, KeyCode::Esc) {
             self.menu = None;
+            self.dispatch_item = None;
             self.force_clear = true;
             return Ok(());
         }
@@ -1931,7 +2613,8 @@ impl App {
                                 self.force_clear = true;
                                 return Ok(());
                             }
-                            self.apply_state(state)?;
+                            let result = self.apply_state(state);
+                            self.soft(result);
                             self.menu = None;
                             self.marks.clear();
                             self.force_clear = true;
@@ -1939,9 +2622,25 @@ impl App {
                     }
                 }
             }
+            MenuMode::Dispatch => {
+                let backend = match key.code {
+                    KeyCode::Char('1') | KeyCode::Enter => Some(AgentBackend::Codex),
+                    KeyCode::Char('2') => Some(AgentBackend::Claude),
+                    _ => None,
+                };
+                if let Some(backend) = backend {
+                    self.dispatch_backend = backend;
+                    self.menu = None;
+                    self.input_mode = Some(InputMode::DispatchExtra);
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.force_clear = true;
+                }
+            }
             MenuMode::ConfirmWip => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    self.apply_state(StateKind::Started)?;
+                    let result = self.apply_state(StateKind::Started);
+                    self.soft(result);
                     self.menu = None;
                     self.marks.clear();
                     self.force_clear = true;
@@ -1964,7 +2663,8 @@ impl App {
                         _ => None,
                     };
                     if let Some(priority) = priority {
-                        self.apply_priority(priority)?;
+                        let result = self.apply_priority(priority);
+                        self.soft(result);
                         self.menu = None;
                         self.marks.clear();
                         self.force_clear = true;
@@ -1986,7 +2686,8 @@ impl App {
                         return Ok(());
                     }
                     if let Some(index) = ch.to_digit(10).and_then(|n| n.checked_sub(1)) {
-                        self.toggle_label(index as usize)?;
+                        let result = self.toggle_label(index as usize);
+                        self.soft(result);
                     }
                 }
             }
@@ -2105,9 +2806,13 @@ impl App {
                         self.force_clear = true;
                         false
                     }
-                    InputMode::Command => self.run_command()?,
+                    InputMode::Command => {
+                        let result = self.run_command();
+                        self.soft_or(result, false)
+                    }
                     InputMode::NewLabel => {
-                        self.create_label_from_input()?;
+                        let result = self.create_label_from_input();
+                        self.soft(result);
                         false
                     }
                     InputMode::BackendModel => self.update_backend_wizard_model(),
@@ -2116,13 +2821,23 @@ impl App {
                         self.advance_project_wizard_name();
                         true
                     }
-                    InputMode::ProjectIdentifier => self.create_project_from_wizard()?,
+                    InputMode::ProjectIdentifier => {
+                        let result = self.create_project_from_wizard();
+                        self.soft_or(result, false)
+                    }
                     InputMode::EditTitle => {
-                        self.apply_title_edit()?;
+                        let result = self.apply_title_edit();
+                        self.soft(result);
                         false
                     }
                     InputMode::EditDue => {
-                        self.apply_due_edit()?;
+                        let result = self.apply_due_edit();
+                        self.soft(result);
+                        false
+                    }
+                    InputMode::DispatchExtra => {
+                        let result = self.dispatch_job();
+                        self.soft(result);
                         false
                     }
                 };
@@ -2785,24 +3500,34 @@ impl App {
         match key.code {
             KeyCode::Enter => advance = true,
             KeyCode::Char('u') => {
-                self.with_single_target(&current_key, |app| app.apply_priority(Priority::Urgent))?;
+                let result = self
+                    .with_single_target(&current_key, |app| app.apply_priority(Priority::Urgent));
+                self.soft(result);
                 advance = true;
             }
             KeyCode::Char('h') => {
-                self.with_single_target(&current_key, |app| app.apply_priority(Priority::High))?;
+                let result =
+                    self.with_single_target(&current_key, |app| app.apply_priority(Priority::High));
+                self.soft(result);
                 advance = true;
             }
             KeyCode::Char('m') => {
-                self.with_single_target(&current_key, |app| app.apply_priority(Priority::Medium))?;
+                let result = self
+                    .with_single_target(&current_key, |app| app.apply_priority(Priority::Medium));
+                self.soft(result);
                 advance = true;
             }
             KeyCode::Char('l') => {
-                self.with_single_target(&current_key, |app| app.apply_priority(Priority::Low))?;
+                let result =
+                    self.with_single_target(&current_key, |app| app.apply_priority(Priority::Low));
+                self.soft(result);
                 advance = true;
             }
             KeyCode::Char('n') => advance = true,
             KeyCode::Char('2') => {
-                self.with_single_target(&current_key, |app| app.apply_state(StateKind::Todo))?;
+                let result =
+                    self.with_single_target(&current_key, |app| app.apply_state(StateKind::Todo));
+                self.soft(result);
                 advance = true;
                 promoted = true;
             }
@@ -2814,15 +3539,18 @@ impl App {
                         self.wip_limit()
                     );
                 } else {
-                    self.with_single_target(&current_key, |app| {
+                    let result = self.with_single_target(&current_key, |app| {
                         app.apply_state(StateKind::Started)
-                    })?;
+                    });
+                    self.soft(result);
                     advance = true;
                     promoted = true;
                 }
             }
             KeyCode::Char('5') => {
-                self.with_single_target(&current_key, |app| app.apply_state(StateKind::Cancelled))?;
+                let result = self
+                    .with_single_target(&current_key, |app| app.apply_state(StateKind::Cancelled));
+                self.soft(result);
                 advance = true;
                 dropped = true;
             }
@@ -3358,6 +4086,9 @@ impl App {
         if self.prompt_view.is_some() {
             self.draw_prompt_overlay(&mut stdout, width, height)?;
         }
+        if self.jobs_open {
+            self.draw_jobs_overlay(&mut stdout, width, height)?;
+        }
         queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
         stdout.flush()?;
         Ok(())
@@ -3695,6 +4426,18 @@ impl App {
             Some(CELL_BG),
             false,
         )?;
+        if let Some((badge, badge_color)) = self.job_badge(&item.key) {
+            draw_span(out, &mut cursor, y + 1, " ", DIM, Some(CELL_BG), false)?;
+            draw_span(
+                out,
+                &mut cursor,
+                y + 1,
+                badge,
+                badge_color,
+                Some(CELL_BG),
+                true,
+            )?;
+        }
         let glyph = item.priority.glyph();
         let glyph_width = glyph.width() as u16;
         if inner_width > glyph_width {
@@ -4476,6 +5219,11 @@ impl App {
                         self.project().total_for(StateKind::Started),
                         self.wip_limit()
                     ),
+                    MenuMode::Dispatch => format!(
+                        "dispatch {} → 1/enter codex · gpt-5.5   2 claude · {}   esc cancel",
+                        self.dispatch_item.as_deref().unwrap_or("?"),
+                        self.client.config.claude_model
+                    ),
                 };
                 if menu != MenuMode::Label {
                     let menu_bg = if menu == MenuMode::ConfirmWip {
@@ -4613,6 +5361,7 @@ impl App {
                 InputMode::ProjectIdentifier => "new project key → ",
                 InputMode::EditTitle => "edit title → ",
                 InputMode::EditDue => "edit due → ",
+                InputMode::DispatchExtra => "dispatch note (optional, appended to the brief) → ",
             };
             input_prompt(prefix, &self.input, self.input_cursor)
         } else {
@@ -6362,7 +7111,7 @@ fn draw_card_border(
 
 fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
     let box_width = min(width.saturating_sub(8), 112);
-    let box_height = min(height.saturating_sub(6), 24);
+    let box_height = min(height.saturating_sub(6), 26);
     if box_width < 48 || box_height < 10 {
         return draw_overlay(
             out,
@@ -6458,6 +7207,15 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         row,
         "a / A",
         "agent prompt via claude/codex (:backend) · A also posts it as a comment",
+    )?;
+    row += 1;
+    draw_shortcut_row(
+        out,
+        left,
+        value_x,
+        row,
+        "d / J",
+        "dispatch an agent into a worktree · fleet view (t dive, l land)",
     )?;
     row += 1;
     draw_shortcut_row(
