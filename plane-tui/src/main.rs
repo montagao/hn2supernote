@@ -3508,8 +3508,20 @@ impl App {
                 false,
             )?;
         }
-        let list_rows = min(order.len() as u16, 8);
-        for (position, &index) in order.iter().enumerate().take(list_rows as usize) {
+        let sel_pos = self
+            .jobs_sel_id
+            .as_deref()
+            .and_then(|id| order.iter().position(|&i| self.agent_jobs[i].job.id == id))
+            .unwrap_or(0);
+        let list_cap = min(order.len(), 8);
+        // window the list around the selection so it scrolls past the 8th job
+        let window_start = if sel_pos >= list_cap {
+            sel_pos + 1 - list_cap
+        } else {
+            0
+        };
+        let window_end = min(window_start + list_cap, order.len());
+        for (position, &index) in order.iter().enumerate().skip(window_start).take(list_cap) {
             let handle = &self.agent_jobs[index];
             let job = &handle.job;
             let selected = match self.jobs_sel_id.as_deref() {
@@ -3574,6 +3586,16 @@ impl App {
             };
             draw_cell(out, inner_x, row, inner_width, &text, fg, bg, selected)?;
             row += 1;
+        }
+        if window_start > 0 || window_end < order.len() {
+            let above = window_start;
+            let below = order.len().saturating_sub(window_end);
+            let hint = match (above, below) {
+                (a, b) if a > 0 && b > 0 => format!("↑ {a} above · ↓ {b} below"),
+                (a, _) if a > 0 => format!("↑ {a} above"),
+                (_, b) => format!("↓ {b} below"),
+            };
+            draw_cell(out, inner_x, row, inner_width, &hint, DIMMER, Some(BG), false)?;
         }
         row += 1;
         let detail_bottom = y + box_height.saturating_sub(3);
