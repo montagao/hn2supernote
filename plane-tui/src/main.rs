@@ -12,7 +12,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use clap::Parser;
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
@@ -50,6 +53,8 @@ const LIST_LABELS_MAX_WIDTH: u16 = 17;
 const LIST_TITLE_MIN_WIDTH: u16 = 10;
 const LIST_DUE_WIDTH: u16 = 7;
 const LIST_UPDATED_WIDTH: u16 = 9;
+const MOUSE_SCROLL_LINES: isize = 3;
+const MAX_COALESCED_NAV_KEYS: usize = 256;
 const BUSINESS_CONTEXT: &str = include_str!("business_context.md");
 const BG: Color = Color::Rgb { r: 9, g: 12, b: 17 };
 const BG_RAISE: Color = Color::Rgb {
@@ -125,12 +130,47 @@ struct Args {
     per_page: usize,
     #[arg(long)]
     check_api: bool,
+    #[arg(long, env = "PLANE_TUI_AGENT_BACKEND")]
+    agent_backend: Option<String>,
     #[arg(long, env = "PLANE_TUI_CODEX_BIN", default_value = "codex")]
     codex_bin: String,
+    #[arg(long, env = "PLANE_TUI_CLAUDE_BIN", default_value = "claude")]
+    claude_bin: String,
+    #[arg(long, env = "PLANE_TUI_CLAUDE_MODEL")]
+    claude_model: Option<String>,
+    #[arg(long, env = "PLANE_TUI_CLAUDE_EFFORT")]
+    claude_effort: Option<String>,
     #[arg(long, env = "PLANE_TUI_REPO_DIR")]
     repo_dir: Option<String>,
     #[arg(long, env = "PLANE_TUI_CONTEXT_FILE")]
     context_file: Option<String>,
+    #[arg(long, env = "PLANE_TUI_AUTO_REFRESH", default_value_t = 5)]
+    auto_refresh: u64,
+    #[arg(long, env = "PLANE_TUI_WIP_LIMIT", default_value_t = 2)]
+    wip_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentBackend {
+    Codex,
+    Claude,
+}
+
+impl AgentBackend {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -141,9 +181,34 @@ struct Config {
     wanted_projects: Vec<String>,
     per_page: usize,
     check_api: bool,
+    agent_backend: AgentBackend,
     codex_bin: String,
+    claude_bin: String,
+    claude_model: String,
+    claude_effort: String,
     repo_dir: Option<String>,
     context_file: Option<String>,
+    auto_refresh_mins: u64,
+    wip_limit: usize,
+}
+
+impl Config {
+    fn agent_bin(&self) -> &str {
+        match self.agent_backend {
+            AgentBackend::Codex => &self.codex_bin,
+            AgentBackend::Claude => &self.claude_bin,
+        }
+    }
+
+    fn agent_summary(&self) -> String {
+        match self.agent_backend {
+            AgentBackend::Codex => format!("codex ({})", self.codex_bin),
+            AgentBackend::Claude => format!(
+                "claude · model {} · effort {}",
+                self.claude_model, self.claude_effort
+            ),
+        }
+    }
 }
 
 impl Config {
@@ -160,21 +225,49 @@ impl Config {
             .ok_or_else(|| anyhow!("set PLANE_BASE_URL or PLANE_API_URL"))?
             .trim_end_matches('/')
             .to_owned();
+        let mut wanted_projects = args
+            .projects
+            .split(',')
+            .map(|part| part.trim().to_lowercase())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        for project in remembered_projects(&args.workspace).unwrap_or_default() {
+            if !wanted_projects.contains(&project) {
+                wanted_projects.push(project);
+            }
+        }
+        let saved = saved_agent_prefs().unwrap_or_default();
+        let agent_backend = match args.agent_backend.as_deref() {
+            Some(value) => AgentBackend::parse(value)
+                .ok_or_else(|| anyhow!("invalid --agent-backend {value:?} (codex or claude)"))?,
+            None => saved
+                .backend
+                .as_deref()
+                .and_then(AgentBackend::parse)
+                .unwrap_or(AgentBackend::Claude),
+        };
         Ok(Self {
             base_url,
             api_key: args.api_key,
             workspace: args.workspace,
-            wanted_projects: args
-                .projects
-                .split(',')
-                .map(|part| part.trim().to_lowercase())
-                .filter(|part| !part.is_empty())
-                .collect(),
+            wanted_projects,
             per_page: args.per_page.clamp(10, 200),
             check_api: args.check_api,
+            agent_backend,
             codex_bin: args.codex_bin,
+            claude_bin: args.claude_bin,
+            claude_model: args
+                .claude_model
+                .or(saved.model)
+                .unwrap_or_else(|| "claude-fable-5".to_owned()),
+            claude_effort: args
+                .claude_effort
+                .or(saved.effort)
+                .unwrap_or_else(|| "high".to_owned()),
             repo_dir: args.repo_dir,
             context_file: args.context_file,
+            auto_refresh_mins: args.auto_refresh,
+            wip_limit: args.wip_limit,
         })
     }
 }
@@ -232,6 +325,14 @@ struct ApiItem {
     completed_at: Option<String>,
     #[serde(default)]
     archived_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ApiComment {
+    #[serde(default)]
+    comment_html: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -378,6 +479,15 @@ impl PlaneClient {
         serde_json::from_value(raw).context("create label response")
     }
 
+    fn create_project(&self, body: Value) -> Result<ApiProject> {
+        let raw = self.request_json(
+            "POST",
+            &format!("/api/v1/workspaces/{}/projects/", self.config.workspace),
+            body,
+        )?;
+        serde_json::from_value(raw).context("create project response")
+    }
+
     fn work_items(&self, project_id: &str, per_page: usize) -> Result<Vec<ApiItem>> {
         self.list_all(&format!(
             "/api/v1/workspaces/{}/projects/{project_id}/work-items/?per_page={per_page}",
@@ -416,6 +526,13 @@ impl PlaneClient {
             ),
             body,
         )
+    }
+
+    fn list_comments(&self, project_id: &str, item_id: &str) -> Result<Vec<ApiComment>> {
+        self.list_all(&format!(
+            "/api/v1/workspaces/{}/projects/{project_id}/work-items/{item_id}/comments/",
+            self.config.workspace
+        ))
     }
 }
 
@@ -581,6 +698,7 @@ struct Project {
     states: Vec<State>,
     labels: Vec<Label>,
     items: Vec<WorkItem>,
+    loaded_at: Instant,
 }
 
 impl Project {
@@ -688,6 +806,7 @@ enum MenuMode {
     Priority,
     Label,
     Edit,
+    ConfirmWip,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -695,9 +814,18 @@ enum InputMode {
     Search,
     Command,
     NewLabel,
+    BackendModel,
+    BackendEffort,
+    ProjectName,
+    ProjectIdentifier,
     EditTitle,
-    EditDescription,
     EditDue,
+}
+
+impl InputMode {
+    fn can_redraw_footer_only(self) -> bool {
+        !matches!(self, Self::Search)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -727,6 +855,51 @@ struct PromptView {
     scroll: usize,
 }
 
+struct CodexJob {
+    key: String,
+    backend: AgentBackend,
+    comment_path: String,
+    pid: u32,
+    started: Instant,
+    rx: mpsc::Receiver<CodexOutcome>,
+}
+
+struct CodexOutcome {
+    prompt: Result<String>,
+    comment: Option<Result<()>>,
+    elapsed_ms: u128,
+}
+
+struct DetailView {
+    key: String,
+    scroll: usize,
+    comments: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct BackendWizard {
+    selected: AgentBackend,
+    claude_model: String,
+    claude_effort: String,
+}
+
+impl BackendWizard {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            selected: config.agent_backend,
+            claude_model: config.claude_model.clone(),
+            claude_effort: config.claude_effort.clone(),
+        }
+    }
+
+    fn cycle(&mut self) {
+        self.selected = match self.selected {
+            AgentBackend::Codex => AgentBackend::Claude,
+            AgentBackend::Claude => AgentBackend::Codex,
+        };
+    }
+}
+
 struct App {
     client: PlaneClient,
     projects: Vec<Project>,
@@ -743,6 +916,7 @@ struct App {
     input: String,
     input_cursor: usize,
     editing_key: Option<String>,
+    new_project_name: Option<String>,
     menu: Option<MenuMode>,
     api_open: bool,
     show_done: bool,
@@ -750,6 +924,10 @@ struct App {
     notes_open: bool,
     triage: Option<Triage>,
     prompt_view: Option<PromptView>,
+    codex_job: Option<CodexJob>,
+    detail: Option<DetailView>,
+    backend_wizard: Option<BackendWizard>,
+    last_idle_draw: Option<Instant>,
     api_log: Vec<ApiLog>,
     status: String,
     busy: Option<String>,
@@ -813,81 +991,12 @@ impl App {
                 t0.elapsed().as_millis(),
             ));
 
-            let states = api_states
-                .into_iter()
-                .map(|state| State {
-                    id: state.id,
-                    name: state.name,
-                    kind: StateKind::from_group(&state.group),
-                })
-                .collect::<Vec<_>>();
-            let state_lookup = states
-                .iter()
-                .map(|state| (state.id.clone(), state.kind))
-                .collect::<BTreeMap<_, _>>();
-            let labels = api_labels
-                .into_iter()
-                .map(|label| Label {
-                    id: label.id,
-                    name: label.name,
-                    color: parse_hex_color(label.color.as_deref().unwrap_or("#777777")),
-                })
-                .collect::<Vec<_>>();
-            let label_lookup = labels
-                .iter()
-                .map(|label| (label.id.clone(), label.name.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let items = api_items
-                .into_iter()
-                .filter(|item| item.archived_at.is_none())
-                .map(|item| {
-                    let state_id = item.state_id.or(item.state).unwrap_or_default();
-                    let state = state_lookup
-                        .get(&state_id)
-                        .copied()
-                        .unwrap_or(StateKind::Backlog);
-                    let mut label_ids = item.label_ids;
-                    if label_ids.is_empty() {
-                        label_ids = item.labels.clone();
-                    }
-                    let mut label_names = item
-                        .label_details
-                        .iter()
-                        .map(|label| label.name.clone())
-                        .collect::<Vec<_>>();
-                    if label_names.is_empty() {
-                        label_names = label_ids
-                            .iter()
-                            .filter_map(|id| label_lookup.get(id).cloned())
-                            .collect();
-                    }
-                    WorkItem {
-                        id: item.id,
-                        key: format!("{}-{}", api_project.identifier, item.sequence_id),
-                        sequence_id: item.sequence_id,
-                        title: item.name,
-                        state_id,
-                        state,
-                        priority: Priority::from_plane(item.priority.as_deref()),
-                        labels: label_names,
-                        label_ids,
-                        due: item.target_date,
-                        created_at: parse_dt(item.created_at.as_deref()),
-                        updated_at: parse_dt(item.updated_at.as_deref()),
-                        completed_at: item.completed_at,
-                        description: html_to_text(item.description_html.as_deref().unwrap_or("")),
-                        actions: Vec::new(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            projects.push(Project {
-                id: api_project.id,
-                name: api_project.name,
-                identifier: api_project.identifier,
-                states,
-                labels,
-                items,
-            });
+            projects.push(project_from_api(
+                api_project,
+                api_states,
+                api_labels,
+                api_items,
+            ));
         }
         let wanted = client.config.wanted_projects.clone();
         projects.sort_by_key(|project| {
@@ -920,6 +1029,7 @@ impl App {
             input: String::new(),
             input_cursor: 0,
             editing_key: None,
+            new_project_name: None,
             menu: None,
             api_open: false,
             show_done: false,
@@ -927,6 +1037,10 @@ impl App {
             notes_open: false,
             triage: None,
             prompt_view: None,
+            codex_job: None,
+            detail: None,
+            backend_wizard: None,
+            last_idle_draw: None,
             api_log,
             status: "connected · press T to triage · ? for keys".to_owned(),
             busy: None,
@@ -941,29 +1055,326 @@ impl App {
     fn run(&mut self) -> Result<()> {
         let _guard = TerminalGuard::enter()?;
         self.draw()?;
+        let mut pending_event = None;
         loop {
             if self.should_quit {
                 break;
             }
-            if event::poll(Duration::from_millis(250))? {
-                match event::read()? {
+            let next_event = if let Some(event) = pending_event.take() {
+                Some(event)
+            } else if event::poll(Duration::from_millis(250))? {
+                Some(event::read()?)
+            } else {
+                None
+            };
+            if let Some(next_event) = next_event {
+                match next_event {
                     Event::Key(key) => {
+                        let overlay_scroll = self.is_overlay_scroll_key(&key);
+                        let input_mode_before = self.input_mode;
+                        let force_clear_before = self.force_clear;
+                        let coalesce_repeat_keys = self.can_coalesce_repeat_key(&key);
                         self.handle_key(key)?;
                         if self.should_quit {
                             break;
                         }
+                        if coalesce_repeat_keys {
+                            self.drain_coalesced_repeat_keys(&mut pending_event)?;
+                            if self.should_quit {
+                                break;
+                            }
+                        }
+                        let codex_redraw = self.poll_codex_job();
                         self.frame = (self.frame + 1) % FRAMES.len();
-                        self.draw()?;
+                        if overlay_scroll && (self.prompt_view.is_some() || self.detail.is_some()) {
+                            self.draw_active_overlay()?;
+                        } else if self.can_redraw_footer_only_after_key(
+                            input_mode_before,
+                            force_clear_before,
+                            codex_redraw,
+                        ) {
+                            self.draw_footer_only()?;
+                        } else {
+                            self.draw()?;
+                        }
                     }
                     Event::Resize(_, _) => {
                         self.clamp_selection();
                         self.draw()?;
                     }
+                    Event::Mouse(mouse) => {
+                        if self.handle_mouse(mouse)? {
+                            self.draw_active_overlay()?;
+                        }
+                    }
                     _ => {}
+                }
+            } else {
+                self.on_tick()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_overlay_scroll_key(&self, key: &KeyEvent) -> bool {
+        (self.prompt_view.is_some() || self.detail.is_some())
+            && matches!(
+                key.code,
+                KeyCode::Char('j')
+                    | KeyCode::Down
+                    | KeyCode::Char('k')
+                    | KeyCode::Up
+                    | KeyCode::PageDown
+                    | KeyCode::Char('d')
+                    | KeyCode::PageUp
+                    | KeyCode::Char('u')
+                    | KeyCode::Char('g')
+                    | KeyCode::Char('G')
+            )
+    }
+
+    fn can_coalesce_repeat_key(&self, key: &KeyEvent) -> bool {
+        if key.modifiers != KeyModifiers::NONE {
+            return false;
+        }
+        if self.prompt_view.is_some() || self.detail.is_some() {
+            return self.is_overlay_scroll_key(key);
+        }
+        if self.keys_open
+            || self.notes_open
+            || self.triage.is_some()
+            || self.backend_wizard.is_some()
+            || self.menu.is_some()
+            || self.input_mode.is_some()
+        {
+            return false;
+        }
+        matches!(
+            key.code,
+            KeyCode::Char('j')
+                | KeyCode::Down
+                | KeyCode::Char('k')
+                | KeyCode::Up
+                | KeyCode::Char('h')
+                | KeyCode::Left
+                | KeyCode::Char('l')
+                | KeyCode::Right
+        )
+    }
+
+    fn drain_coalesced_repeat_keys(&mut self, pending_event: &mut Option<Event>) -> Result<()> {
+        let mut drained = 0;
+        while drained < MAX_COALESCED_NAV_KEYS && event::poll(Duration::from_millis(0))? {
+            let event = event::read()?;
+            match event {
+                Event::Key(key) if self.can_coalesce_repeat_key(&key) => {
+                    self.handle_key(key)?;
+                    drained += 1;
+                    if self.should_quit {
+                        break;
+                    }
+                }
+                event => {
+                    *pending_event = Some(event);
+                    break;
                 }
             }
         }
         Ok(())
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollDown => MOUSE_SCROLL_LINES,
+            MouseEventKind::ScrollUp => -MOUSE_SCROLL_LINES,
+            _ => return Ok(false),
+        };
+        if self.prompt_view.is_some() {
+            self.scroll_prompt_view(delta);
+            return Ok(true);
+        }
+        if self.detail.is_some() {
+            self.scroll_detail_view(delta);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn scroll_prompt_view(&mut self, delta: isize) {
+        if let Some(view) = self.prompt_view.as_mut() {
+            view.scroll = scroll_offset(view.scroll, delta);
+        }
+    }
+
+    fn scroll_detail_view(&mut self, delta: isize) {
+        if let Some(detail) = self.detail.as_mut() {
+            detail.scroll = scroll_offset(detail.scroll, delta);
+        }
+    }
+
+    fn on_tick(&mut self) -> Result<()> {
+        let mut redraw = self.poll_codex_job();
+        if let Some(job) = &self.codex_job {
+            let elapsed = job.started.elapsed().as_secs();
+            self.busy = Some(format!(
+                "{} · agent prompt for {} · {elapsed}s · esc cancels",
+                job.backend.name(),
+                job.key
+            ));
+            self.frame = (self.frame + 1) % FRAMES.len();
+            redraw = true;
+        }
+        if self.maybe_auto_refresh() {
+            redraw = true;
+        }
+        if !redraw
+            && self
+                .last_idle_draw
+                .is_none_or(|at| at.elapsed() > Duration::from_secs(30))
+        {
+            redraw = true;
+        }
+        if redraw {
+            self.last_idle_draw = Some(Instant::now());
+            self.draw()?;
+        }
+        Ok(())
+    }
+
+    fn poll_codex_job(&mut self) -> bool {
+        let Some(job) = &self.codex_job else {
+            return false;
+        };
+        match job.rx.try_recv() {
+            Ok(outcome) => {
+                let job = self.codex_job.take().expect("codex job present");
+                self.busy = None;
+                self.finish_codex_job(job, outcome);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                let job = self.codex_job.take().expect("codex job present");
+                self.busy = None;
+                self.status = format!(
+                    "{} worker for {} stopped unexpectedly",
+                    job.backend.name(),
+                    job.key
+                );
+                true
+            }
+        }
+    }
+
+    fn finish_codex_job(&mut self, job: CodexJob, outcome: CodexOutcome) {
+        let prompt = match outcome.prompt {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                self.api_log.push(ApiLog::new(
+                    "AGENT",
+                    &job.key,
+                    "agent prompt",
+                    "err",
+                    outcome.elapsed_ms,
+                ));
+                self.status = format!("{} failed: {err:#}", job.backend.name());
+                return;
+            }
+        };
+        self.api_log.push(ApiLog::new(
+            "AGENT",
+            &job.key,
+            "agent prompt",
+            "ok",
+            outcome.elapsed_ms,
+        ));
+        let file = save_prompt(&job.key, &prompt).unwrap_or_else(|_| "(not saved)".to_owned());
+        let clipboard_note = match copy_to_clipboard(&prompt) {
+            Ok(()) => " · copied".to_owned(),
+            Err(err) => format!(" · clipboard failed: {err:#}"),
+        };
+        let comment_note = match outcome.comment {
+            Some(Ok(())) => {
+                self.api_log.push(ApiLog::new(
+                    "POST",
+                    &job.comment_path,
+                    "agent prompt comment",
+                    "201",
+                    0,
+                ));
+                if let Some(index) = self.find_index_by_key(&job.key) {
+                    self.project_mut().items[index]
+                        .actions
+                        .insert(0, "POST comment · agent prompt".to_owned());
+                }
+                " · commented".to_owned()
+            }
+            Some(Err(err)) => {
+                self.api_log.push(ApiLog::new(
+                    "POST",
+                    &job.comment_path,
+                    "agent prompt comment",
+                    "err",
+                    0,
+                ));
+                format!(" · comment failed: {err:#}")
+            }
+            None => String::new(),
+        };
+        self.status = format!(
+            "agent prompt for {} · saved {file}{clipboard_note}{comment_note}",
+            job.key
+        );
+        self.prompt_view = Some(PromptView {
+            key: job.key,
+            text: prompt,
+            file,
+            scroll: 0,
+        });
+        self.force_clear = true;
+    }
+
+    fn cancel_codex_job(&mut self) {
+        if let Some(job) = self.codex_job.take() {
+            let _ = Command::new("kill")
+                .arg(job.pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            self.busy = None;
+            self.status = format!("{} cancelled for {}", job.backend.name(), job.key);
+        }
+    }
+
+    fn maybe_auto_refresh(&mut self) -> bool {
+        let mins = self.client.config.auto_refresh_mins;
+        if mins == 0
+            || self.input_mode.is_some()
+            || self.menu.is_some()
+            || self.triage.is_some()
+            || self.keys_open
+            || self.notes_open
+            || self.prompt_view.is_some()
+            || self.detail.is_some()
+            || self.backend_wizard.is_some()
+            || self.codex_job.is_some()
+            || self.busy.is_some()
+        {
+            return false;
+        }
+        if self.project().loaded_at.elapsed() < Duration::from_secs(mins * 60) {
+            return false;
+        }
+        let identifier = self.project().identifier.clone();
+        match self.refresh() {
+            Ok(()) => self.status = format!("auto-refreshed {identifier}"),
+            Err(err) => {
+                // touch loaded_at so a dead network does not retry every tick
+                self.project_mut().loaded_at = Instant::now();
+                self.status = format!("auto-refresh failed: {err:#}");
+            }
+        }
+        true
     }
 
     fn project(&self) -> &Project {
@@ -1086,6 +1497,27 @@ impl App {
         self.project().items.iter().position(|item| item.key == key)
     }
 
+    fn wip_limit(&self) -> usize {
+        self.client.config.wip_limit
+    }
+
+    fn wip_would_exceed(&self, keys: &[String]) -> bool {
+        let limit = self.wip_limit();
+        if limit == 0 {
+            return false;
+        }
+        let current = self.project().total_for(StateKind::Started);
+        let incoming = keys
+            .iter()
+            .filter(|key| {
+                self.find_index_by_key(key)
+                    .map(|index| self.project().items[index].state != StateKind::Started)
+                    .unwrap_or(false)
+            })
+            .count();
+        current + incoming > limit
+    }
+
     fn run_busy<T, F>(&mut self, message: impl Into<String>, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -1159,8 +1591,20 @@ impl App {
         if self.prompt_view.is_some() {
             return self.handle_prompt_view_key(key);
         }
+        if self.detail.is_some() {
+            return self.handle_detail_key(key);
+        }
         if self.triage.is_some() {
             return self.handle_triage_key(key);
+        }
+        if matches!(
+            self.input_mode,
+            Some(InputMode::BackendModel | InputMode::BackendEffort)
+        ) {
+            return self.handle_input_key(self.input_mode.expect("backend input mode"), key);
+        }
+        if self.backend_wizard.is_some() {
+            return self.handle_backend_wizard_key(key);
         }
         if let Some(menu) = self.menu {
             return self.handle_menu_key(menu, key);
@@ -1171,6 +1615,11 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                if self.codex_job.is_some() {
+                    self.cancel_codex_job();
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => self.move_vertical(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_vertical(-1),
             KeyCode::Char('h') | KeyCode::Left => self.move_column(-1),
@@ -1200,6 +1649,7 @@ impl App {
             KeyCode::Char('e') => self.menu = Some(MenuMode::Edit),
             KeyCode::Char('a') => self.generate_agent_prompt(false)?,
             KeyCode::Char('A') => self.generate_agent_prompt(true)?,
+            KeyCode::Enter => self.open_detail()?,
             KeyCode::Char('o') => self.open_targets(),
             KeyCode::Char('n') => {
                 self.input_mode = Some(InputMode::Command);
@@ -1232,6 +1682,8 @@ impl App {
             }
             KeyCode::Char('?') => self.keys_open = true,
             KeyCode::Char('!') => self.notes_open = true,
+            KeyCode::Tab => self.cycle_project(1)?,
+            KeyCode::BackTab => self.cycle_project(-1)?,
             KeyCode::Char(ch) if ch.is_ascii_digit() && ch != '0' => {
                 let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
                 if index < self.projects.len() {
@@ -1339,6 +1791,21 @@ impl App {
         self.status = format!("sort → {}", self.sort.label());
     }
 
+    fn cycle_project(&mut self, delta: isize) -> Result<()> {
+        if self.projects.is_empty() {
+            return Ok(());
+        }
+        let max_index = self.projects.len().saturating_sub(1);
+        let next = if delta < 0 {
+            self.active_project.checked_sub(1).unwrap_or(max_index)
+        } else if self.active_project >= max_index {
+            0
+        } else {
+            self.active_project + 1
+        };
+        self.switch_project(next)
+    }
+
     fn switch_project(&mut self, index: usize) -> Result<()> {
         self.active_project = index;
         self.column = 1.min(self.board_states().len().saturating_sub(1));
@@ -1422,11 +1889,12 @@ impl App {
                 created_at: parse_dt(item.created_at.as_deref()),
                 updated_at: parse_dt(item.updated_at.as_deref()),
                 completed_at: item.completed_at,
-                description: html_to_text(item.description_html.as_deref().unwrap_or("")),
+                description: html_to_text_multiline(item.description_html.as_deref().unwrap_or("")),
                 actions: Vec::new(),
             });
         }
         self.project_mut().items = items;
+        self.project_mut().loaded_at = Instant::now();
         self.status = format!(
             "refreshed {} · {} loaded items",
             identifier,
@@ -1456,6 +1924,13 @@ impl App {
                         .get(index as usize)
                         .copied();
                         if let Some(state) = state {
+                            if state == StateKind::Started
+                                && self.wip_would_exceed(&self.target_keys())
+                            {
+                                self.menu = Some(MenuMode::ConfirmWip);
+                                self.force_clear = true;
+                                return Ok(());
+                            }
                             self.apply_state(state)?;
                             self.menu = None;
                             self.marks.clear();
@@ -1464,6 +1939,20 @@ impl App {
                     }
                 }
             }
+            MenuMode::ConfirmWip => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.apply_state(StateKind::Started)?;
+                    self.menu = None;
+                    self.marks.clear();
+                    self.force_clear = true;
+                }
+                KeyCode::Char('n') => {
+                    self.menu = None;
+                    self.force_clear = true;
+                    self.status = "kept out of In Progress — finish something first".to_owned();
+                }
+                _ => {}
+            },
             MenuMode::Priority => {
                 if let KeyCode::Char(ch) = key.code {
                     let priority = match ch {
@@ -1505,7 +1994,7 @@ impl App {
                 if let KeyCode::Char(ch) = key.code {
                     match ch {
                         't' => self.start_edit_title(),
-                        'd' => self.start_edit_description(),
+                        'd' => self.edit_description_in_editor()?,
                         'u' => self.start_edit_due(),
                         _ => {}
                     }
@@ -1530,19 +2019,54 @@ impl App {
         self.menu = None;
     }
 
-    fn start_edit_description(&mut self) {
+    fn edit_description_in_editor(&mut self) -> Result<()> {
         let Some((key, description)) = self
             .current_item()
             .map(|item| (item.key.clone(), item.description.clone()))
         else {
             self.status = "no item selected".to_owned();
-            return;
+            self.menu = None;
+            return Ok(());
         };
-        self.input = description;
-        self.input_cursor = self.input.len();
-        self.editing_key = Some(key);
-        self.input_mode = Some(InputMode::EditDescription);
         self.menu = None;
+        self.force_clear = true;
+        let edited = match edit_text_in_editor(&key, &description) {
+            Ok(Some(edited)) => edited,
+            Ok(None) => {
+                self.status = format!("description unchanged for {key}");
+                return Ok(());
+            }
+            Err(err) => {
+                self.status = format!("editor failed: {err:#}");
+                return Ok(());
+            }
+        };
+        let Some(index) = self.find_index_by_key(&key) else {
+            self.status = format!("{key} is no longer loaded");
+            return Ok(());
+        };
+        let project_id = self.project().id.clone();
+        let item_id = self.project().items[index].id.clone();
+        let path = format!("/{}/work-items/{key}/", self.project().identifier);
+        let description_html = text_to_description_html(&edited);
+        let t0 = Instant::now();
+        let body = json!({ "description_html": description_html });
+        self.run_busy(format!("PATCH {key} description"), move |client| {
+            client.update_work_item(&project_id, &item_id, body)
+        })?;
+        self.api_log.push(ApiLog::new(
+            "PATCH",
+            &path,
+            "description",
+            "200",
+            t0.elapsed().as_millis(),
+        ));
+        let item = &mut self.project_mut().items[index];
+        item.description = edited;
+        item.updated_at = Some(Utc::now());
+        item.actions.insert(0, "PATCH description".to_owned());
+        self.status = format!("edited description for {key} in $EDITOR");
+        Ok(())
     }
 
     fn start_edit_due(&mut self) {
@@ -1567,30 +2091,44 @@ impl App {
                 self.input.clear();
                 self.input_cursor = 0;
                 self.editing_key = None;
+                self.new_project_name = None;
                 if mode == InputMode::Search {
                     self.search.clear();
                     self.force_clear = true;
                 }
             }
             KeyCode::Enter => {
-                match mode {
+                let keep_input = match mode {
                     InputMode::Search => {
                         self.search = self.input.clone();
                         self.status = format!("search → /{}", self.search);
                         self.force_clear = true;
+                        false
                     }
-                    InputMode::Command => {
-                        self.run_command()?;
+                    InputMode::Command => self.run_command()?,
+                    InputMode::NewLabel => {
+                        self.create_label_from_input()?;
+                        false
                     }
-                    InputMode::NewLabel => self.create_label_from_input()?,
-                    InputMode::EditTitle => self.apply_title_edit()?,
-                    InputMode::EditDescription => self.apply_description_edit()?,
-                    InputMode::EditDue => self.apply_due_edit()?,
+                    InputMode::BackendModel => self.update_backend_wizard_model(),
+                    InputMode::BackendEffort => self.update_backend_wizard_effort(),
+                    InputMode::ProjectName => {
+                        self.advance_project_wizard_name();
+                        true
+                    }
+                    InputMode::ProjectIdentifier => self.create_project_from_wizard()?,
+                    InputMode::EditTitle => {
+                        self.apply_title_edit()?;
+                        false
+                    }
+                    InputMode::EditDue => {
+                        self.apply_due_edit()?;
+                        false
+                    }
+                };
+                if !keep_input {
+                    self.clear_input_state();
                 }
-                self.input_mode = None;
-                self.input.clear();
-                self.input_cursor = 0;
-                self.editing_key = None;
             }
             KeyCode::Backspace => {
                 if self.input_cursor > 0 {
@@ -1634,50 +2172,220 @@ impl App {
         Ok(())
     }
 
-    fn run_command(&mut self) -> Result<()> {
+    fn clear_input_state(&mut self) {
+        self.input_mode = None;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.editing_key = None;
+        self.new_project_name = None;
+    }
+
+    fn run_command(&mut self) -> Result<bool> {
         let input = self.input.clone();
         let mut parts = input.trim().splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("").trim();
-        match command {
-            "new" => self.create_item(rest)?,
-            "agent" | "prompt" if rest == "post" => self.generate_agent_prompt(true)?,
-            "agent" | "prompt" => self.generate_agent_prompt(false)?,
-            "triage" => self.start_triage(),
-            "state" => self.menu = Some(MenuMode::State),
-            "priority" => self.menu = Some(MenuMode::Priority),
-            "label" => self.menu = Some(MenuMode::Label),
-            "open" => self.open_targets(),
+        let keep_input = match command {
+            "new" => {
+                self.create_item(rest)?;
+                false
+            }
+            "project" if rest.is_empty() || rest == "new" => {
+                self.start_project_wizard();
+                true
+            }
+            "agent" | "prompt" if rest == "post" => {
+                self.generate_agent_prompt(true)?;
+                false
+            }
+            "agent" | "prompt" => {
+                self.generate_agent_prompt(false)?;
+                false
+            }
+            "backend" => {
+                if rest.is_empty() {
+                    self.start_backend_wizard();
+                } else {
+                    self.configure_backend(rest);
+                }
+                false
+            }
+            "triage" => {
+                self.start_triage();
+                false
+            }
+            "state" => {
+                self.menu = Some(MenuMode::State);
+                false
+            }
+            "priority" => {
+                self.menu = Some(MenuMode::Priority);
+                false
+            }
+            "label" => {
+                self.menu = Some(MenuMode::Label);
+                false
+            }
+            "open" => {
+                self.open_targets();
+                false
+            }
             "view" => {
                 self.toggle_view();
                 self.force_clear = true;
+                false
             }
-            "refresh" => self.refresh()?,
+            "refresh" => {
+                self.refresh()?;
+                false
+            }
             "api" => {
                 self.api_open = !self.api_open;
                 self.force_clear = true;
+                false
             }
-            "help" => self.keys_open = true,
+            "help" => {
+                self.keys_open = true;
+                false
+            }
             "filter" if rest == "fire" => {
                 self.filter = FilterMode::Fire;
                 self.force_clear = true;
+                false
             }
             "filter" if rest == "untriaged" => {
                 self.filter = FilterMode::Untriaged;
                 self.force_clear = true;
+                false
             }
             "filter" if rest == "clear" => {
                 self.filter = FilterMode::All;
                 self.force_clear = true;
+                false
             }
             "sort" => {
                 self.cycle_sort();
                 self.force_clear = true;
+                false
             }
-            "" => {}
-            other => self.status = format!("unknown command :{other}"),
+            "" => false,
+            other => {
+                self.status = format!("unknown command :{other}");
+                false
+            }
+        };
+        Ok(keep_input)
+    }
+
+    fn start_project_wizard(&mut self) {
+        self.input_mode = Some(InputMode::ProjectName);
+        self.input.clear();
+        self.input_cursor = 0;
+        self.editing_key = None;
+        self.new_project_name = None;
+        self.status = "new project: enter name".to_owned();
+    }
+
+    fn advance_project_wizard_name(&mut self) {
+        let name = self.input.trim().to_owned();
+        if name.is_empty() {
+            self.status = "project name is required".to_owned();
+            self.input_mode = Some(InputMode::ProjectName);
+            return;
         }
-        Ok(())
+        if self
+            .projects
+            .iter()
+            .any(|project| project.name.eq_ignore_ascii_case(&name))
+        {
+            self.status = format!("project already exists: {name}");
+            self.input_mode = Some(InputMode::ProjectName);
+            return;
+        }
+        let identifier = project_identifier_from_name(&name);
+        self.new_project_name = Some(name);
+        self.input = identifier;
+        self.input_cursor = self.input.len();
+        self.input_mode = Some(InputMode::ProjectIdentifier);
+        self.status = "new project: confirm identifier".to_owned();
+    }
+
+    fn create_project_from_wizard(&mut self) -> Result<bool> {
+        let Some(name) = self.new_project_name.clone() else {
+            self.status = "project wizard lost the name; start :project again".to_owned();
+            return Ok(false);
+        };
+        let identifier = normalize_project_identifier(&self.input);
+        if identifier.is_empty() {
+            self.status = "project identifier is required".to_owned();
+            self.input_mode = Some(InputMode::ProjectIdentifier);
+            return Ok(true);
+        }
+        if self.projects.iter().any(|project| {
+            project.identifier.eq_ignore_ascii_case(&identifier)
+                || project.name.eq_ignore_ascii_case(&name)
+        }) {
+            self.status = format!("project already exists: {identifier} {name}");
+            self.input = identifier;
+            self.input_cursor = self.input.len();
+            self.input_mode = Some(InputMode::ProjectIdentifier);
+            return Ok(true);
+        }
+
+        let t0 = Instant::now();
+        let body = json!({
+            "name": name,
+            "identifier": identifier,
+        });
+        let api_project = self.run_busy(format!("POST project {identifier}"), move |client| {
+            client.create_project(body)
+        })?;
+        self.api_log.push(ApiLog::new(
+            "POST",
+            "/projects/",
+            &format!("{} {}", api_project.identifier, api_project.name),
+            "201",
+            t0.elapsed().as_millis(),
+        ));
+
+        let remember_note =
+            match remember_project(&self.client.config.workspace, &api_project.identifier) {
+                Ok(()) => String::new(),
+                Err(err) => format!(" · remember failed: {err:#}"),
+            };
+        let loaded = self.load_created_project(api_project)?;
+        let identifier = loaded.identifier.clone();
+        let name = loaded.name.clone();
+        self.projects.push(loaded);
+        let index = self.projects.len().saturating_sub(1);
+        self.client
+            .config
+            .wanted_projects
+            .push(identifier.to_lowercase());
+        self.switch_project(index)?;
+        self.status = format!("created project {identifier} {name}{remember_note}");
+        Ok(false)
+    }
+
+    fn load_created_project(&mut self, api_project: ApiProject) -> Result<Project> {
+        let project_id = api_project.id.clone();
+        let identifier = api_project.identifier.clone();
+        let per_page = self.client.config.per_page;
+        let t0 = Instant::now();
+        let project = self.run_busy(format!("GET {identifier} project data"), move |client| {
+            let states = client.states(&project_id)?;
+            let labels = client.labels(&project_id).unwrap_or_default();
+            let items = client.work_items(&project_id, per_page)?;
+            Ok(project_from_api(api_project, states, labels, items))
+        })?;
+        self.api_log.push(ApiLog::new(
+            "GET",
+            &format!("/{identifier}/bootstrap/"),
+            "states labels items",
+            "200",
+            t0.elapsed().as_millis(),
+        ));
+        Ok(project)
     }
 
     fn apply_state(&mut self, state: StateKind) -> Result<()> {
@@ -1795,44 +2503,6 @@ impl App {
         item.updated_at = Some(Utc::now());
         item.actions.insert(0, "PATCH title".to_owned());
         self.status = format!("edited title for {key}");
-        Ok(())
-    }
-
-    fn apply_description_edit(&mut self) -> Result<()> {
-        let description = self.input.trim().to_owned();
-        let Some(key) = self.editing_key.clone() else {
-            self.status = "no edit target".to_owned();
-            return Ok(());
-        };
-        let Some(index) = self.find_index_by_key(&key) else {
-            self.status = format!("{key} is no longer loaded");
-            return Ok(());
-        };
-        let project_id = self.project().id.clone();
-        let item_id = self.project().items[index].id.clone();
-        let path = format!("/{}/work-items/{key}/", self.project().identifier);
-        let description_html = if description.is_empty() {
-            String::new()
-        } else {
-            format!("<p>{}</p>", escape_html(&description))
-        };
-        let t0 = Instant::now();
-        let body = json!({ "description_html": description_html });
-        self.run_busy(format!("PATCH {key} description"), move |client| {
-            client.update_work_item(&project_id, &item_id, body)
-        })?;
-        self.api_log.push(ApiLog::new(
-            "PATCH",
-            &path,
-            "description",
-            "200",
-            t0.elapsed().as_millis(),
-        ));
-        let item = &mut self.project_mut().items[index];
-        item.description = description;
-        item.updated_at = Some(Utc::now());
-        item.actions.insert(0, "PATCH description".to_owned());
-        self.status = format!("edited description for {key}");
         Ok(())
     }
 
@@ -1988,8 +2658,10 @@ impl App {
         Ok(())
     }
 
-    fn create_item(&mut self, title: &str) -> Result<()> {
-        if title.trim().is_empty() {
+    fn create_item(&mut self, input: &str) -> Result<()> {
+        let (title, priority, label_ids, unknown_labels) =
+            parse_new_item_tokens(input, &self.project().labels);
+        if title.is_empty() {
             self.status = ":new needs a title".to_owned();
             return Ok(());
         }
@@ -1999,10 +2671,14 @@ impl App {
             .project()
             .state_by_kind(state)
             .map(|state| state.id.clone());
-        let mut body = json!({ "name": title.trim(), "priority": "none" });
+        let mut body = json!({ "name": title, "priority": priority.as_plane() });
         if let Some(state_id) = state_id {
             body["state"] = Value::String(state_id);
         }
+        if !label_ids.is_empty() {
+            body["labels"] = json!(label_ids);
+        }
+        let label_count = label_ids.len();
         let t0 = Instant::now();
         let raw = self.run_busy(format!("POST item in {}", state.name()), move |client| {
             client.create_work_item(&project_id, body)
@@ -2010,14 +2686,24 @@ impl App {
         self.api_log.push(ApiLog::new(
             "POST",
             &format!("/{}/work-items/", self.project().identifier),
-            title.trim(),
+            &title,
             "201",
             t0.elapsed().as_millis(),
         ));
         let item: ApiItem = serde_json::from_value(raw)?;
         self.refresh()?;
+        let mut notes = String::new();
+        if priority != Priority::None {
+            notes.push_str(&format!(" · {}", priority.as_plane()));
+        }
+        if label_count > 0 {
+            notes.push_str(&format!(" · {label_count} label(s)"));
+        }
+        if !unknown_labels.is_empty() {
+            notes.push_str(&format!(" · unknown labels: {}", unknown_labels.join(", ")));
+        }
         self.status = format!(
-            "created {}-{} in {}",
+            "created {}-{} in {}{notes}",
             self.project().identifier,
             item.sequence_id,
             state.name()
@@ -2121,9 +2807,19 @@ impl App {
                 promoted = true;
             }
             KeyCode::Char('3') => {
-                self.with_single_target(&current_key, |app| app.apply_state(StateKind::Started))?;
-                advance = true;
-                promoted = true;
+                if self.wip_would_exceed(std::slice::from_ref(&current_key)) {
+                    self.status = format!(
+                        "In Progress is full ({}/{}) — finish something first",
+                        self.project().total_for(StateKind::Started),
+                        self.wip_limit()
+                    );
+                } else {
+                    self.with_single_target(&current_key, |app| {
+                        app.apply_state(StateKind::Started)
+                    })?;
+                    advance = true;
+                    promoted = true;
+                }
             }
             KeyCode::Char('5') => {
                 self.with_single_target(&current_key, |app| app.apply_state(StateKind::Cancelled))?;
@@ -2166,24 +2862,16 @@ impl App {
                 self.force_clear = true;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(view) = self.prompt_view.as_mut() {
-                    view.scroll = view.scroll.saturating_add(1);
-                }
+                self.scroll_prompt_view(1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(view) = self.prompt_view.as_mut() {
-                    view.scroll = view.scroll.saturating_sub(1);
-                }
+                self.scroll_prompt_view(-1);
             }
             KeyCode::PageDown | KeyCode::Char('d') => {
-                if let Some(view) = self.prompt_view.as_mut() {
-                    view.scroll = view.scroll.saturating_add(10);
-                }
+                self.scroll_prompt_view(10);
             }
             KeyCode::PageUp | KeyCode::Char('u') => {
-                if let Some(view) = self.prompt_view.as_mut() {
-                    view.scroll = view.scroll.saturating_sub(10);
-                }
+                self.scroll_prompt_view(-10);
             }
             KeyCode::Char('g') => {
                 if let Some(view) = self.prompt_view.as_mut() {
@@ -2212,7 +2900,272 @@ impl App {
         Ok(())
     }
 
+    fn open_detail(&mut self) -> Result<()> {
+        let Some(item) = self.current_item() else {
+            self.status = "no item selected".to_owned();
+            return Ok(());
+        };
+        let key = item.key.clone();
+        let item_id = item.id.clone();
+        let project_id = self.project().id.clone();
+        let path = format!("/{}/work-items/{key}/comments/", self.project().identifier);
+        let t0 = Instant::now();
+        let result = self.run_busy(format!("GET comments for {key}"), move |client| {
+            client.list_comments(&project_id, &item_id)
+        });
+        let comments = match result {
+            Ok(mut list) => {
+                self.api_log.push(ApiLog::new(
+                    "GET",
+                    &path,
+                    "",
+                    "200",
+                    t0.elapsed().as_millis(),
+                ));
+                list.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                list.into_iter()
+                    .map(|comment| {
+                        let when = comment
+                            .created_at
+                            .as_deref()
+                            .map(|value| {
+                                value.chars().take(16).collect::<String>().replace('T', " ")
+                            })
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        let text =
+                            html_to_text_multiline(comment.comment_html.as_deref().unwrap_or(""));
+                        (when, text)
+                    })
+                    .collect()
+            }
+            Err(err) => {
+                self.api_log.push(ApiLog::new(
+                    "GET",
+                    &path,
+                    "",
+                    "err",
+                    t0.elapsed().as_millis(),
+                ));
+                self.status = format!("comments fetch failed: {err:#}");
+                Vec::new()
+            }
+        };
+        self.detail = Some(DetailView {
+            key,
+            scroll: 0,
+            comments,
+        });
+        self.force_clear = true;
+        Ok(())
+    }
+
+    fn handle_detail_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                self.detail = None;
+                self.force_clear = true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.scroll_detail_view(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.scroll_detail_view(-1);
+            }
+            KeyCode::PageDown | KeyCode::Char('d') => {
+                self.scroll_detail_view(10);
+            }
+            KeyCode::PageUp | KeyCode::Char('u') => {
+                self.scroll_detail_view(-10);
+            }
+            KeyCode::Char('g') => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.scroll = 0;
+                }
+            }
+            KeyCode::Char('G') => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.scroll = usize::MAX / 2;
+                }
+            }
+            KeyCode::Char('o') => self.open_targets(),
+            KeyCode::Char('a') => self.generate_agent_prompt(false)?,
+            KeyCode::Char('A') => self.generate_agent_prompt(true)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn start_backend_wizard(&mut self) {
+        self.backend_wizard = Some(BackendWizard::from_config(&self.client.config));
+        self.menu = None;
+        self.status =
+            "select agent backend · arrows/1/2 choose · m model · e effort · enter save".to_owned();
+        self.force_clear = true;
+    }
+
+    fn handle_backend_wizard_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.backend_wizard = None;
+                self.status = format!("backend unchanged: {}", self.client.config.agent_summary());
+                self.force_clear = true;
+            }
+            KeyCode::Enter | KeyCode::Char('y') => self.apply_backend_wizard(),
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
+                if let Some(wizard) = self.backend_wizard.as_mut() {
+                    wizard.cycle();
+                    self.status = format!("backend choice → {}", wizard.selected.name());
+                    self.force_clear = true;
+                }
+            }
+            KeyCode::Char('1') => self.select_backend_wizard_choice(AgentBackend::Codex),
+            KeyCode::Char('2') => self.select_backend_wizard_choice(AgentBackend::Claude),
+            KeyCode::Char('m') => self.start_backend_wizard_model_edit(),
+            KeyCode::Char('e') => self.start_backend_wizard_effort_edit(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn select_backend_wizard_choice(&mut self, backend: AgentBackend) {
+        if let Some(wizard) = self.backend_wizard.as_mut() {
+            wizard.selected = backend;
+            self.status = format!("backend choice → {}", backend.name());
+            self.force_clear = true;
+        }
+    }
+
+    fn start_backend_wizard_model_edit(&mut self) {
+        let Some(wizard) = self.backend_wizard.as_mut() else {
+            return;
+        };
+        wizard.selected = AgentBackend::Claude;
+        self.input = wizard.claude_model.clone();
+        self.input_cursor = self.input.len();
+        self.input_mode = Some(InputMode::BackendModel);
+        self.status = "editing Claude model · enter accepts · esc keeps previous".to_owned();
+        self.force_clear = true;
+    }
+
+    fn start_backend_wizard_effort_edit(&mut self) {
+        let Some(wizard) = self.backend_wizard.as_mut() else {
+            return;
+        };
+        wizard.selected = AgentBackend::Claude;
+        self.input = wizard.claude_effort.clone();
+        self.input_cursor = self.input.len();
+        self.input_mode = Some(InputMode::BackendEffort);
+        self.status = "editing Claude effort · low/medium/high/xhigh/max".to_owned();
+        self.force_clear = true;
+    }
+
+    fn update_backend_wizard_model(&mut self) -> bool {
+        let value = self.input.trim();
+        let Some(wizard) = self.backend_wizard.as_mut() else {
+            return false;
+        };
+        if value.is_empty() {
+            self.status = "Claude model cannot be empty".to_owned();
+            return true;
+        }
+        wizard.claude_model = value.to_owned();
+        wizard.selected = AgentBackend::Claude;
+        self.status = format!("Claude model → {}", wizard.claude_model);
+        self.force_clear = true;
+        false
+    }
+
+    fn update_backend_wizard_effort(&mut self) -> bool {
+        let value = self.input.trim();
+        let Some(wizard) = self.backend_wizard.as_mut() else {
+            return false;
+        };
+        if value.is_empty() {
+            self.status = "Claude effort cannot be empty".to_owned();
+            return true;
+        }
+        wizard.claude_effort = value.to_owned();
+        wizard.selected = AgentBackend::Claude;
+        self.status = format!("Claude effort → {}", wizard.claude_effort);
+        self.force_clear = true;
+        false
+    }
+
+    fn apply_backend_wizard(&mut self) {
+        let Some(wizard) = self.backend_wizard.take() else {
+            return;
+        };
+        self.set_agent_backend(
+            wizard.selected,
+            Some(wizard.claude_model),
+            Some(wizard.claude_effort),
+        );
+        self.force_clear = true;
+    }
+
+    fn set_agent_backend(
+        &mut self,
+        backend: AgentBackend,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        let (model, effort, summary) = {
+            let config = &mut self.client.config;
+            config.agent_backend = backend;
+            if let Some(model) = model {
+                config.claude_model = model;
+            }
+            if let Some(effort) = effort {
+                config.claude_effort = effort;
+            }
+            (
+                config.claude_model.clone(),
+                config.claude_effort.clone(),
+                config.agent_summary(),
+            )
+        };
+        if let Err(err) = save_agent_prefs(backend, &model, &effort) {
+            self.status = format!("agent backend: {summary} (not saved: {err:#})");
+            return;
+        }
+        self.status = format!("agent backend: {summary}");
+    }
+
+    fn configure_backend(&mut self, rest: &str) {
+        if rest.is_empty() {
+            self.start_backend_wizard();
+            return;
+        }
+        let mut parts = rest.split_whitespace();
+        if let Some(first) = parts.next() {
+            let Some(backend) = AgentBackend::parse(first) else {
+                self.status = "usage: :backend codex | :backend claude [model] [effort]".to_owned();
+                return;
+            };
+            let model = (backend == AgentBackend::Claude)
+                .then(|| parts.next().map(str::to_owned))
+                .flatten();
+            let effort = (backend == AgentBackend::Claude)
+                .then(|| parts.next().map(str::to_owned))
+                .flatten();
+            self.set_agent_backend(backend, model, effort);
+        }
+    }
+
     fn generate_agent_prompt(&mut self, post_comment: bool) -> Result<()> {
+        if let Some(job) = &self.codex_job {
+            self.status = format!(
+                "{} already generating for {} · esc cancels",
+                job.backend.name(),
+                job.key
+            );
+            return Ok(());
+        }
         let Some(item) = self.current_item() else {
             self.status = "no item selected".to_owned();
             return Ok(());
@@ -2220,95 +3173,70 @@ impl App {
         let item_key = item.key.clone();
         let item_id = item.id.clone();
         let meta_prompt = self.build_meta_prompt(item);
-        let codex_bin = self.client.config.codex_bin.clone();
-        let repo_dir = self.client.config.repo_dir.clone();
-        let t0 = Instant::now();
-        let result = self.run_busy(
-            format!("codex · crafting agent prompt for {item_key} (can take a minute)"),
-            move |_client| run_codex(&codex_bin, repo_dir.as_deref(), &meta_prompt),
+        let project_id = self.project().id.clone();
+        let comment_path = format!(
+            "/{}/work-items/{item_key}/comments/",
+            self.project().identifier
         );
-        let prompt = match result {
-            Ok(prompt) => prompt,
+        let config = &self.client.config;
+        let out_file = std::env::temp_dir().join(format!(
+            "plane-tui-agent-prompt-{}-{item_key}.md",
+            std::process::id()
+        ));
+        let backend = config.agent_backend;
+        let child = match spawn_agent(config, &out_file) {
+            Ok(child) => child,
             Err(err) => {
-                self.api_log.push(ApiLog::new(
-                    "CODEX",
-                    &item_key,
-                    "agent prompt",
-                    "err",
-                    t0.elapsed().as_millis(),
-                ));
-                self.status = format!("codex failed: {err:#}");
-                self.force_clear = true;
+                self.status = format!("{} failed: {err:#}", backend.name());
                 return Ok(());
             }
         };
-        self.api_log.push(ApiLog::new(
-            "CODEX",
-            &item_key,
-            "agent prompt",
-            "ok",
-            t0.elapsed().as_millis(),
-        ));
-        let file = match save_prompt(&item_key, &prompt) {
-            Ok(path) => path,
-            Err(_) => "(not saved)".to_owned(),
-        };
-        let clipboard_note = match copy_to_clipboard(&prompt) {
-            Ok(()) => " · copied".to_owned(),
-            Err(err) => format!(" · clipboard failed: {err:#}"),
-        };
-        let mut comment_note = String::new();
-        if post_comment {
-            let project_id = self.project().id.clone();
-            let comment_item_id = item_id.clone();
-            let path = format!(
-                "/{}/work-items/{item_key}/comments/",
-                self.project().identifier
-            );
-            let comment_html = format!("<pre>{}</pre>", escape_html(&prompt));
-            let body = json!({ "comment_html": comment_html });
+        let pid = child.id();
+        let agent_bin = config.agent_bin().to_owned();
+        let client = self.client.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
             let t0 = Instant::now();
-            let result = self.run_busy(
-                format!("POST agent prompt comment on {item_key}"),
-                move |client| client.create_comment(&project_id, &comment_item_id, body),
-            );
-            match result {
-                Ok(_) => {
-                    self.api_log.push(ApiLog::new(
-                        "POST",
-                        &path,
-                        "agent prompt comment",
-                        "201",
-                        t0.elapsed().as_millis(),
-                    ));
-                    if let Some(index) = self.find_index_by_key(&item_key) {
-                        self.project_mut().items[index]
-                            .actions
-                            .insert(0, "POST comment · agent prompt".to_owned());
-                    }
-                    comment_note = " · commented".to_owned();
+            let prompt = complete_agent(child, backend, &agent_bin, &out_file, &meta_prompt);
+            let comment = match (&prompt, post_comment) {
+                (Ok(prompt), true) => {
+                    let body =
+                        json!({ "comment_html": format!("<pre>{}</pre>", escape_html(prompt)) });
+                    Some(
+                        client
+                            .create_comment(&project_id, &item_id, body)
+                            .map(|_| ()),
+                    )
                 }
-                Err(err) => {
-                    self.api_log.push(ApiLog::new(
-                        "POST",
-                        &path,
-                        "agent prompt comment",
-                        "err",
-                        t0.elapsed().as_millis(),
-                    ));
-                    comment_note = format!(" · comment failed: {err:#}");
-                }
-            }
-        }
-        self.status =
-            format!("agent prompt for {item_key} · saved {file}{clipboard_note}{comment_note}");
-        self.prompt_view = Some(PromptView {
-            key: item_key,
-            text: prompt,
-            file,
-            scroll: 0,
+                _ => None,
+            };
+            let _ = tx.send(CodexOutcome {
+                prompt,
+                comment,
+                elapsed_ms: t0.elapsed().as_millis(),
+            });
         });
-        self.force_clear = true;
+        self.codex_job = Some(CodexJob {
+            key: item_key.clone(),
+            backend,
+            comment_path,
+            pid,
+            started: Instant::now(),
+            rx,
+        });
+        self.busy = Some(format!(
+            "{} · agent prompt for {item_key} · esc cancels",
+            backend.name()
+        ));
+        self.status = format!(
+            "{} started for {item_key}{} · keep working, it runs in the background",
+            backend.name(),
+            if post_comment {
+                " · will post comment"
+            } else {
+                ""
+            }
+        );
         Ok(())
     }
 
@@ -2331,7 +3259,7 @@ impl App {
             item.description.clone()
         };
         let repo_note = if config.repo_dir.is_some() {
-            "\nYou are running inside the TranslateMom monorepo checkout: read the relevant files first (READMEs, AGENTS.md, the code areas the task touches) and ground the prompt in what the code actually does.\n"
+            "\nYour working directory is a checkout of the TranslateMom monorepo. Read whatever files you need to make the brief accurate and concrete.\n"
         } else {
             ""
         };
@@ -2340,8 +3268,7 @@ impl App {
             config.base_url, config.workspace, item.key
         );
         format!(
-            "You are an expert prompt engineer preparing work for an autonomous coding agent.\n\
-             Write a complete, self-contained \"design and implement\" prompt for the Plane work item below. The coding agent that receives your prompt will work inside the TranslateMom monorepo and has no other context, so the prompt must carry everything it needs.\n\
+            "You are writing a task brief for a coding agent that will pick up the Plane work item below and work on it in the TranslateMom monorepo. The agent will see only your brief, not this conversation.\n\
              {repo_note}\n\
              <business_context>\n{context}\n</business_context>\n\n\
              <work_item>\n\
@@ -2355,20 +3282,9 @@ impl App {
              url: {url}\n\
              description:\n{description}\n\
              </work_item>\n\n\
-             Structure the prompt you write with these sections:\n\
-             1. Title — the work item key plus an imperative one-line summary.\n\
-             2. Background — only the TranslateMom product/business context that matters for this task, which app(s)/service(s) the work most plausibly touches, and why it matters now.\n\
-             3. Problem & goal — the user-visible problem, the desired outcome, and how success will be judged.\n\
-             4. Design first — direct the agent to explore the named code areas, propose a design, and state key decisions/trade-offs before writing code.\n\
-             5. Implementation plan — concrete, stack-accurate guidance (apps, routes, queues, stores, providers) as steps, not code.\n\
-             6. Scope & non-goals — what to leave alone; guard against scope creep.\n\
-             7. Acceptance criteria — verifiable behaviors plus the exact test/lint/check commands to run from the owning app directory.\n\
-             8. Constraints & cautions — repo conventions (work from the owning app, respect submodule boundaries) and any claim-drift/billing/privacy cautions if relevant.\n\n\
-             Rules:\n\
-             - Ground every technical claim in the business context or the repository; when uncertain, tell the agent to verify in the repo instead of guessing.\n\
-             - Be specific to THIS work item; do not restate the whole business context.\n\
-             - If the work item is vague, infer the most plausible intent from the title and context, state that assumption explicitly in the prompt, and instruct the agent to confirm it cheaply in code before building.\n\
-             - Output ONLY the final prompt in Markdown — no preamble, no commentary, no code fence around the whole document.\n",
+             Write the brief you would want to receive if you were the agent taking on this task. Use your judgment about structure, length, and what to include — whatever best serves this particular work item. It is an assignment (what and why), not an implementation plan (how); leave design decisions to the agent doing the work.\n\
+             Two things matter: everything in the brief must be true — grounded in the business context or the repository, with open questions flagged as assumptions to verify rather than guessed at — and it must be specific to this work item rather than a restatement of general context.\n\n\
+             Output only the final Markdown brief, with no preamble or commentary.\n",
             key = item.key,
             project_id = project.identifier,
             project_name = project.name,
@@ -2436,12 +3352,77 @@ impl App {
         if self.triage.is_some() {
             self.draw_triage_overlay(&mut stdout, width, height)?;
         }
+        if self.detail.is_some() {
+            self.draw_detail_overlay(&mut stdout, width, height)?;
+        }
         if self.prompt_view.is_some() {
             self.draw_prompt_overlay(&mut stdout, width, height)?;
         }
         queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
         stdout.flush()?;
         Ok(())
+    }
+
+    fn draw_active_overlay(&mut self) -> Result<()> {
+        let (width, height) = size()?;
+        let mut stdout = io::stdout();
+        queue!(stdout, BeginSynchronizedUpdate, Hide)?;
+        if self.prompt_view.is_some() {
+            self.draw_prompt_overlay_body(&mut stdout, width, height)?;
+        } else if self.detail.is_some() {
+            self.draw_detail_overlay_body(&mut stdout, width, height)?;
+        }
+        queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    fn draw_footer_only(&mut self) -> Result<()> {
+        let (width, height) = size()?;
+        let mut stdout = io::stdout();
+        queue!(stdout, BeginSynchronizedUpdate, Hide)?;
+        let frame = LayoutFrame::new(width, height);
+        let footer_height = if self.api_open { 8 } else { 3 };
+        let body_top = frame.y + 1;
+        let body_height = frame.height.saturating_sub(1 + footer_height);
+        self.draw_footer(
+            &mut stdout,
+            frame.x,
+            body_top + body_height,
+            frame.width,
+            footer_height,
+        )?;
+        queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    fn can_redraw_footer_only_after_key(
+        &self,
+        input_mode_before: Option<InputMode>,
+        force_clear_before: bool,
+        codex_redraw: bool,
+    ) -> bool {
+        if force_clear_before || self.force_clear || codex_redraw {
+            return false;
+        }
+        if self.keys_open
+            || self.notes_open
+            || self.triage.is_some()
+            || self.detail.is_some()
+            || self.prompt_view.is_some()
+        {
+            return false;
+        }
+
+        let Some(previous_mode) = input_mode_before else {
+            return false;
+        };
+        let Some(current_mode) = self.input_mode else {
+            return false;
+        };
+
+        previous_mode.can_redraw_footer_only() && current_mode.can_redraw_footer_only()
     }
 
     fn draw_header(&self, out: &mut io::Stdout, start_x: u16, width: u16, y: u16) -> Result<()> {
@@ -2491,6 +3472,18 @@ impl App {
         } else {
             right_segments.push(("J 0".to_owned(), DIMMER, false));
         }
+        let sync_secs = self.project().loaded_at.elapsed().as_secs();
+        let (sync_text, sync_color) = if sync_secs < 60 {
+            ("⟳now".to_owned(), DIMMER)
+        } else if sync_secs < 3600 {
+            (
+                format!("⟳{}m", sync_secs / 60),
+                if sync_secs >= 900 { AMBER } else { DIMMER },
+            )
+        } else {
+            (format!("⟳{}h", sync_secs / 3600), AMBER)
+        };
+        right_segments.push((sync_text, sync_color, false));
         right_segments.push((host, DIM, false));
         right_segments.push(("●".to_owned(), GREEN, false));
 
@@ -2552,16 +3545,31 @@ impl App {
                 true,
             )?;
             draw_span(out, &mut header_x, y, " ", DIM, Some(BG), false)?;
-            draw_span(out, &mut header_x, y, state.name(), PAPER, Some(BG), true)?;
-            draw_span(out, &mut header_x, y, " ", DIM, Some(BG), false)?;
+            let wip_limit = self.wip_limit();
+            let over_wip = *state == StateKind::Started && wip_limit > 0 && total > wip_limit;
             draw_span(
                 out,
                 &mut header_x,
                 y,
-                &total.to_string(),
-                DIM,
+                state.name(),
+                if over_wip { RED } else { PAPER },
                 Some(BG),
-                false,
+                true,
+            )?;
+            draw_span(out, &mut header_x, y, " ", DIM, Some(BG), false)?;
+            let count_text = if *state == StateKind::Started && wip_limit > 0 {
+                format!("{total}/{wip_limit}")
+            } else {
+                total.to_string()
+            };
+            draw_span(
+                out,
+                &mut header_x,
+                y,
+                &count_text,
+                if over_wip { RED } else { DIM },
+                Some(BG),
+                over_wip,
             )?;
             if !shown.is_empty() && effective_width as usize > shown.width() + 1 {
                 draw_cell(
@@ -2728,14 +3736,20 @@ impl App {
             title_bg,
             selected,
         )?;
-        let age = item
-            .updated_at
-            .map(time_ago)
-            .unwrap_or_else(|| "unknown".to_owned());
-        self.draw_card_labels(out, inner_x, y + 4, inner_width, item, &age)?;
+        let (meta, meta_color) = match card_due_alert(item.due.as_deref()) {
+            Some((alert, color)) => (alert, color),
+            None => (
+                item.updated_at
+                    .map(time_ago)
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                DIMMER,
+            ),
+        };
+        self.draw_card_labels(out, inner_x, y + 4, inner_width, item, &meta, meta_color)?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_card_labels(
         &self,
         out: &mut io::Stdout,
@@ -2744,6 +3758,7 @@ impl App {
         width: u16,
         item: &WorkItem,
         age: &str,
+        age_color: Color,
     ) -> Result<()> {
         draw_cell(out, x, y, width, "", DIM, Some(CELL_BG), false)?;
         let age_width = age.width().min(width as usize);
@@ -2754,7 +3769,7 @@ impl App {
                 y,
                 age_width as u16,
                 age,
-                DIMMER,
+                age_color,
                 Some(CELL_BG),
                 false,
             )?;
@@ -2762,6 +3777,7 @@ impl App {
 
         let label_width = width.saturating_sub(age_width as u16 + 1);
         let mut cursor = x;
+        let cell_end = x.saturating_add(label_width);
         let mut rendered = 0;
         for label_id in item.label_ids.iter().take(2) {
             let Some(label) = self
@@ -2776,15 +3792,27 @@ impl App {
                 break;
             }
             if rendered > 0 {
-                draw_span(out, &mut cursor, y, " ", DIM, Some(CELL_BG), false)?;
+                draw_span_clipped(
+                    out,
+                    &mut cursor,
+                    cell_end,
+                    y,
+                    " ",
+                    DIM,
+                    Some(CELL_BG),
+                    false,
+                )?;
             }
-            let remaining = label_width.saturating_sub(cursor.saturating_sub(x)) as usize;
+            if cursor >= cell_end {
+                break;
+            }
             let text = format!("{}{}", color_marker(label.color), label.name);
-            draw_span(
+            draw_span_clipped(
                 out,
                 &mut cursor,
+                cell_end,
                 y,
-                &truncate(&text, remaining.min(12)),
+                &text,
                 label.color,
                 Some(CELL_BG),
                 false,
@@ -2808,7 +3836,7 @@ impl App {
                     .labels
                     .iter()
                     .take(2)
-                    .map(|label| format!("·{}", truncate(label, 10)))
+                    .map(|label| format!("·{label}"))
                     .collect::<Vec<_>>()
                     .join(" ");
                 draw_cell(out, x, y, label_width, &fallback, DIM, Some(CELL_BG), false)?;
@@ -3241,10 +4269,19 @@ impl App {
             ("labels", String::new(), TEXT),
             (
                 "due",
-                item.due
-                    .clone()
-                    .unwrap_or_else(|| "none · d to set".to_owned()),
-                if item.due.is_some() { TEXT } else { DIMMER },
+                match item.due.as_deref() {
+                    Some(due) => match card_due_alert(Some(due)) {
+                        Some((alert, _)) => format!("{due} · {alert}"),
+                        None => due.to_owned(),
+                    },
+                    None => "none · d to set".to_owned(),
+                },
+                match item.due.as_deref() {
+                    Some(due) => card_due_alert(Some(due))
+                        .map(|(_, color)| color)
+                        .unwrap_or(TEXT),
+                    None => DIMMER,
+                },
             ),
             (
                 "created",
@@ -3283,6 +4320,8 @@ impl App {
             }
             if name == "labels" {
                 draw_label_field(out, x + 1, row, width - 1, self.project(), item)?;
+            } else if name == "url" {
+                draw_link_field(out, x + 1, row, width - 1, &value, value_color)?;
             } else {
                 draw_field_line(out, x + 1, row, width - 1, name, &value, value_color)?;
             }
@@ -3384,62 +4423,78 @@ impl App {
                 row += 1;
             }
         }
-        let label_menu_open = self.menu == Some(MenuMode::Label);
-        if label_menu_open && row < y + height {
-            self.draw_label_menu_bar(out, inner_x, row, inner_width)?;
+        if self.backend_wizard.is_some() && row < y + height {
+            self.draw_backend_wizard_bar(out, inner_x, row, inner_width)?;
             row += 1;
-        } else if !self.marks.is_empty() && row < y + height {
-            draw_cell(
-                out,
-                x,
-                row,
-                width,
-                &format!(
-                    " {} marked · s state · p priority · t label · o open · I invert · U clear",
-                    self.marks.len()
-                ),
-                Color::Black,
-                Some(ACCENT),
-                true,
-            )?;
-            row += 1;
-        }
-        if let Some(menu) = self.menu {
-            let text = match menu {
-                MenuMode::State => {
-                    "state → 1 backlog  2 todo  3 in-progress  4 done  5 cancelled  esc cancel"
-                        .to_owned()
-                }
-                MenuMode::Priority => format!(
-                    "priority → {}  esc cancel",
-                    PRIORITY_ORDER
-                        .iter()
-                        .map(|priority| format!(
-                            "{} {} {}",
-                            priority.as_plane().chars().next().unwrap_or('n'),
-                            priority.glyph(),
-                            priority.as_plane()
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                ),
-                MenuMode::Label => String::new(),
-                MenuMode::Edit => {
-                    "edit → t title  d description  u due date  esc cancel".to_owned()
-                }
-            };
-            if menu != MenuMode::Label {
+        } else {
+            let label_menu_open = self.menu == Some(MenuMode::Label);
+            if label_menu_open && row < y + height {
+                self.draw_label_menu_bar(out, inner_x, row, inner_width)?;
+                row += 1;
+            } else if !self.marks.is_empty() && row < y + height {
                 draw_cell(
                     out,
-                    inner_x,
+                    x,
                     row,
-                    inner_width,
-                    &text,
+                    width,
+                    &format!(
+                        " {} marked · s state · p priority · t label · o open · I invert · U clear",
+                        self.marks.len()
+                    ),
                     Color::Black,
-                    Some(PAPER),
+                    Some(ACCENT),
                     true,
                 )?;
                 row += 1;
+            }
+            if let Some(menu) = self.menu {
+                let text = match menu {
+                    MenuMode::State => {
+                        "state → 1 backlog  2 todo  3 in-progress  4 done  5 cancelled  esc cancel"
+                            .to_owned()
+                    }
+                    MenuMode::Priority => format!(
+                        "priority → {}  esc cancel",
+                        PRIORITY_ORDER
+                            .iter()
+                            .map(|priority| format!(
+                                "{} {} {}",
+                                priority.as_plane().chars().next().unwrap_or('n'),
+                                priority.glyph(),
+                                priority.as_plane()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("  ")
+                    ),
+                    MenuMode::Label => String::new(),
+                    MenuMode::Edit => {
+                        "edit → t title  d description in $EDITOR  u due date  esc cancel"
+                            .to_owned()
+                    }
+                    MenuMode::ConfirmWip => format!(
+                        "In Progress is full ({}/{}) — move anyway? Something must leave first · y move  esc cancel",
+                        self.project().total_for(StateKind::Started),
+                        self.wip_limit()
+                    ),
+                };
+                if menu != MenuMode::Label {
+                    let menu_bg = if menu == MenuMode::ConfirmWip {
+                        RED
+                    } else {
+                        PAPER
+                    };
+                    draw_cell(
+                        out,
+                        inner_x,
+                        row,
+                        inner_width,
+                        &text,
+                        Color::Black,
+                        Some(menu_bg),
+                        true,
+                    )?;
+                    row += 1;
+                }
             }
         }
         if row < y + height {
@@ -3452,7 +4507,7 @@ impl App {
                 inner_x,
                 row,
                 inner_width,
-                "j/k h/l move · e edit · a/A agent · m mark · s state · p priority · t label · D done · T triage · v view · / search · : cmd · x api · ? keys · q quit",
+                "j/k h/l move · enter detail · e edit · a/A agent · m mark · s state · p priority · t label · D done · T triage · v view · / search · : cmd · x api · ? keys · q quit",
                 DIMMER,
                 None,
                 false,
@@ -3552,8 +4607,11 @@ impl App {
                 InputMode::Search => "/",
                 InputMode::Command => ":",
                 InputMode::NewLabel => "new label → ",
+                InputMode::BackendModel => "claude model → ",
+                InputMode::BackendEffort => "claude effort → ",
+                InputMode::ProjectName => "new project name → ",
+                InputMode::ProjectIdentifier => "new project key → ",
                 InputMode::EditTitle => "edit title → ",
-                InputMode::EditDescription => "edit description → ",
                 InputMode::EditDue => "edit due → ",
             };
             input_prompt(prefix, &self.input, self.input_cursor)
@@ -3580,6 +4638,96 @@ impl App {
                 format!("{} / {} · list", min(self.cursor + 1, len), len)
             }
         }
+    }
+
+    fn draw_backend_wizard_bar(
+        &self,
+        out: &mut io::Stdout,
+        x: u16,
+        y: u16,
+        width: u16,
+    ) -> Result<()> {
+        let Some(wizard) = self.backend_wizard.as_ref() else {
+            return Ok(());
+        };
+        let end = x.saturating_add(width);
+        draw_cell(out, x, y, width, "", DIM, Some(BG_RAISE), false)?;
+        let mut cursor = x;
+        draw_span_clipped(
+            out,
+            &mut cursor,
+            end,
+            y,
+            " backend → ",
+            Color::Black,
+            Some(PAPER),
+            true,
+        )?;
+        self.draw_backend_wizard_choice(
+            out,
+            &mut cursor,
+            end,
+            y,
+            "1 codex",
+            wizard.selected == AgentBackend::Codex,
+        )?;
+        self.draw_backend_wizard_choice(
+            out,
+            &mut cursor,
+            end,
+            y,
+            "2 claude",
+            wizard.selected == AgentBackend::Claude,
+        )?;
+        let details = format!(
+            "  model {}  effort {}",
+            wizard.claude_model, wizard.claude_effort
+        );
+        draw_span_clipped(
+            out,
+            &mut cursor,
+            end,
+            y,
+            &details,
+            DIM,
+            Some(BG_RAISE),
+            false,
+        )?;
+        draw_span_clipped(
+            out,
+            &mut cursor,
+            end,
+            y,
+            "  m model  e effort  enter save  esc cancel",
+            DIMMER,
+            Some(BG_RAISE),
+            false,
+        )?;
+        Ok(())
+    }
+
+    fn draw_backend_wizard_choice(
+        &self,
+        out: &mut io::Stdout,
+        cursor: &mut u16,
+        end: u16,
+        y: u16,
+        label: &str,
+        selected: bool,
+    ) -> Result<()> {
+        draw_span_clipped(out, cursor, end, y, " ", DIM, Some(BG_RAISE), false)?;
+        let bg = if selected { ACCENT } else { CELL_BG };
+        let fg = if selected { Color::Black } else { PAPER };
+        draw_span_clipped(
+            out,
+            cursor,
+            end,
+            y,
+            &format!(" {label} "),
+            fg,
+            Some(bg),
+            selected,
+        )
     }
 
     fn draw_label_menu_bar(&self, out: &mut io::Stdout, x: u16, y: u16, width: u16) -> Result<()> {
@@ -3705,6 +4853,25 @@ impl App {
     }
 
     fn draw_prompt_overlay(&mut self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+        self.draw_prompt_overlay_inner(out, width, height, true)
+    }
+
+    fn draw_prompt_overlay_body(
+        &mut self,
+        out: &mut io::Stdout,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        self.draw_prompt_overlay_inner(out, width, height, false)
+    }
+
+    fn draw_prompt_overlay_inner(
+        &mut self,
+        out: &mut io::Stdout,
+        width: u16,
+        height: u16,
+        draw_shell: bool,
+    ) -> Result<()> {
         let Some(view) = self.prompt_view.as_mut() else {
             return Ok(());
         };
@@ -3734,29 +4901,205 @@ impl App {
         let max_scroll = wrapped.len().saturating_sub(visible);
         view.scroll = view.scroll.min(max_scroll);
         let scroll = view.scroll;
-        let title = format!("agent prompt · {}", view.key);
         let hint = format!(
-            "j/k scroll · y copy · esc close · {}-{}/{} · {}",
+            "wheel/j/k scroll · y copy · esc close · {}-{}/{} · {}",
             min(scroll + 1, wrapped.len()),
             min(scroll + visible, wrapped.len()),
             wrapped.len(),
             view.file
         );
-        draw_modal_shell(out, x, y, box_width, box_height, &title)?;
-        let mut row = y + 2;
-        for line in wrapped.iter().skip(scroll).take(visible) {
+        if draw_shell {
+            let title = format!("agent prompt · {}", view.key);
+            draw_modal_shell(out, x, y, box_width, box_height, &title)?;
+        }
+        for offset in 0..visible {
+            let line = wrapped
+                .get(scroll + offset)
+                .map(String::as_str)
+                .unwrap_or("");
             draw_cell(
                 out,
                 x + 3,
-                row,
+                y + 2 + offset as u16,
                 box_width.saturating_sub(6),
                 line,
                 TEXT,
                 Some(BG),
                 false,
             )?;
-            row += 1;
         }
+        draw_cell(
+            out,
+            x + 3,
+            y + box_height.saturating_sub(3),
+            box_width.saturating_sub(6),
+            &hint,
+            DIM,
+            Some(BG),
+            false,
+        )?;
+        Ok(())
+    }
+
+    fn draw_detail_overlay(&mut self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+        self.draw_detail_overlay_inner(out, width, height, true)
+    }
+
+    fn draw_detail_overlay_body(
+        &mut self,
+        out: &mut io::Stdout,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        self.draw_detail_overlay_inner(out, width, height, false)
+    }
+
+    fn draw_detail_overlay_inner(
+        &mut self,
+        out: &mut io::Stdout,
+        width: u16,
+        height: u16,
+        draw_shell: bool,
+    ) -> Result<()> {
+        let Some(detail) = self.detail.as_ref() else {
+            return Ok(());
+        };
+        let detail_key = detail.key.clone();
+        let box_width = min(width.saturating_sub(4), 108);
+        let box_height = height.saturating_sub(2);
+        if box_width < 40 || box_height < 8 {
+            return draw_overlay(
+                out,
+                width,
+                height,
+                &[" detail ", "terminal too small", "esc/q close"],
+            );
+        }
+        let x = width.saturating_sub(box_width) / 2;
+        let y = height.saturating_sub(box_height) / 2;
+        let content_width = box_width.saturating_sub(6) as usize;
+
+        let Some(index) = self.find_index_by_key(&detail_key) else {
+            return draw_overlay(
+                out,
+                width,
+                height,
+                &[" detail ", "item no longer loaded", "esc/q close"],
+            );
+        };
+        let item = &self.project().items[index];
+
+        let mut lines: Vec<(String, Color, bool)> = Vec::new();
+        for line in wrap_line(&item.title, content_width) {
+            lines.push((line, PAPER, true));
+        }
+        lines.push((String::new(), TEXT, false));
+        lines.push((
+            format!(
+                "{} {}   ·   {} {}",
+                item.state.glyph(),
+                self.project().state_name(&item.state_id),
+                item.priority.glyph(),
+                item.priority.as_plane()
+            ),
+            item.state.color(),
+            false,
+        ));
+        let labels = if item.labels.is_empty() {
+            "none".to_owned()
+        } else {
+            item.labels.join(" · ")
+        };
+        lines.push((format!("labels    {labels}"), TEXT, false));
+        let (due_text, due_color) = match item.due.as_deref() {
+            Some(due) => {
+                let (_, color) = list_due(Some(due));
+                (due.to_owned(), color)
+            }
+            None => ("none".to_owned(), DIMMER),
+        };
+        lines.push((format!("due       {due_text}"), due_color, false));
+        lines.push((
+            format!(
+                "created   {}   ·   updated {}",
+                item.created_at
+                    .map(|dt| dt.date_naive().to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                item.updated_at
+                    .map(time_ago)
+                    .unwrap_or_else(|| "unknown".to_owned())
+            ),
+            TEXT,
+            false,
+        ));
+        lines.push((
+            format!(
+                "url       {}/{}/browse/{}",
+                self.client.config.base_url, self.client.config.workspace, item.key
+            ),
+            ACCENT,
+            false,
+        ));
+        lines.push((String::new(), TEXT, false));
+        lines.push(("description".to_owned(), DIM, false));
+        let description = if item.description.trim().is_empty() {
+            "(no description)".to_owned()
+        } else {
+            item.description.clone()
+        };
+        for raw_line in description.lines() {
+            for line in wrap_line(raw_line, content_width) {
+                lines.push((line, TEXT, false));
+            }
+        }
+        lines.push((String::new(), TEXT, false));
+        lines.push((format!("comments ({})", detail.comments.len()), DIM, false));
+        if detail.comments.is_empty() {
+            lines.push(("(no comments)".to_owned(), DIMMER, false));
+        }
+        for (when, text) in &detail.comments {
+            lines.push((format!("· {when}"), ACCENT, false));
+            for raw_line in text.lines() {
+                for line in wrap_line(raw_line, content_width.saturating_sub(2)) {
+                    lines.push((format!("  {line}"), TEXT, false));
+                }
+            }
+            lines.push((String::new(), TEXT, false));
+        }
+
+        let visible = box_height.saturating_sub(5) as usize;
+        let max_scroll = lines.len().saturating_sub(visible);
+        let scroll = {
+            let detail = self.detail.as_mut().expect("detail present");
+            detail.scroll = detail.scroll.min(max_scroll);
+            detail.scroll
+        };
+        if draw_shell {
+            let title = format!("{detail_key} · detail");
+            draw_modal_shell(out, x, y, box_width, box_height, &title)?;
+        }
+        for offset in 0..visible {
+            let (line, color, bold) = lines
+                .get(scroll + offset)
+                .map(|(line, color, bold)| (line.as_str(), *color, *bold))
+                .unwrap_or(("", TEXT, false));
+            draw_cell(
+                out,
+                x + 3,
+                y + 2 + offset as u16,
+                box_width.saturating_sub(6),
+                line,
+                color,
+                Some(BG),
+                bold,
+            )?;
+        }
+        let hint = format!(
+            "wheel/j/k scroll · o open · a/A agent prompt · esc close · {}-{}/{}",
+            min(scroll + 1, lines.len()),
+            min(scroll + visible, lines.len()),
+            lines.len()
+        );
         draw_cell(
             out,
             x + 3,
@@ -3841,14 +5184,19 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -3905,40 +5253,298 @@ fn input_prompt(prefix: &str, input: &str, cursor: usize) -> String {
     prompt
 }
 
-fn run_codex(codex_bin: &str, repo_dir: Option<&str>, prompt: &str) -> Result<String> {
-    let out_file =
-        std::env::temp_dir().join(format!("plane-tui-agent-prompt-{}.md", std::process::id()));
-    let mut command = Command::new(codex_bin);
-    command
-        .arg("exec")
-        .arg("--skip-git-repo-check")
-        .arg("--sandbox")
-        .arg("read-only")
-        .arg("--ephemeral")
-        .arg("--color")
-        .arg("never")
-        .arg("--output-last-message")
-        .arg(&out_file)
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    if let Some(repo_dir) = repo_dir {
+fn card_due_alert(due: Option<&str>) -> Option<(String, Color)> {
+    let due = due?.trim();
+    let date = NaiveDate::parse_from_str(due, "%Y-%m-%d").ok()?;
+    let days = date
+        .signed_duration_since(Local::now().date_naive())
+        .num_days();
+    match days {
+        d if d < 0 => Some((format!("{}d over", -d), RED)),
+        0 => Some(("due today".to_owned(), RED)),
+        1 => Some(("due tom".to_owned(), AMBER)),
+        2..=3 => Some((format!("due {}", due.get(5..).unwrap_or(due)), AMBER)),
+        _ => None,
+    }
+}
+
+fn project_from_api(
+    api_project: ApiProject,
+    api_states: Vec<ApiState>,
+    api_labels: Vec<ApiLabel>,
+    api_items: Vec<ApiItem>,
+) -> Project {
+    let identifier = api_project.identifier;
+    let states = api_states
+        .into_iter()
+        .map(|state| State {
+            id: state.id,
+            name: state.name,
+            kind: StateKind::from_group(&state.group),
+        })
+        .collect::<Vec<_>>();
+    let state_lookup = states
+        .iter()
+        .map(|state| (state.id.clone(), state.kind))
+        .collect::<BTreeMap<_, _>>();
+    let labels = api_labels
+        .into_iter()
+        .map(|label| Label {
+            id: label.id,
+            name: label.name,
+            color: parse_hex_color(label.color.as_deref().unwrap_or("#777777")),
+        })
+        .collect::<Vec<_>>();
+    let label_lookup = labels
+        .iter()
+        .map(|label| (label.id.clone(), label.name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let items = api_items
+        .into_iter()
+        .filter(|item| item.archived_at.is_none())
+        .map(|item| {
+            let state_id = item.state_id.or(item.state).unwrap_or_default();
+            let state = state_lookup
+                .get(&state_id)
+                .copied()
+                .unwrap_or(StateKind::Backlog);
+            let mut label_ids = item.label_ids;
+            if label_ids.is_empty() {
+                label_ids = item.labels.clone();
+            }
+            let mut label_names = item
+                .label_details
+                .iter()
+                .map(|label| label.name.clone())
+                .collect::<Vec<_>>();
+            if label_names.is_empty() {
+                label_names = label_ids
+                    .iter()
+                    .filter_map(|id| label_lookup.get(id).cloned())
+                    .collect();
+            }
+            WorkItem {
+                id: item.id,
+                key: format!("{}-{}", identifier, item.sequence_id),
+                sequence_id: item.sequence_id,
+                title: item.name,
+                state_id,
+                state,
+                priority: Priority::from_plane(item.priority.as_deref()),
+                labels: label_names,
+                label_ids,
+                due: item.target_date,
+                created_at: parse_dt(item.created_at.as_deref()),
+                updated_at: parse_dt(item.updated_at.as_deref()),
+                completed_at: item.completed_at,
+                description: html_to_text_multiline(item.description_html.as_deref().unwrap_or("")),
+                actions: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    Project {
+        id: api_project.id,
+        name: api_project.name,
+        identifier,
+        states,
+        labels,
+        items,
+        loaded_at: Instant::now(),
+    }
+}
+
+fn project_identifier_from_name(name: &str) -> String {
+    let acronym = name
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|part| part.chars().find(|ch| ch.is_ascii_alphanumeric()))
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect::<String>();
+    let candidate = if acronym.len() >= 2 {
+        acronym
+    } else {
+        name.to_owned()
+    };
+    let normalized = normalize_project_identifier(&candidate);
+    if normalized.is_empty() {
+        "PROJ".to_owned()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_project_identifier(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_uppercase())
+        .take(8)
+        .collect()
+}
+
+fn parse_new_item_tokens(
+    input: &str,
+    labels: &[Label],
+) -> (String, Priority, Vec<String>, Vec<String>) {
+    let mut title_words = Vec::new();
+    let mut priority = Priority::None;
+    let mut label_ids = Vec::new();
+    let mut unknown_labels = Vec::new();
+    for word in input.split_whitespace() {
+        if let Some(tag) = word.strip_prefix('!') {
+            let parsed = match tag.to_lowercase().as_str() {
+                "u" | "urgent" => Some(Priority::Urgent),
+                "h" | "high" => Some(Priority::High),
+                "m" | "medium" => Some(Priority::Medium),
+                "l" | "low" => Some(Priority::Low),
+                _ => None,
+            };
+            if let Some(parsed) = parsed {
+                priority = parsed;
+                continue;
+            }
+        }
+        if let Some(name) = word.strip_prefix('#') {
+            if !name.is_empty() {
+                let query = name.to_lowercase();
+                let exact = labels
+                    .iter()
+                    .find(|label| label.name.to_lowercase() == query);
+                let found = exact.or_else(|| {
+                    let matches = labels
+                        .iter()
+                        .filter(|label| label.name.to_lowercase().starts_with(&query))
+                        .collect::<Vec<_>>();
+                    if matches.len() == 1 {
+                        Some(matches[0])
+                    } else {
+                        None
+                    }
+                });
+                match found {
+                    Some(label) => {
+                        if !label_ids.contains(&label.id) {
+                            label_ids.push(label.id.clone());
+                        }
+                    }
+                    None => unknown_labels.push(name.to_owned()),
+                }
+                continue;
+            }
+        }
+        title_words.push(word);
+    }
+    (title_words.join(" "), priority, label_ids, unknown_labels)
+}
+
+fn edit_text_in_editor(item_key: &str, initial: &str) -> Result<Option<String>> {
+    let path = std::env::temp_dir().join(format!(
+        "plane-tui-desc-{}-{item_key}.md",
+        std::process::id()
+    ));
+    fs::write(&path, initial).with_context(|| format!("write {}", path.display()))?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_owned());
+    let mut parts = editor.split_whitespace();
+    let bin = parts.next().unwrap_or("vi").to_owned();
+    let args = parts.map(str::to_owned).collect::<Vec<_>>();
+
+    disable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    )?;
+    let status = Command::new(&bin).args(&args).arg(&path).status();
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
+    enable_raw_mode()?;
+
+    let status = status.with_context(|| format!("launch editor {bin} (set $EDITOR)"))?;
+    if !status.success() {
+        let _ = fs::remove_file(&path);
+        bail!("{bin} exited with {status}");
+    }
+    let edited = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let _ = fs::remove_file(&path);
+    let edited = edited.trim_end().to_owned();
+    if edited == initial.trim_end() {
+        return Ok(None);
+    }
+    Ok(Some(edited))
+}
+
+fn text_to_description_html(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|paragraph| !paragraph.is_empty())
+        .map(|paragraph| format!("<p>{}</p>", escape_html(paragraph).replace('\n', "<br/>")))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn spawn_agent(config: &Config, out_file: &std::path::Path) -> Result<std::process::Child> {
+    let bin = config.agent_bin();
+    let mut command = Command::new(bin);
+    match config.agent_backend {
+        AgentBackend::Codex => {
+            command
+                .arg("exec")
+                .arg("--skip-git-repo-check")
+                .arg("--sandbox")
+                .arg("read-only")
+                .arg("--ephemeral")
+                .arg("--color")
+                .arg("never")
+                .arg("--output-last-message")
+                .arg(out_file)
+                .arg("-")
+                .stdout(Stdio::null());
+        }
+        AgentBackend::Claude => {
+            command
+                .arg("--print")
+                .arg("--model")
+                .arg(&config.claude_model)
+                .arg("--effort")
+                .arg(&config.claude_effort)
+                .arg("--disallowedTools")
+                .arg("Edit,Write,NotebookEdit")
+                .stdout(Stdio::piped());
+        }
+    }
+    command.stdin(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(repo_dir) = config.repo_dir.as_deref() {
         command.current_dir(repo_dir);
     }
-    let mut child = command.spawn().with_context(|| {
-        format!("launch {codex_bin} (install codex or set PLANE_TUI_CODEX_BIN / --codex-bin)")
-    })?;
+    command.spawn().with_context(|| {
+        format!("launch {bin} (install it, or pick a backend with :backend codex|claude)")
+    })
+}
+
+fn complete_agent(
+    mut child: std::process::Child,
+    backend: AgentBackend,
+    bin: &str,
+    out_file: &std::path::Path,
+    prompt: &str,
+) -> Result<String> {
     let Some(mut stdin) = child.stdin.take() else {
-        bail!("{codex_bin} stdin unavailable");
+        let _ = child.kill();
+        bail!("{bin} stdin unavailable");
     };
     stdin
         .write_all(prompt.as_bytes())
-        .context("write prompt to codex stdin")?;
+        .with_context(|| format!("write prompt to {bin} stdin"))?;
     drop(stdin);
     let output = child
         .wait_with_output()
-        .with_context(|| format!("wait for {codex_bin} exec"))?;
+        .with_context(|| format!("wait for {bin}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let tail = stderr
@@ -3947,13 +5553,19 @@ fn run_codex(codex_bin: &str, repo_dir: Option<&str>, prompt: &str) -> Result<St
             .find(|line| !line.trim().is_empty())
             .unwrap_or("no stderr")
             .to_owned();
-        bail!("{codex_bin} exec failed ({}): {tail}", output.status);
+        bail!("{bin} failed ({}): {tail}", output.status);
     }
-    let text = fs::read_to_string(&out_file)
-        .with_context(|| format!("read codex output {}", out_file.display()))?;
-    let _ = fs::remove_file(&out_file);
+    let text = match backend {
+        AgentBackend::Codex => {
+            let text = fs::read_to_string(out_file)
+                .with_context(|| format!("read {bin} output {}", out_file.display()))?;
+            let _ = fs::remove_file(out_file);
+            text
+        }
+        AgentBackend::Claude => String::from_utf8_lossy(&output.stdout).into_owned(),
+    };
     if text.trim().is_empty() {
-        bail!("{codex_bin} returned an empty prompt");
+        bail!("{bin} returned an empty prompt");
     }
     Ok(text.trim().to_owned())
 }
@@ -3970,14 +5582,106 @@ fn prompt_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("PLANE_TUI_PROMPT_DIR") {
         return Ok(PathBuf::from(dir));
     }
+    Ok(plane_tui_data_dir()?.join("prompts"))
+}
+
+fn plane_tui_data_dir() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         return Ok(PathBuf::from(home)
             .join(".local")
             .join("share")
-            .join("plane-tui")
-            .join("prompts"));
+            .join("plane-tui"));
     }
-    Ok(std::env::current_dir()?.join(".plane-tui-prompts"))
+    Ok(std::env::current_dir()?.join(".plane-tui-data"))
+}
+
+#[derive(Debug, Default)]
+struct AgentPrefs {
+    backend: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+fn agent_prefs_path() -> Result<PathBuf> {
+    Ok(plane_tui_data_dir()?.join("agent-backend.tsv"))
+}
+
+fn saved_agent_prefs() -> Result<AgentPrefs> {
+    let path = agent_prefs_path()?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(AgentPrefs::default()),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let mut fields = text.trim().split('\t');
+    let field = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    Ok(AgentPrefs {
+        backend: field(fields.next()),
+        model: field(fields.next()),
+        effort: field(fields.next()),
+    })
+}
+
+fn save_agent_prefs(backend: AgentBackend, model: &str, effort: &str) -> Result<()> {
+    let path = agent_prefs_path()?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    fs::write(&path, format!("{}\t{model}\t{effort}\n", backend.name()))
+        .with_context(|| format!("write {}", path.display()))
+}
+
+fn remembered_projects_path() -> Result<PathBuf> {
+    Ok(plane_tui_data_dir()?.join("projects.tsv"))
+}
+
+fn remembered_projects(workspace: &str) -> Result<Vec<String>> {
+    let path = remembered_projects_path()?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let (saved_workspace, identifier) = line.split_once('\t')?;
+            (saved_workspace == workspace)
+                .then(|| identifier.trim().to_lowercase())
+                .filter(|identifier| !identifier.is_empty())
+        })
+        .collect())
+}
+
+fn remember_project(workspace: &str, identifier: &str) -> Result<()> {
+    let identifier = identifier.trim().to_lowercase();
+    if identifier.is_empty() {
+        return Ok(());
+    }
+    let path = remembered_projects_path()?;
+    let mut rows = fs::read_to_string(&path)
+        .map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+        .or_else(|err| {
+            if err.kind() == io::ErrorKind::NotFound {
+                Ok(Vec::new())
+            } else {
+                Err(err).with_context(|| format!("read {}", path.display()))
+            }
+        })?;
+    let row = format!("{workspace}\t{identifier}");
+    if !rows.iter().any(|existing| existing == &row) {
+        rows.push(row);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&path, format!("{}\n", rows.join("\n")))
+        .with_context(|| format!("write {}", path.display()))
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
@@ -4095,27 +5799,54 @@ fn time_ago(dt: DateTime<Utc>) -> String {
     }
 }
 
-fn html_to_text(html: &str) -> String {
+fn html_to_text_multiline(html: &str) -> String {
+    let normalized = html
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</p>", "\n\n")
+        .replace("</div>", "\n")
+        .replace("</li>", "\n")
+        .replace("</pre>", "\n")
+        .replace("</h1>", "\n")
+        .replace("</h2>", "\n")
+        .replace("</h3>", "\n");
     let mut text = String::new();
     let mut in_tag = false;
-    for ch in html.chars() {
+    for ch in normalized.chars() {
         match ch {
             '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                text.push(' ');
-            }
+            '>' => in_tag = false,
             _ if !in_tag => text.push(ch),
             _ => {}
         }
     }
-    text.replace("&nbsp;", " ")
+    let text = text
+        .replace("&nbsp;", " ")
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'");
+    let mut out: Vec<String> = Vec::new();
+    let mut blanks = 0;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            blanks += 1;
+            if blanks > 1 || out.is_empty() {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out.push(line.to_owned());
+    }
+    while out.last().is_some_and(|line| line.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
 }
 
 fn escape_html(value: &str) -> String {
@@ -4234,6 +5965,14 @@ fn wrap_line(value: &str, width: usize) -> Vec<String> {
     lines
 }
 
+fn scroll_offset(value: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        value.saturating_add(delta as usize)
+    } else {
+        value.saturating_sub((-delta) as usize)
+    }
+}
+
 fn draw_text(out: &mut io::Stdout, x: &mut u16, y: u16, text: &str, fg: Color) -> Result<()> {
     queue!(
         out,
@@ -4244,6 +5983,41 @@ fn draw_text(out: &mut io::Stdout, x: &mut u16, y: u16, text: &str, fg: Color) -
         ResetColor
     )?;
     *x = x.saturating_add(text.width() as u16);
+    Ok(())
+}
+
+fn draw_link_field(
+    out: &mut io::Stdout,
+    x: u16,
+    y: u16,
+    width: u16,
+    url: &str,
+    value_color: Color,
+) -> Result<()> {
+    draw_cell(out, x, y, width, "", DIM, None, false)?;
+    let mut cursor = x;
+    draw_span(
+        out,
+        &mut cursor,
+        y,
+        &format!("{:<9}", "url"),
+        DIMMER,
+        Some(BG),
+        false,
+    )?;
+    let remaining = width.saturating_sub(cursor.saturating_sub(x));
+    if remaining > 0 {
+        let display = truncate(url, remaining as usize);
+        // OSC 8 hyperlink: kitty and friends make the visible text clickable.
+        queue!(
+            out,
+            MoveTo(cursor, y),
+            SetForegroundColor(value_color),
+            SetBackgroundColor(BG),
+            Print(format!("\x1b]8;;{url}\x1b\\{display}\x1b]8;;\x1b\\")),
+            ResetColor
+        )?;
+    }
     Ok(())
 }
 
@@ -4588,7 +6362,7 @@ fn draw_card_border(
 
 fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
     let box_width = min(width.saturating_sub(8), 112);
-    let box_height = min(height.saturating_sub(6), 23);
+    let box_height = min(height.saturating_sub(6), 24);
     if box_width < 48 || box_height < 10 {
         return draw_overlay(
             out,
@@ -4597,7 +6371,7 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
             &[
                 " keys ",
                 "j/k move · h/l columns · D show done · e edit · s state · p priority · t labels",
-                "m mark · T triage · / search · : command · q close",
+                "m mark · T triage · / search · : command (:new, :project) · q close",
             ],
         );
     }
@@ -4643,8 +6417,17 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         left,
         value_x,
         row,
-        "1 2 3",
-        "switch project - TMOM · TMIOS · MKT",
+        "enter",
+        "item detail · description + comments",
+    )?;
+    row += 1;
+    draw_shortcut_row(
+        out,
+        left,
+        value_x,
+        row,
+        "tab / S-tab / 1 2 3",
+        "next · previous · direct project switch",
     )?;
     row += 2;
 
@@ -4674,7 +6457,7 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         value_x,
         row,
         "a / A",
-        "agent prompt via codex · A also posts it as a comment",
+        "agent prompt via claude/codex (:backend) · A also posts it as a comment",
     )?;
     row += 1;
     draw_shortcut_row(
@@ -4708,7 +6491,7 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         value_x,
         row,
         "/  :  f  S",
-        "search · command · filter · sort",
+        "search · command (:new, :project, :backend) · filter · sort",
     )?;
     row += 1;
     draw_shortcut_row(out, left, value_x, row, "? / q / esc", "close this panel")?;
