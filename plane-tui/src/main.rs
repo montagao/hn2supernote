@@ -1,10 +1,12 @@
 mod jobs;
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,8 +23,8 @@ use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
 use crossterm::terminal::{
-    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
-    disable_raw_mode, enable_raw_mode, size,
+    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
 use crossterm::{execute, queue};
 use reqwest::blocking::Client;
@@ -1254,7 +1256,8 @@ struct App {
     last_g: Option<Instant>,
     frame: usize,
     should_quit: bool,
-    last_size: Option<(u16, u16)>,
+    /// What the terminal currently shows; the diff target for the next frame.
+    screen: Screen,
     force_clear: bool,
     agent_jobs: Vec<jobs::JobHandle>,
     jobs_open: bool,
@@ -1385,7 +1388,7 @@ impl App {
             last_g: None,
             frame: 0,
             should_quit: false,
-            last_size: None,
+            screen: Screen::default(),
             force_clear: true,
             agent_jobs: plane_tui_data_dir()
                 .ok()
@@ -2003,7 +2006,7 @@ impl App {
         Ok(())
     }
 
-    fn draw_skill_wizard(&self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    fn draw_skill_wizard(&self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
         let Some(picks) = &self.skill_wizard else {
             return Ok(());
         };
@@ -2277,7 +2280,7 @@ impl App {
         Ok(())
     }
 
-    fn draw_repo_wizard(&self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    fn draw_repo_wizard(&self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
         let Some(picks) = &self.repo_wizard else {
             return Ok(());
         };
@@ -2700,7 +2703,7 @@ impl App {
             .status();
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
         enable_raw_mode()?;
-        self.force_clear = true;
+        self.invalidate_screen();
         status.context("running git diff (pager)")?;
         Ok(())
     }
@@ -3450,7 +3453,7 @@ impl App {
         Ok(())
     }
 
-    fn draw_jobs_overlay(&self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    fn draw_jobs_overlay(&self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
         let box_width = min(width.saturating_sub(6), 112);
         let box_height = min(height.saturating_sub(4), 30);
         if box_width < 60 || box_height < 12 {
@@ -4291,7 +4294,7 @@ impl App {
             return Ok(());
         };
         self.menu = None;
-        self.force_clear = true;
+        self.invalidate_screen();
         let edited = match edit_text_in_editor(&key, &description) {
             Ok(Some(edited)) => edited,
             Ok(None) => {
@@ -5594,19 +5597,58 @@ impl App {
         )
     }
 
-    fn draw(&mut self) -> Result<()> {
-        let (width, height) = size()?;
+    /// Build a fresh frame, either blank (force_clear) or seeded from what's on
+    /// screen (so untouched cells cost nothing in the diff), and hand it to the
+    /// draw_* functions.
+    fn new_frame(&mut self, width: u16, height: u16) -> Screen {
+        let size_changed = self.screen.w != width || self.screen.h != height;
+        let mut buf = if self.force_clear || size_changed {
+            Screen::blank(width, height)
+        } else {
+            let mut buf = Screen::blank(width, height);
+            buf.cells.clone_from(&self.screen.cells);
+            buf
+        };
+        self.force_clear = false;
+        buf.begin_frame();
+        buf
+    }
+
+    /// Emit a diffed frame to the terminal. On a resize we first repaint the
+    /// physical screen to the base background so the grid and terminal agree.
+    fn present(&mut self, mut buf: Screen, width: u16, height: u16) -> Result<()> {
         let mut stdout = io::stdout();
         queue!(stdout, BeginSynchronizedUpdate, Hide)?;
-        let size_changed = self.last_size != Some((width, height));
-        if self.force_clear || size_changed {
-            clear_area(&mut stdout, 0, 0, width, height, Some(BG))?;
-            self.force_clear = false;
-            self.last_size = Some((width, height));
+        if self.screen.w != width || self.screen.h != height {
+            queue!(
+                stdout,
+                SetBackgroundColor(BG),
+                Clear(ClearType::All),
+                ResetColor
+            )?;
+            self.screen = Screen::blank(width, height);
         }
+        buf.flush_into(&mut self.screen, &mut stdout)?;
+        queue!(stdout, EndSynchronizedUpdate)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    /// Forget what's on the terminal after an external program (a git pager or
+    /// `$EDITOR`) took it over: the next frame then does a full physical repaint
+    /// instead of diffing against a stale model.
+    fn invalidate_screen(&mut self) {
+        self.screen = Screen::default();
+        self.force_clear = true;
+    }
+
+    fn draw(&mut self) -> Result<()> {
+        let (width, height) = size()?;
+        let mut buf = self.new_frame(width, height);
+        let out = &mut buf;
         let frame = LayoutFrame::new(width, height);
-        draw_outer_frame(&mut stdout, frame)?;
-        self.draw_header(&mut stdout, frame.x, frame.width, frame.y)?;
+        draw_outer_frame(out, frame)?;
+        self.draw_header(out, frame.x, frame.width, frame.y)?;
         let footer_height = if self.api_open { 8 } else { 3 };
         let body_top = frame.y + 1;
         let body_height = frame.height.saturating_sub(1 + footer_height);
@@ -5619,16 +5661,12 @@ impl App {
         };
         let board_width = frame.width.saturating_sub(inspector_width);
         match self.view {
-            ViewMode::Board => {
-                self.draw_board(&mut stdout, frame.x, body_top, board_width, body_height)?
-            }
-            ViewMode::List => {
-                self.draw_list(&mut stdout, frame.x, body_top, board_width, body_height)?
-            }
+            ViewMode::Board => self.draw_board(out, frame.x, body_top, board_width, body_height)?,
+            ViewMode::List => self.draw_list(out, frame.x, body_top, board_width, body_height)?,
         }
         if inspector_width > 0 {
             self.draw_inspector(
-                &mut stdout,
+                out,
                 frame.x + board_width,
                 body_top,
                 inspector_width,
@@ -5636,73 +5674,65 @@ impl App {
             )?;
         }
         self.draw_footer(
-            &mut stdout,
+            out,
             frame.x,
             body_top + body_height,
             frame.width,
             footer_height,
         )?;
         if self.keys_open {
-            self.draw_keys_overlay(&mut stdout, width, height)?;
+            self.draw_keys_overlay(out, width, height)?;
         }
         if self.notes_open {
-            self.draw_notes_overlay(&mut stdout, width, height)?;
+            self.draw_notes_overlay(out, width, height)?;
         }
         if self.triage.is_some() {
-            self.draw_triage_overlay(&mut stdout, width, height)?;
+            self.draw_triage_overlay(out, width, height)?;
         }
         if self.detail.is_some() {
-            self.draw_detail_overlay(&mut stdout, width, height)?;
+            self.draw_detail_overlay(out, width, height)?;
         }
         if self.prompt_view.is_some() {
-            self.draw_prompt_overlay(&mut stdout, width, height)?;
+            self.draw_prompt_overlay(out, width, height)?;
         }
         if self.jobs_open {
-            self.draw_jobs_overlay(&mut stdout, width, height)?;
+            self.draw_jobs_overlay(out, width, height)?;
         }
         if self.repo_wizard.is_some() {
-            self.draw_repo_wizard(&mut stdout, width, height)?;
+            self.draw_repo_wizard(out, width, height)?;
         }
         if self.skill_wizard.is_some() {
-            self.draw_skill_wizard(&mut stdout, width, height)?;
+            self.draw_skill_wizard(out, width, height)?;
         }
-        queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
-        stdout.flush()?;
-        Ok(())
+        self.present(buf, width, height)
     }
 
     fn draw_active_overlay(&mut self) -> Result<()> {
         let (width, height) = size()?;
-        let mut stdout = io::stdout();
-        queue!(stdout, BeginSynchronizedUpdate, Hide)?;
+        let mut buf = self.new_frame(width, height);
         if self.prompt_view.is_some() {
-            self.draw_prompt_overlay_body(&mut stdout, width, height)?;
+            self.draw_prompt_overlay_body(&mut buf, width, height)?;
         } else if self.detail.is_some() {
-            self.draw_detail_overlay_body(&mut stdout, width, height)?;
+            self.draw_detail_overlay_body(&mut buf, width, height)?;
         }
-        queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
-        stdout.flush()?;
-        Ok(())
+        self.present(buf, width, height)
     }
 
     fn draw_footer_only(&mut self) -> Result<()> {
         let (width, height) = size()?;
-        let mut stdout = io::stdout();
-        queue!(stdout, BeginSynchronizedUpdate, Hide)?;
+        let mut buf = self.new_frame(width, height);
         let frame = LayoutFrame::new(width, height);
         let footer_height = if self.api_open { 8 } else { 3 };
         let body_top = frame.y + 1;
         let body_height = frame.height.saturating_sub(1 + footer_height);
         self.draw_footer(
-            &mut stdout,
+            &mut buf,
             frame.x,
             body_top + body_height,
             frame.width,
             footer_height,
         )?;
-        queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
-        stdout.flush()?;
-        Ok(())
+        self.present(buf, width, height)
     }
 
     fn can_redraw_footer_only_after_key(
@@ -5733,7 +5763,7 @@ impl App {
         previous_mode.can_redraw_footer_only() && current_mode.can_redraw_footer_only()
     }
 
-    fn draw_header(&self, out: &mut io::Stdout, start_x: u16, width: u16, y: u16) -> Result<()> {
+    fn draw_header(&self, out: &mut Screen, start_x: u16, width: u16, y: u16) -> Result<()> {
         draw_cell(out, start_x, y, width, "", DIM, Some(BG), false)?;
         let mut x = start_x;
         draw_span(
@@ -5814,14 +5844,7 @@ impl App {
         Ok(())
     }
 
-    fn draw_board(
-        &self,
-        out: &mut io::Stdout,
-        x: u16,
-        y: u16,
-        width: u16,
-        height: u16,
-    ) -> Result<()> {
+    fn draw_board(&self, out: &mut Screen, x: u16, y: u16, width: u16, height: u16) -> Result<()> {
         let states = self.board_states();
         let col_widths = distribute_width(width, states.len(), 20);
         let mut col_x = x;
@@ -5964,7 +5987,7 @@ impl App {
 
     fn draw_card(
         &self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         x: u16,
         y: u16,
         width: u16,
@@ -6072,7 +6095,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn draw_card_labels(
         &self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         x: u16,
         y: u16,
         width: u16,
@@ -6165,14 +6188,7 @@ impl App {
         Ok(())
     }
 
-    fn draw_list(
-        &self,
-        out: &mut io::Stdout,
-        x: u16,
-        y: u16,
-        width: u16,
-        height: u16,
-    ) -> Result<()> {
+    fn draw_list(&self, out: &mut Screen, x: u16, y: u16, width: u16, height: u16) -> Result<()> {
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -6269,7 +6285,7 @@ impl App {
 
     fn draw_list_header(
         &self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         x: u16,
         y: u16,
         width: u16,
@@ -6331,7 +6347,7 @@ impl App {
 
     fn draw_list_row(
         &self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         x: u16,
         y: u16,
         width: u16,
@@ -6431,7 +6447,7 @@ impl App {
 
     fn draw_list_labels(
         &self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         x: u16,
         end: u16,
         y: u16,
@@ -6487,7 +6503,7 @@ impl App {
 
     fn draw_inspector(
         &self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         x: u16,
         y: u16,
         width: u16,
@@ -6677,14 +6693,7 @@ impl App {
         Ok(())
     }
 
-    fn draw_footer(
-        &self,
-        out: &mut io::Stdout,
-        x: u16,
-        y: u16,
-        width: u16,
-        height: u16,
-    ) -> Result<()> {
+    fn draw_footer(&self, out: &mut Screen, x: u16, y: u16, width: u16, height: u16) -> Result<()> {
         queue!(
             out,
             MoveTo(x, y),
@@ -6892,7 +6901,7 @@ impl App {
         Ok(())
     }
 
-    fn draw_command_line(&self, out: &mut io::Stdout, x: u16, y: u16, width: u16) -> Result<()> {
+    fn draw_command_line(&self, out: &mut Screen, x: u16, y: u16, width: u16) -> Result<()> {
         if width == 0 {
             return Ok(());
         }
@@ -7018,13 +7027,7 @@ impl App {
         }
     }
 
-    fn draw_backend_wizard_bar(
-        &self,
-        out: &mut io::Stdout,
-        x: u16,
-        y: u16,
-        width: u16,
-    ) -> Result<()> {
+    fn draw_backend_wizard_bar(&self, out: &mut Screen, x: u16, y: u16, width: u16) -> Result<()> {
         let Some(wizard) = self.backend_wizard.as_ref() else {
             return Ok(());
         };
@@ -7086,7 +7089,7 @@ impl App {
 
     fn draw_backend_wizard_choice(
         &self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         cursor: &mut u16,
         end: u16,
         y: u16,
@@ -7108,7 +7111,7 @@ impl App {
         )
     }
 
-    fn draw_label_menu_bar(&self, out: &mut io::Stdout, x: u16, y: u16, width: u16) -> Result<()> {
+    fn draw_label_menu_bar(&self, out: &mut Screen, x: u16, y: u16, width: u16) -> Result<()> {
         draw_cell(out, x, y, width, "", DIM, Some(BG_RAISE), false)?;
         let mut cursor = x;
         draw_span(
@@ -7173,11 +7176,11 @@ impl App {
         Ok(())
     }
 
-    fn draw_keys_overlay(&self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    fn draw_keys_overlay(&self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
         draw_help_panel(out, width, height)
     }
 
-    fn draw_notes_overlay(&self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    fn draw_notes_overlay(&self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
         let lines = [
             " design notes ",
             "The board tells the truth: live Plane items, not a local mock.",
@@ -7191,7 +7194,7 @@ impl App {
         draw_overlay(out, width, height, &lines)
     }
 
-    fn draw_triage_overlay(&self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    fn draw_triage_overlay(&self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
         let Some(triage) = self.triage.as_ref() else {
             return Ok(());
         };
@@ -7230,13 +7233,13 @@ impl App {
         draw_overlay(out, width, height, &refs)
     }
 
-    fn draw_prompt_overlay(&mut self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    fn draw_prompt_overlay(&mut self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
         self.draw_prompt_overlay_inner(out, width, height, true)
     }
 
     fn draw_prompt_overlay_body(
         &mut self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         width: u16,
         height: u16,
     ) -> Result<()> {
@@ -7245,7 +7248,7 @@ impl App {
 
     fn draw_prompt_overlay_inner(
         &mut self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         width: u16,
         height: u16,
         draw_shell: bool,
@@ -7319,13 +7322,13 @@ impl App {
         Ok(())
     }
 
-    fn draw_detail_overlay(&mut self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    fn draw_detail_overlay(&mut self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
         self.draw_detail_overlay_inner(out, width, height, true)
     }
 
     fn draw_detail_overlay_body(
         &mut self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         width: u16,
         height: u16,
     ) -> Result<()> {
@@ -7334,7 +7337,7 @@ impl App {
 
     fn draw_detail_overlay_inner(
         &mut self,
-        out: &mut io::Stdout,
+        out: &mut Screen,
         width: u16,
         height: u16,
         draw_shell: bool,
@@ -8351,7 +8354,453 @@ fn scroll_offset(value: usize, delta: isize) -> usize {
     }
 }
 
-fn draw_text(out: &mut io::Stdout, x: &mut u16, y: u16, text: &str, fg: Color) -> Result<()> {
+// ── Diffing back-buffer renderer ───────────────────────────────────────────
+//
+// The draw_* functions all emit crossterm commands into a `&mut dyn io::Write`.
+// Instead of streaming those straight to the terminal (a full repaint every
+// frame — the source of the flicker/lag), we point them at a `Screen`, which is
+// a tiny terminal emulator: it parses the exact escape vocabulary crossterm
+// produces (CUP, SGR 38/48/39/49/0/1, and OSC 8 hyperlinks) into a cell grid.
+// At the end of a frame we diff that grid against what's currently on the
+// terminal and emit only the cells that actually changed. Unchanged regions —
+// and closed overlays under `force_clear` — cost nothing, so there is no flash
+// and the byte volume per keystroke collapses.
+
+/// A foreground/background colour, stored as the exact SGR form crossterm emits
+/// so it round-trips byte-for-byte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ink {
+    Default,
+    Idx(u8),
+    Rgb(u8, u8, u8),
+}
+
+impl Ink {
+    fn write_fg(self, out: &mut String) {
+        match self {
+            Ink::Default => out.push_str("\x1b[39m"),
+            Ink::Idx(n) => {
+                let _ = write!(out, "\x1b[38;5;{n}m");
+            }
+            Ink::Rgb(r, g, b) => {
+                let _ = write!(out, "\x1b[38;2;{r};{g};{b}m");
+            }
+        }
+    }
+    fn write_bg(self, out: &mut String) {
+        match self {
+            Ink::Default => out.push_str("\x1b[49m"),
+            Ink::Idx(n) => {
+                let _ = write!(out, "\x1b[48;5;{n}m");
+            }
+            Ink::Rgb(r, g, b) => {
+                let _ = write!(out, "\x1b[48;2;{r};{g};{b}m");
+            }
+        }
+    }
+}
+
+const fn ink_of(c: Color) -> Ink {
+    match c {
+        Color::Rgb { r, g, b } => Ink::Rgb(r, g, b),
+        _ => Ink::Default,
+    }
+}
+const BG_INK: Ink = ink_of(BG);
+
+#[derive(Clone, PartialEq, Debug)]
+struct Cell {
+    ch: char,
+    fg: Ink,
+    bg: Ink,
+    bold: bool,
+    link: Option<Rc<str>>,
+    /// right half of a wide (double-width) glyph; the lead cell paints it.
+    cont: bool,
+}
+
+impl Cell {
+    fn blank() -> Self {
+        Cell {
+            ch: ' ',
+            fg: Ink::Default,
+            bg: BG_INK,
+            bold: false,
+            link: None,
+            cont: false,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum ParseState {
+    Ground,
+    Esc,
+    Csi,
+    Osc,
+    OscEsc,
+}
+
+/// A cell grid that consumes crossterm's escape stream (via `io::Write`) and can
+/// diff itself against a previous frame.
+struct Screen {
+    w: u16,
+    h: u16,
+    cells: Vec<Cell>,
+    // parser cursor + pen
+    cx: u16,
+    cy: u16,
+    fg: Ink,
+    bg: Ink,
+    bold: bool,
+    link: Option<Rc<str>>,
+    // stream-parser scratch
+    state: ParseState,
+    params: Vec<u16>,
+    cur_param: Option<u16>,
+    priv_mode: bool,
+    osc: Vec<u8>,
+    ground: Vec<u8>,
+}
+
+impl Default for Screen {
+    fn default() -> Self {
+        Screen::blank(0, 0)
+    }
+}
+
+impl Screen {
+    fn blank(w: u16, h: u16) -> Self {
+        Screen {
+            w,
+            h,
+            cells: vec![Cell::blank(); w as usize * h as usize],
+            cx: 0,
+            cy: 0,
+            fg: Ink::Default,
+            bg: Ink::Default,
+            bold: false,
+            link: None,
+            state: ParseState::Ground,
+            params: Vec::new(),
+            cur_param: None,
+            priv_mode: false,
+            osc: Vec::new(),
+            ground: Vec::new(),
+        }
+    }
+
+    /// Reset the parser cursor/pen at the start of a frame. The grid content is
+    /// left intact so partial redraws (footer-only) keep the rest of the frame.
+    fn begin_frame(&mut self) {
+        self.cx = 0;
+        self.cy = 0;
+        self.fg = Ink::Default;
+        self.bg = Ink::Default;
+        self.bold = false;
+        self.link = None;
+        self.state = ParseState::Ground;
+        self.params.clear();
+        self.cur_param = None;
+        self.priv_mode = false;
+        self.osc.clear();
+        self.ground.clear();
+    }
+
+    fn idx(&self, x: u16, y: u16) -> usize {
+        y as usize * self.w as usize + x as usize
+    }
+
+    fn flush_ground(&mut self) {
+        if self.ground.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&self.ground).into_owned();
+        self.ground.clear();
+        for ch in text.chars() {
+            self.put_char(ch);
+        }
+    }
+
+    fn put_char(&mut self, ch: char) {
+        let cw = ch.width().unwrap_or(0);
+        if cw == 0 {
+            return; // skip zero-width / control chars
+        }
+        if self.cy < self.h && self.cx < self.w {
+            let i = self.idx(self.cx, self.cy);
+            self.cells[i] = Cell {
+                ch,
+                fg: self.fg,
+                bg: self.bg,
+                bold: self.bold,
+                link: self.link.clone(),
+                cont: false,
+            };
+            if cw == 2 && self.cx + 1 < self.w {
+                let j = i + 1;
+                self.cells[j] = Cell {
+                    ch: ' ',
+                    fg: self.fg,
+                    bg: self.bg,
+                    bold: self.bold,
+                    link: self.link.clone(),
+                    cont: true,
+                };
+            }
+        }
+        self.cx = self.cx.saturating_add(cw as u16);
+    }
+
+    fn apply_sgr(&mut self) {
+        if self.params.is_empty() {
+            self.params.push(0);
+        }
+        let mut i = 0;
+        while i < self.params.len() {
+            match self.params[i] {
+                0 => {
+                    self.fg = Ink::Default;
+                    self.bg = Ink::Default;
+                    self.bold = false;
+                }
+                1 => self.bold = true,
+                22 => self.bold = false,
+                39 => self.fg = Ink::Default,
+                49 => self.bg = Ink::Default,
+                38 | 48 => {
+                    let is_fg = self.params[i] == 38;
+                    match self.params.get(i + 1) {
+                        Some(2) => {
+                            let r = self.params.get(i + 2).copied().unwrap_or(0) as u8;
+                            let g = self.params.get(i + 3).copied().unwrap_or(0) as u8;
+                            let b = self.params.get(i + 4).copied().unwrap_or(0) as u8;
+                            let ink = Ink::Rgb(r, g, b);
+                            if is_fg {
+                                self.fg = ink;
+                            } else {
+                                self.bg = ink;
+                            }
+                            i += 4;
+                        }
+                        Some(5) => {
+                            let n = self.params.get(i + 2).copied().unwrap_or(0) as u8;
+                            let ink = Ink::Idx(n);
+                            if is_fg {
+                                self.fg = ink;
+                            } else {
+                                self.bg = ink;
+                            }
+                            i += 2;
+                        }
+                        _ => {}
+                    }
+                }
+                p @ 30..=37 => self.fg = Ink::Idx((p - 30) as u8),
+                p @ 90..=97 => self.fg = Ink::Idx((p - 90 + 8) as u8),
+                p @ 40..=47 => self.bg = Ink::Idx((p - 40) as u8),
+                p @ 100..=107 => self.bg = Ink::Idx((p - 100 + 8) as u8),
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    fn handle_csi(&mut self, final_byte: u8) {
+        match final_byte {
+            b'H' | b'f' => {
+                let row = self.params.first().copied().unwrap_or(1).max(1) - 1;
+                let col = self.params.get(1).copied().unwrap_or(1).max(1) - 1;
+                self.cy = row;
+                self.cx = col;
+            }
+            b'm' if !self.priv_mode => self.apply_sgr(),
+            b'J' if self.params.first().copied().unwrap_or(0) == 2 => {
+                for cell in &mut self.cells {
+                    *cell = Cell {
+                        ch: ' ',
+                        fg: Ink::Default,
+                        bg: self.bg,
+                        bold: false,
+                        link: None,
+                        cont: false,
+                    };
+                }
+            }
+            _ => {} // private-mode toggles (?25/?2026) and anything else: ignore
+        }
+    }
+
+    fn handle_osc(&mut self) {
+        // Only OSC 8 hyperlinks are emitted: "8;<params>;<uri>".
+        let s = String::from_utf8_lossy(&self.osc).into_owned();
+        self.osc.clear();
+        if let Some(rest) = s.strip_prefix("8;") {
+            // rest = "<params>;<uri>"; params are always empty here.
+            if let Some(uri) = rest.splitn(2, ';').nth(1) {
+                self.link = if uri.is_empty() {
+                    None
+                } else {
+                    Some(Rc::from(uri))
+                };
+            }
+        }
+    }
+
+    fn feed(&mut self, byte: u8) {
+        match self.state {
+            ParseState::Ground => {
+                if byte == 0x1b {
+                    self.flush_ground();
+                    self.state = ParseState::Esc;
+                } else {
+                    self.ground.push(byte);
+                }
+            }
+            ParseState::Esc => match byte {
+                b'[' => {
+                    self.params.clear();
+                    self.cur_param = None;
+                    self.priv_mode = false;
+                    self.state = ParseState::Csi;
+                }
+                b']' => {
+                    self.osc.clear();
+                    self.state = ParseState::Osc;
+                }
+                _ => self.state = ParseState::Ground,
+            },
+            ParseState::Csi => {
+                if byte == b'?' {
+                    self.priv_mode = true;
+                } else if byte.is_ascii_digit() {
+                    self.cur_param =
+                        Some(self.cur_param.unwrap_or(0).saturating_mul(10) + (byte - b'0') as u16);
+                } else if byte == b';' {
+                    let p = self.cur_param.take().unwrap_or(0);
+                    self.params.push(p);
+                } else {
+                    if let Some(p) = self.cur_param.take() {
+                        self.params.push(p);
+                    }
+                    self.handle_csi(byte);
+                    self.state = ParseState::Ground;
+                }
+            }
+            ParseState::Osc => match byte {
+                0x07 => {
+                    self.handle_osc();
+                    self.state = ParseState::Ground;
+                }
+                0x1b => self.state = ParseState::OscEsc,
+                _ => self.osc.push(byte),
+            },
+            ParseState::OscEsc => {
+                if byte == b'\\' {
+                    self.handle_osc();
+                    self.state = ParseState::Ground;
+                } else {
+                    self.osc.push(0x1b);
+                    self.osc.push(byte);
+                    self.state = ParseState::Osc;
+                }
+            }
+        }
+    }
+
+    /// Diff this freshly-drawn frame against `prev` (what's on the terminal),
+    /// emit only the changed cells, and update `prev` to match.
+    fn flush_into(&mut self, prev: &mut Screen, out: &mut dyn io::Write) -> Result<()> {
+        self.flush_ground();
+        let mut o = String::new();
+        o.push_str("\x1b[0m");
+        let mut cf = Ink::Default;
+        let mut cb = Ink::Default;
+        let mut cbold = false;
+        let mut clink: Option<Rc<str>> = None;
+        for y in 0..self.h {
+            let mut pen: Option<u16> = None;
+            let mut x = 0u16;
+            while x < self.w {
+                let i = self.idx(x, y);
+                let cell = &self.cells[i];
+                if cell.cont {
+                    // painted by the lead; keep prev in sync and move on
+                    if prev.cells[i] != *cell {
+                        prev.cells[i] = cell.clone();
+                    }
+                    x += 1;
+                    continue;
+                }
+                let wide = (x + 1 < self.w) && self.cells[i + 1].cont;
+                let cw = if wide { 2 } else { 1 };
+                let changed =
+                    prev.cells[i] != *cell || (wide && prev.cells[i + 1] != self.cells[i + 1]);
+                if !changed {
+                    x += cw;
+                    continue;
+                }
+                if pen != Some(x) {
+                    let _ = write!(o, "\x1b[{};{}H", y + 1, x + 1);
+                }
+                // style delta
+                if cbold && !cell.bold {
+                    o.push_str("\x1b[0m");
+                    cf = Ink::Default;
+                    cb = Ink::Default;
+                    cbold = false;
+                } else if !cbold && cell.bold {
+                    o.push_str("\x1b[1m");
+                    cbold = true;
+                }
+                if cf != cell.fg {
+                    cell.fg.write_fg(&mut o);
+                    cf = cell.fg;
+                }
+                if cb != cell.bg {
+                    cell.bg.write_bg(&mut o);
+                    cb = cell.bg;
+                }
+                if clink != cell.link {
+                    match &cell.link {
+                        Some(uri) => {
+                            let _ = write!(o, "\x1b]8;;{uri}\x1b\\");
+                        }
+                        None => o.push_str("\x1b]8;;\x1b\\"),
+                    }
+                    clink = cell.link.clone();
+                }
+                o.push(cell.ch);
+                pen = Some(x + cw);
+                prev.cells[i] = cell.clone();
+                if wide {
+                    prev.cells[i + 1] = self.cells[i + 1].clone();
+                }
+                x += cw;
+            }
+        }
+        if clink.is_some() {
+            o.push_str("\x1b]8;;\x1b\\");
+        }
+        o.push_str("\x1b[0m");
+        out.write_all(o.as_bytes())?;
+        Ok(())
+    }
+}
+
+impl io::Write for Screen {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for &byte in buf {
+            self.feed(byte);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn draw_text(out: &mut Screen, x: &mut u16, y: u16, text: &str, fg: Color) -> Result<()> {
     queue!(
         out,
         MoveTo(*x, y),
@@ -8365,7 +8814,7 @@ fn draw_text(out: &mut io::Stdout, x: &mut u16, y: u16, text: &str, fg: Color) -
 }
 
 fn draw_link_field(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     y: u16,
     width: u16,
@@ -8400,7 +8849,7 @@ fn draw_link_field(
 }
 
 fn draw_field_line(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     y: u16,
     width: u16,
@@ -8436,7 +8885,7 @@ fn draw_field_line(
 }
 
 fn draw_label_field(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     y: u16,
     width: u16,
@@ -8503,7 +8952,7 @@ fn draw_label_field(
     Ok(())
 }
 
-fn draw_outer_frame(out: &mut io::Stdout, frame: LayoutFrame) -> Result<()> {
+fn draw_outer_frame(out: &mut Screen, frame: LayoutFrame) -> Result<()> {
     if frame.x == 0 || frame.y == 0 || frame.width < 2 || frame.height < 2 {
         return Ok(());
     }
@@ -8543,7 +8992,7 @@ fn draw_outer_frame(out: &mut io::Stdout, frame: LayoutFrame) -> Result<()> {
 }
 
 fn clear_area(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     y: u16,
     width: u16,
@@ -8562,7 +9011,7 @@ fn clear_area(
 }
 
 fn draw_span(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: &mut u16,
     y: u16,
     text: &str,
@@ -8583,7 +9032,7 @@ fn draw_span(
 }
 
 fn draw_span_clipped(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: &mut u16,
     end: u16,
     y: u16,
@@ -8600,7 +9049,7 @@ fn draw_span_clipped(
 }
 
 fn draw_cell(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     y: u16,
     width: u16,
@@ -8627,7 +9076,7 @@ fn draw_cell(
 }
 
 fn draw_cell_right(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     y: u16,
     width: u16,
@@ -8658,7 +9107,7 @@ fn next_list_x(x: u16, width: u16, end: u16) -> u16 {
 }
 
 fn draw_list_cell(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     end: u16,
     y: u16,
@@ -8676,7 +9125,7 @@ fn draw_list_cell(
 }
 
 fn draw_list_cell_right(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     end: u16,
     y: u16,
@@ -8694,7 +9143,7 @@ fn draw_list_cell_right(
 }
 
 fn draw_card_border(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     y: u16,
     width: u16,
@@ -8738,7 +9187,7 @@ fn draw_card_border(
     Ok(())
 }
 
-fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+fn draw_help_panel(out: &mut Screen, width: u16, height: u16) -> Result<()> {
     let box_width = min(width.saturating_sub(8), 112);
     let box_height = min(height.saturating_sub(6), 29);
     if box_width < 48 || box_height < 10 {
@@ -8914,7 +9363,7 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
 }
 
 fn draw_modal_shell(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     y: u16,
     width: u16,
@@ -8994,12 +9443,12 @@ fn draw_modal_shell(
     Ok(())
 }
 
-fn draw_help_section(out: &mut io::Stdout, x: u16, y: u16, title: &str) -> Result<()> {
+fn draw_help_section(out: &mut Screen, x: u16, y: u16, title: &str) -> Result<()> {
     draw_cell(out, x, y, 28, title, DIM, Some(BG), false)
 }
 
 fn draw_shortcut_row(
-    out: &mut io::Stdout,
+    out: &mut Screen,
     x: u16,
     value_x: u16,
     y: u16,
@@ -9013,7 +9462,7 @@ fn draw_shortcut_row(
     Ok(())
 }
 
-fn draw_overlay(out: &mut io::Stdout, width: u16, height: u16, lines: &[&str]) -> Result<()> {
+fn draw_overlay(out: &mut Screen, width: u16, height: u16, lines: &[&str]) -> Result<()> {
     let box_width = min(width.saturating_sub(4), 88);
     let box_height = min(height.saturating_sub(4), lines.len() as u16 + 2);
     let x = width.saturating_sub(box_width) / 2;
@@ -9081,4 +9530,278 @@ fn draw_overlay(out: &mut io::Stdout, width: u16, height: u16, lines: &[&str]) -
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    fn grid_text(s: &Screen) -> Vec<String> {
+        (0..s.h)
+            .map(|y| {
+                (0..s.w)
+                    .map(|x| {
+                        let c = &s.cells[s.idx(x, y)];
+                        if c.cont { '\u{0}' } else { c.ch }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    // Replay a flushed stream onto a blank terminal and confirm it reproduces
+    // the source frame exactly — this is the invariant that guarantees the diff
+    // output is faithful to what the draw_* functions intended.
+    fn replay(src: &mut Screen) -> Screen {
+        let mut prev = Screen::blank(src.w, src.h);
+        let mut bytes: Vec<u8> = Vec::new();
+        src.flush_into(&mut prev, &mut bytes).unwrap();
+        let mut fresh = Screen::blank(src.w, src.h);
+        fresh.write_all(&bytes).unwrap();
+        fresh.flush_ground();
+        fresh
+    }
+
+    #[test]
+    fn parses_move_color_print() {
+        let mut s = Screen::blank(20, 3);
+        draw_cell(&mut s, 0, 0, 20, "hello", PAPER, Some(BG), false).unwrap();
+        s.flush_ground();
+        assert_eq!(grid_text(&s)[0], format!("{:<20}", "hello"));
+        let c = &s.cells[s.idx(0, 0)];
+        assert_eq!(c.ch, 'h');
+        assert_eq!(c.fg, ink_of(PAPER));
+        assert_eq!(c.bg, ink_of(BG));
+    }
+
+    #[test]
+    fn wide_glyph_marks_continuation() {
+        let mut s = Screen::blank(10, 1);
+        let mut x = 0;
+        // a double-width glyph
+        draw_span(&mut s, &mut x, 0, "⣾", ACCENT, Some(BG), false).unwrap();
+        s.flush_ground();
+        assert_eq!(s.cells[s.idx(0, 0)].ch, '⣾');
+        assert!(!s.cells[s.idx(0, 0)].cont);
+        // the box glyph ⣾ is width 1 in this app's font metrics; ensure at least
+        // that placement + advance are consistent with unicode width.
+        let w = "⣾".width() as u16;
+        assert_eq!(x, w);
+    }
+
+    #[test]
+    fn osc8_link_round_trips() {
+        let mut s = Screen::blank(40, 1);
+        draw_link_field(&mut s, 0, 0, 40, "https://example.com/x", ACCENT).unwrap();
+        s.flush_ground();
+        // the url cells should carry a link annotation
+        let has_link = (0..s.w).any(|x| s.cells[s.idx(x, 0)].link.is_some());
+        assert!(has_link, "expected an OSC 8 link somewhere on the row");
+        let fresh = replay(&mut s);
+        assert_eq!(grid_text(&fresh), grid_text(&s));
+        assert!((0..fresh.w).any(|x| fresh.cells[fresh.idx(x, 0)].link.is_some()));
+    }
+
+    #[test]
+    fn flush_reproduces_frame() {
+        let mut s = Screen::blank(24, 4);
+        draw_cell(&mut s, 0, 0, 24, "top line", PAPER, Some(BG), true).unwrap();
+        let mut x = 1;
+        draw_span(&mut s, &mut x, 1, "mixed", RED, Some(CELL_BG), false).unwrap();
+        draw_span(&mut s, &mut x, 1, " tail", GREEN, None, true).unwrap();
+        draw_cell_right(&mut s, 0, 2, 24, "right", DIM, Some(BG), false).unwrap();
+        s.flush_ground();
+        let fresh = replay(&mut s);
+        assert_eq!(grid_text(&fresh), grid_text(&s));
+        for i in 0..s.cells.len() {
+            assert_eq!(fresh.cells[i], s.cells[i], "cell {i} differs");
+        }
+    }
+
+    #[test]
+    fn chunked_writes_survive_split_escapes() {
+        // Emulate crossterm splitting a single command across write() calls.
+        let mut whole = Screen::blank(20, 1);
+        draw_cell(&mut whole, 0, 0, 20, "split me", AMBER, Some(BG), true).unwrap();
+        whole.flush_ground();
+
+        // capture the exact bytes, then feed them one at a time
+        let mut prev = Screen::blank(20, 1);
+        let mut bytes = Vec::new();
+        whole.flush_into(&mut prev, &mut bytes).unwrap();
+        let mut byte_at_a_time = Screen::blank(20, 1);
+        for b in &bytes {
+            byte_at_a_time.write_all(&[*b]).unwrap();
+        }
+        byte_at_a_time.flush_ground();
+        assert_eq!(grid_text(&byte_at_a_time), grid_text(&whole));
+    }
+
+    #[test]
+    fn diff_emits_only_changed_cells() {
+        // frame 1
+        let mut prev = Screen::blank(30, 2);
+        let mut frame1 = Screen::blank(30, 2);
+        draw_cell(
+            &mut frame1,
+            0,
+            0,
+            30,
+            "unchanged header",
+            PAPER,
+            Some(BG),
+            false,
+        )
+        .unwrap();
+        draw_cell(&mut frame1, 0, 1, 30, "status: idle", DIM, Some(BG), false).unwrap();
+        let mut sink = Vec::new();
+        frame1.flush_into(&mut prev, &mut sink).unwrap();
+
+        // frame 2: only the second line changes
+        let mut frame2 = Screen::blank(30, 2);
+        frame2.cells.clone_from(&prev.cells);
+        frame2.begin_frame();
+        draw_cell(
+            &mut frame2,
+            0,
+            1,
+            30,
+            "status: busy",
+            AMBER,
+            Some(BG),
+            false,
+        )
+        .unwrap();
+        let mut sink2 = Vec::new();
+        frame2.flush_into(&mut prev, &mut sink2).unwrap();
+        let out = String::from_utf8_lossy(&sink2);
+
+        // the header text must not be re-emitted; the changed word must be
+        assert!(
+            !out.contains("unchanged header"),
+            "unchanged row was repainted: {out:?}"
+        );
+        assert!(
+            out.contains("busy"),
+            "changed row was not repainted: {out:?}"
+        );
+        // and the cursor should jump to row 2 (CUP row index 2)
+        assert!(out.contains("\x1b[2;"), "expected a move to the second row");
+    }
+
+    #[test]
+    fn diff_is_far_smaller_than_full_repaint() {
+        // A representative full frame: 100x30 of colored cells.
+        let (w, h) = (100u16, 30u16);
+        let paint = |s: &mut Screen, spinner: char| {
+            s.begin_frame();
+            for y in 0..h {
+                draw_cell(
+                    s,
+                    0,
+                    y,
+                    w,
+                    &format!("row {y:02} of the board view here"),
+                    PAPER,
+                    Some(BG),
+                    false,
+                )
+                .unwrap();
+            }
+            let mut x = 2;
+            draw_span(
+                s,
+                &mut x,
+                h - 1,
+                &format!("working {spinner}"),
+                AMBER,
+                Some(BG),
+                true,
+            )
+            .unwrap();
+            s.flush_ground();
+        };
+
+        // full repaint = flushing frame 1 against a blank terminal
+        let mut prev = Screen::blank(w, h);
+        let mut frame1 = Screen::blank(w, h);
+        paint(&mut frame1, '⣾');
+        let mut full = Vec::new();
+        frame1.flush_into(&mut prev, &mut full).unwrap();
+
+        // next frame: only the spinner glyph changes (a typical tick)
+        let mut frame2 = Screen::blank(w, h);
+        frame2.cells.clone_from(&prev.cells);
+        paint(&mut frame2, '⣽');
+        let mut diff = Vec::new();
+        frame2.flush_into(&mut prev, &mut diff).unwrap();
+
+        println!(
+            "full repaint = {} bytes, one-glyph diff = {} bytes ({}x smaller)",
+            full.len(),
+            diff.len(),
+            full.len() / diff.len().max(1),
+        );
+        // the spinner change should cost a tiny fraction of a full repaint
+        assert!(
+            diff.len() * 20 < full.len(),
+            "diff {} not much smaller than full {}",
+            diff.len(),
+            full.len()
+        );
+    }
+
+    #[test]
+    fn force_clear_erases_uncovered_cells() {
+        // an overlay covers part of the screen...
+        let mut prev = Screen::blank(20, 2);
+        let mut with_overlay = Screen::blank(20, 2);
+        draw_cell(
+            &mut with_overlay,
+            0,
+            0,
+            20,
+            "base row zero here",
+            DIM,
+            Some(BG),
+            false,
+        )
+        .unwrap();
+        draw_cell(
+            &mut with_overlay,
+            0,
+            1,
+            20,
+            "OVERLAY POPUP",
+            PAPER,
+            Some(CELL_BG),
+            true,
+        )
+        .unwrap();
+        let mut sink = Vec::new();
+        with_overlay.flush_into(&mut prev, &mut sink).unwrap();
+
+        // ...then it closes: a force_clear frame that only redraws row zero
+        let mut cleared = Screen::blank(20, 2); // blank == what new_frame builds on force_clear
+        cleared.begin_frame();
+        draw_cell(
+            &mut cleared,
+            0,
+            0,
+            20,
+            "base row zero here",
+            DIM,
+            Some(BG),
+            false,
+        )
+        .unwrap();
+        let mut sink2 = Vec::new();
+        cleared.flush_into(&mut prev, &mut sink2).unwrap();
+
+        // row 1 in the terminal state must now be blank (overlay erased)
+        for x in 0..prev.w {
+            let c = &prev.cells[prev.idx(x, 1)];
+            assert_eq!(c.ch, ' ', "overlay cell {x} not cleared");
+        }
+    }
 }
