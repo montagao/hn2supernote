@@ -2266,8 +2266,8 @@ impl App {
 
     /// (Re)start one job's agent: fresh attempt files, fresh timestamps.
     fn spawn_agent_job(&mut self, index: usize) -> Result<()> {
-        let permission_mode =
-            std::env::var("PLANE_TUI_CLAUDE_PERM").unwrap_or_else(|_| "acceptEdits".to_owned());
+        let permission_mode = std::env::var("PLANE_TUI_CLAUDE_PERM")
+            .unwrap_or_else(|_| "bypassPermissions".to_owned());
         let handle = &mut self.agent_jobs[index];
         jobs::reset_attempt_files(&handle.dir);
         handle.job.started_at = Some(Utc::now().to_rfc3339());

@@ -544,15 +544,32 @@ fn stream_json_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Codex sandbox mode. Defaults to full autonomy: the worktree is
+/// disposable, and an approval prompt in an unattended pane is a stall.
+/// Set PLANE_TUI_CODEX_SANDBOX=workspace-write to re-tighten.
+fn codex_sandbox() -> String {
+    std::env::var("PLANE_TUI_CODEX_SANDBOX")
+        .unwrap_or_else(|_| "danger-full-access".to_owned())
+}
+
 fn agent_command(job: &Job, dir: &Path, claude_permission_mode: &str) -> String {
     let prompt = shell_quote(&dir.join("prompt.md").display().to_string());
     let result = shell_quote(&dir.join("result.md").display().to_string());
     if job.mode == JobMode::Interactive {
         // full agent TUI with the brief preloaded; the human drives it —
-        // works with either backend, they both take an initial prompt arg
+        // works with either backend, they both take an initial prompt arg.
+        // approvals stay off even here: an unattended "proceed?" is a stall
         let bin = shell_quote(&job.model_binary());
         return if job.backend.as_str() == "codex" {
-            format!("{bin} --sandbox workspace-write \"$(cat {prompt})\"")
+            let sandbox = codex_sandbox();
+            if sandbox == "danger-full-access" {
+                format!("{bin} --dangerously-bypass-approvals-and-sandbox \"$(cat {prompt})\"")
+            } else {
+                format!(
+                    "{bin} --sandbox {} --ask-for-approval never \"$(cat {prompt})\"",
+                    shell_quote(&sandbox),
+                )
+            }
         } else {
             format!(
                 "{bin} --model {} --effort {} --permission-mode {} \"$(cat {prompt})\"",
@@ -564,8 +581,9 @@ fn agent_command(job: &Job, dir: &Path, claude_permission_mode: &str) -> String 
     }
     if job.backend.as_str() == "codex" {
         return format!(
-            "{} exec --sandbox workspace-write --output-last-message {result} < {prompt}",
+            "{} exec --sandbox {} --output-last-message {result} < {prompt}",
             shell_quote(&job.model_binary()),
+            shell_quote(&codex_sandbox()),
         );
     }
     let bin = shell_quote(&job.model_binary());
