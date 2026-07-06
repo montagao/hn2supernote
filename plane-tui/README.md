@@ -130,7 +130,12 @@ the real code paths; it delivers a committed design doc with its assumptions,
 unknown unknowns, architecture-changing questions, and 2–3 prototyped options
 with a recommendation, and its summary posts to the item). Review an
 exploration, then `f` "go with option B — implement it" requeues into the
-same worktree with the design threaded into the prompt. `i` toggles
+same worktree with the design threaded into the prompt. `s` opens a
+**skills picker** — a checkbox list over installed skills (the target
+repo's `.claude/skills` / `.codex/skills` first, then `~/.claude/skills`
+and `~/.codex/skills`, deduped by name); picked skills are hinted in the
+prompt by name + description ("use them where they genuinely help"), and
+referenced in the fable-5 brief when `b` is on. `i` toggles
 **interactive** mode for whichever executor you pick
 (the pane runs the agent's own TUI — claude or codex — with the brief
 preloaded; dispatching deep-dives you straight into it; human-paced, so

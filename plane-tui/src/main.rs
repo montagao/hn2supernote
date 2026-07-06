@@ -86,6 +86,79 @@ struct RepoPick {
     hidden: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SkillPick {
+    name: String,
+    description: String,
+    origin: &'static str, // "repo" | "claude" | "codex"
+    selected: bool,
+}
+
+/// Parse a SKILL.md's frontmatter for name + first description line.
+fn skill_meta(dir: &Path) -> Option<(String, String)> {
+    let raw = fs::read_to_string(dir.join("SKILL.md")).ok()?;
+    let mut name = dir.file_name()?.to_string_lossy().to_string();
+    let mut description = String::new();
+    let mut in_frontmatter = false;
+    for line in raw.lines().take(40) {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            if in_frontmatter {
+                break;
+            }
+            in_frontmatter = true;
+            continue;
+        }
+        if !in_frontmatter {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("name:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                name = value.to_owned();
+            }
+        } else if let Some(value) = trimmed.strip_prefix("description:") {
+            description = value.trim().to_owned();
+        }
+    }
+    Some((name, description))
+}
+
+fn scan_skill_root(
+    root: &Path,
+    origin: &'static str,
+    selected: &[String],
+    picks: &mut Vec<SkillPick>,
+    seen: &mut BTreeSet<String>,
+) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        let Some((name, description)) = skill_meta(&dir) else {
+            continue;
+        };
+        if !seen.insert(name.to_lowercase()) {
+            continue;
+        }
+        let selected = selected
+            .iter()
+            .any(|have| have.eq_ignore_ascii_case(&name));
+        picks.push(SkillPick {
+            name,
+            description,
+            origin,
+            selected,
+        });
+    }
+}
+
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
@@ -1166,6 +1239,9 @@ struct App {
     dispatch_repo: usize,
     repo_wizard: Option<Vec<RepoPick>>,
     repo_wizard_sel: usize,
+    skill_wizard: Option<Vec<SkillPick>>,
+    skill_wizard_sel: usize,
+    dispatch_skills: Vec<String>,
     feedback_job: Option<String>,
     feedback_backend: Option<AgentBackend>,
     land_job: Option<String>,
@@ -1297,6 +1373,9 @@ impl App {
             dispatch_repo: 0,
             repo_wizard: None,
             repo_wizard_sel: 0,
+            skill_wizard: None,
+            skill_wizard_sel: 0,
+            dispatch_skills: Vec::new(),
             feedback_job: None,
             feedback_backend: None,
             land_job: None,
@@ -1792,6 +1871,137 @@ impl App {
 
     // ------------------------------------------------------ agent cockpit
 
+    /// `s` in the dispatch menu: checkbox picker over installed skills
+    /// (repo-scoped first, then ~/.claude/skills and ~/.codex/skills).
+    /// Picks are hinted in the prompt, so this runs before generation.
+    fn open_skill_wizard(&mut self) {
+        let selected = self.dispatch_skills.clone();
+        let registry = repo_registry(&self.client.config);
+        let repo = registry
+            .get(self.dispatch_repo)
+            .or_else(|| registry.first())
+            .map(|(_, path)| path.clone());
+        let mut picks = Vec::new();
+        let mut seen = BTreeSet::new();
+        if let Some(repo) = &repo {
+            scan_skill_root(&repo.join(".claude/skills"), "repo", &selected, &mut picks, &mut seen);
+            scan_skill_root(&repo.join(".codex/skills"), "repo", &selected, &mut picks, &mut seen);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let home = PathBuf::from(home);
+            scan_skill_root(&home.join(".claude/skills"), "claude", &selected, &mut picks, &mut seen);
+            scan_skill_root(&home.join(".codex/skills"), "codex", &selected, &mut picks, &mut seen);
+        }
+        if picks.is_empty() {
+            self.status = "no skills found (~/.claude/skills, ~/.codex/skills, <repo>/.claude/skills)".to_owned();
+            return;
+        }
+        self.skill_wizard = Some(picks);
+        self.skill_wizard_sel = 0;
+        self.force_clear = true;
+    }
+
+    fn handle_skill_wizard_key(&mut self, key: KeyEvent) -> Result<()> {
+        let len = self.skill_wizard.as_ref().map(Vec::len).unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.skill_wizard = None;
+                // return to the dispatch menu mid-flow
+                if self.dispatch_item.is_some() {
+                    self.menu = Some(MenuMode::Dispatch);
+                    self.status = format!(
+                        "{} skill(s) picked — they'll be hinted in the prompt",
+                        self.dispatch_skills.len()
+                    );
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.skill_wizard_sel = min(self.skill_wizard_sel + 1, len.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.skill_wizard_sel = self.skill_wizard_sel.saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let sel = self.skill_wizard_sel;
+                if let Some(picks) = &mut self.skill_wizard {
+                    if let Some(pick) = picks.get_mut(sel) {
+                        pick.selected = !pick.selected;
+                        let name = pick.name.clone();
+                        let selected = pick.selected;
+                        if selected {
+                            if !self
+                                .dispatch_skills
+                                .iter()
+                                .any(|have| have.eq_ignore_ascii_case(&name))
+                            {
+                                self.dispatch_skills.push(name);
+                            }
+                        } else {
+                            self.dispatch_skills
+                                .retain(|have| !have.eq_ignore_ascii_case(&name));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.force_clear = true;
+        Ok(())
+    }
+
+    fn draw_skill_wizard(&self, out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+        let Some(picks) = &self.skill_wizard else {
+            return Ok(());
+        };
+        let box_width = min(width.saturating_sub(6), 104);
+        let box_height = min(height.saturating_sub(4), 30);
+        let x = width.saturating_sub(box_width) / 2;
+        let y = height.saturating_sub(box_height) / 2;
+        draw_modal_shell(
+            out,
+            x,
+            y,
+            box_width,
+            box_height,
+            &format!("skills · {} picked", self.dispatch_skills.len()),
+        )?;
+        let inner_x = x + 2;
+        let inner_width = box_width.saturating_sub(4);
+        let mut row = y + 2;
+        let visible = box_height.saturating_sub(5) as usize;
+        let start = self.skill_wizard_sel.saturating_sub(visible.saturating_sub(1));
+        for (position, pick) in picks.iter().enumerate().skip(start).take(visible) {
+            let selected = position == self.skill_wizard_sel;
+            let mark = if pick.selected { "[✓]" } else { "[ ]" };
+            let text = format!(
+                " {mark} {:<24} {:<6} {}",
+                truncate(&pick.name, 24),
+                pick.origin,
+                truncate(&pick.description, 58),
+            );
+            let (fg, bg) = if selected {
+                (Color::Black, Some(PAPER))
+            } else if pick.selected {
+                (TEXT, Some(BG))
+            } else {
+                (DIM, Some(BG))
+            };
+            draw_cell(out, inner_x, row, inner_width, &text, fg, bg, selected)?;
+            row += 1;
+        }
+        draw_cell(
+            out,
+            inner_x,
+            y + box_height.saturating_sub(2),
+            inner_width,
+            "enter/space toggle · j/k move · esc back to dispatch",
+            DIM,
+            Some(BG),
+            false,
+        )?;
+        Ok(())
+    }
+
     /// `:repos` / `R` in the dispatch menu: discover git repos and manage
     /// which ones are dispatch targets.
     fn open_repo_wizard(&mut self) {
@@ -2089,6 +2299,7 @@ impl App {
         self.dispatch_interactive = false;
         self.dispatch_explore = false;
         self.dispatch_repo = 0;
+        self.dispatch_skills.clear();
         self.dispatch_item = Some(key);
         self.menu = Some(MenuMode::Dispatch);
         self.force_clear = true;
@@ -2196,6 +2407,7 @@ impl App {
             } else {
                 jobs::JobStance::Implement
             },
+            skills: self.dispatch_skills.clone(),
         };
         // two-stage briefing: hand the item to the fable-5 brief generator
         // first; the job sits in BRIEFING until the brief becomes prompt.md
@@ -2458,6 +2670,43 @@ impl App {
         self.post_results.push(rx);
     }
 
+    /// A hint section listing the skills picked at dispatch, enriched with
+    /// their descriptions when still discoverable. A nudge, not a mandate —
+    /// both CLIs load their skill registries themselves.
+    fn skills_prompt_section(&self, skills: &[String]) -> String {
+        if skills.is_empty() {
+            return String::new();
+        }
+        let mut catalog: Vec<SkillPick> = Vec::new();
+        let mut seen = BTreeSet::new();
+        let registry = repo_registry(&self.client.config);
+        for (_, repo) in &registry {
+            scan_skill_root(&repo.join(".claude/skills"), "repo", &[], &mut catalog, &mut seen);
+            scan_skill_root(&repo.join(".codex/skills"), "repo", &[], &mut catalog, &mut seen);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let home = PathBuf::from(home);
+            scan_skill_root(&home.join(".claude/skills"), "claude", &[], &mut catalog, &mut seen);
+            scan_skill_root(&home.join(".codex/skills"), "codex", &[], &mut catalog, &mut seen);
+        }
+        let mut lines = String::new();
+        for name in skills {
+            let description = catalog
+                .iter()
+                .find(|pick| pick.name.eq_ignore_ascii_case(name))
+                .map(|pick| pick.description.clone())
+                .unwrap_or_default();
+            if description.is_empty() {
+                lines.push_str(&format!("- {name}\n"));
+            } else {
+                lines.push_str(&format!("- {name} — {}\n", truncate(&description, 160)));
+            }
+        }
+        format!(
+            "\n## skills worth reaching for\nThe reviewer flagged these installed skills as likely relevant — use them where they genuinely help, skip them where they don't:\n{lines}"
+        )
+    }
+
     fn executor_business_context(&self) -> String {
         if let Some(path) = self.client.config.context_file.as_deref() {
             if let Ok(text) = fs::read_to_string(path) {
@@ -2497,6 +2746,7 @@ impl App {
             jobs::JobStance::Explore => explore_stance_section(&item.key),
             jobs::JobStance::Implement => String::new(),
         };
+        let skills = self.skills_prompt_section(&job.skills);
         let repo_has_docs = repo_has_agent_docs(&job.repo);
         let context = if repo_has_docs && config.context_file.is_none() {
             String::new()
@@ -2504,7 +2754,7 @@ impl App {
             format!("\n## business context\n{}\n", self.executor_business_context())
         };
         format!(
-            "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}{stance}{context}{envelope}",
+            "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}{stance}{skills}{context}{envelope}",
             key = item.key,
             title = item.title,
             state = item.state,
@@ -2530,6 +2780,16 @@ impl App {
             meta_prompt.push_str(
                 "\n\nThis dispatch is a design/exploration pass, not implementation: the brief should ask the agent for assumptions, unknown unknowns, architecture-changing questions, and prototyped options with a recommendation — not code changes.\n",
             );
+        }
+        let skills = self
+            .job_index_by_id(&job_id)
+            .map(|index| self.agent_jobs[index].job.skills.clone())
+            .unwrap_or_default();
+        if !skills.is_empty() {
+            meta_prompt.push_str(&format!(
+                "\n\nThe executor has these skills installed and the reviewer flagged them as relevant — the brief may reference them by name: {}.\n",
+                skills.join(", ")
+            ));
         }
         let item_key = item.key.clone();
         let config = &self.client.config;
@@ -2596,8 +2856,9 @@ impl App {
                     }
                     jobs::JobStance::Implement => String::new(),
                 };
+                let skills = self.skills_prompt_section(&self.agent_jobs[index].job.skills.clone());
                 let prompt = format!(
-                    "{}\n{stance}{}",
+                    "{}\n{stance}{skills}{}",
                     brief.trim(),
                     executor_envelope(&branch, repo_has_docs)
                 );
@@ -3370,6 +3631,9 @@ impl App {
             }
             return Ok(());
         }
+        if self.skill_wizard.is_some() {
+            return self.handle_skill_wizard_key(key);
+        }
         if self.repo_wizard.is_some() {
             return self.handle_repo_wizard_key(key);
         }
@@ -3761,6 +4025,11 @@ impl App {
                     KeyCode::Char('e') => {
                         self.dispatch_explore = !self.dispatch_explore;
                         self.force_clear = true;
+                        None
+                    }
+                    KeyCode::Char('s') => {
+                        self.menu = None;
+                        self.open_skill_wizard();
                         None
                     }
                     KeyCode::Char('r') => {
@@ -5282,6 +5551,9 @@ impl App {
         if self.repo_wizard.is_some() {
             self.draw_repo_wizard(&mut stdout, width, height)?;
         }
+        if self.skill_wizard.is_some() {
+            self.draw_skill_wizard(&mut stdout, width, height)?;
+        }
         queue!(stdout, ResetColor, EndSynchronizedUpdate)?;
         stdout.flush()?;
         Ok(())
@@ -6420,7 +6692,7 @@ impl App {
                             .map(|(name, _)| name.as_str())
                             .unwrap_or("?");
                         format!(
-                            "dispatch {} → enter {}  1 codex  2 claude  i int:{}  b brief:{}  e stance:{}  r repo:{}  esc",
+                            "dispatch {} → enter {}  1 codex  2 claude  i int:{}  b brief:{}  e stance:{}  s skills:{}  r repo:{}  esc",
                             self.dispatch_item.as_deref().unwrap_or("?"),
                             match self.dispatch_backend {
                                 AgentBackend::Codex => "codex",
@@ -6429,6 +6701,7 @@ impl App {
                             if self.dispatch_interactive { "on" } else { "off" },
                             if self.dispatch_brief { "fable-5" } else { "env" },
                             if self.dispatch_explore { "explore" } else { "impl" },
+                            self.dispatch_skills.len(),
                             repo_label,
                         )
                     }
@@ -8447,7 +8720,7 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         value_x,
         row,
         "d",
-        "dispatch agent → enter default · 1/2 backend · i interactive · b brief · e explore · r repo",
+        "dispatch agent → enter default · 1/2 backend · i interactive · b brief · e explore · s skills · r repo",
     )?;
     row += 1;
     draw_shortcut_row(

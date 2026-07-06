@@ -99,6 +99,9 @@ pub struct Job {
     pub mode: JobMode,
     #[serde(default)]
     pub stance: JobStance,
+    /// Skill names picked in the dispatch wizard — hinted in the prompt.
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 /// Runtime view of a job: the serialized Job plus tailing state.
@@ -994,6 +997,7 @@ mod tests {
             started_at: None,
             mode: JobMode::Headless,
             stance: JobStance::Implement,
+            skills: Vec::new(),
         };
         let dir = std::env::temp_dir().join(format!("pti-job-test-{}", std::process::id()));
         save(&dir, &job).unwrap();
@@ -1202,6 +1206,7 @@ mod tests {
             started_at: None,
             mode: JobMode::Headless,
             stance: JobStance::Implement,
+            skills: Vec::new(),
         };
         let target = land_merge(&job).unwrap();
         assert!(!target.is_empty());
@@ -1295,6 +1300,7 @@ mod tests {
             started_at: None,
             mode: JobMode::Headless,
             stance: JobStance::Implement,
+            skills: Vec::new(),
         };
         assert!(diff_stat(&job).contains("fix.txt"));
         discard(&job).unwrap();
@@ -1345,6 +1351,7 @@ mod tests {
             started_at: None,
             mode: JobMode::Headless,
             stance: JobStance::Implement,
+            skills: Vec::new(),
         };
         save(&dir, &job).unwrap();
         spawn_raw(
