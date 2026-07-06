@@ -159,6 +159,32 @@ fn scan_skill_root(
     }
 }
 
+#[cfg(test)]
+mod skill_tests {
+    use super::*;
+
+    #[test]
+    fn skill_meta_parses_frontmatter() {
+        let dir = std::env::temp_dir().join(format!("pti-skill-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: seo-audit\ndescription: Run an SEO audit across the site.\nuser-invokable: true\n---\n# body\n",
+        )
+        .unwrap();
+        let (name, description) = skill_meta(&dir).unwrap();
+        assert_eq!(name, "seo-audit");
+        assert_eq!(description, "Run an SEO audit across the site.");
+        // no frontmatter → falls back to the directory name
+        fs::write(dir.join("SKILL.md"), "just a body, no frontmatter\n").unwrap();
+        let (name, description) = skill_meta(&dir).unwrap();
+        assert!(name.starts_with("pti-skill-test-"));
+        assert!(description.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
