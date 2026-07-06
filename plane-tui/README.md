@@ -22,40 +22,64 @@ pti
 
 ## Keys
 
-- `1` `2` `3`: switch Product / iOS / Growth
+- `tab` / `shift-tab`: next / previous project; `1` `2` `3`: direct project switch
 - `j/k` and arrows: move
 - `h/l`: board columns
+- `enter`: item detail view — full description plus Plane comments (`wheel`/`j/k` scroll, `o` open, `a/A` agent prompt, `esc` close)
 - `v`: board/list view
 - `D`: show/hide the Done board column
 - `m`, `I`, `U`: mark, invert marks, clear marks
-- `e`: edit the selected item title, description, or due date
-- `a`: craft a "design and implement" agent prompt for the selected item (also `:agent`)
+- `e`: edit the selected item title, description (opens `$EDITOR`), or due date
+- `a`: craft a direct task brief for the selected item (also `:agent`)
 - `A`: same, then post the prompt back to the Plane item as a comment (also `:agent post`)
-- `s`: set state on cursor or marks
+- `esc`: cancel a running agent-prompt generation
+- `s`: set state on cursor or marks; moving items into In Progress past the WIP limit
+  asks for confirmation (`y` moves anyway, `esc`/`n` cancels)
 - `p`: set priority on cursor or marks
 - `t`: toggle labels on cursor or marks; press `n` in the label menu to create a label
 - `T`: triage unprioritized backlog items
 - `/`: search
-- `:`: command mode, including `:new title`
+- `:`: command mode, including `:new title`, `:project`, and `:backend`
 - `x`: API drawer
 - `?`: keys overlay
 - `R`: refresh from Plane
-- `o`: open canonical Plane browse URL
+- `o`: open canonical Plane browse URL (the inspector URL is also click-to-open via OSC 8)
 - `q`: quit
 
-New items are created in the currently selected board state. In list view, they use the selected item's state.
+New items are created in the currently selected board state. In list view, they use the
+selected item's state. `:new` accepts inline tokens: `!u/!h/!m/!l` set priority and
+`#labelname` attaches labels (case-insensitive, unique prefixes work), e.g.
+`:new fix upload bug !h #fullstack`.
+
+`:project` opens a two-step wizard for creating a Plane project: enter the display
+name, then confirm or edit the generated project key before it is posted. Created
+project keys are remembered in `~/.local/share/plane-tui/projects.tsv` so they are
+merged into the `--projects` filter on later runs.
+
+Cards show `Nd over` (red) or `due today`/`due tom` (amber) in place of the age when a due
+date is close. The header shows `⟳Nm` sync age for the active project; the board
+auto-refreshes when idle and stale (`--auto-refresh <minutes>` / `PLANE_TUI_AUTO_REFRESH`,
+default 5, `0` disables).
+
+The In Progress board column enforces a WIP limit (`--wip-limit` / `PLANE_TUI_WIP_LIMIT`,
+default 2, `0` disables): its header shows `N/limit` and turns red when over, and both
+`s` and the `T` triage flow guard against moving more items in past the limit.
 
 ## Agent prompts (`a` / `A`)
 
-Press `a` on the selected work item to have Codex write a self-contained
-"design and implement" prompt for a coding agent. The generated prompt combines
+Press `a` on the selected work item to have an LLM CLI (Claude Code by default,
+Codex optionally) write a direct task brief for a coding agent. The generated
+brief combines
 the item's fields (title, description, state, priority, labels, due, URL) with
 embedded TranslateMom business/architecture context distilled from the internal
 dossier (`src/business_context.md`, compiled into the binary).
 
-The result opens in a scrollable overlay (`j/k` scroll, `y` copy, `esc` close),
+Generation runs in the background — keep triaging while the spinner shows in the
+status line; `esc` cancels. When it finishes, the prompt overlay pops up on its own.
+
+The result opens in a scrollable overlay (`wheel`/`j/k` scroll, `y` copy, `esc` close),
 is copied to the clipboard, and is saved under `~/.local/share/plane-tui/prompts/`.
-Each run is also logged to the API drawer (`x`) as a `CODEX` entry.
+Each run is also logged to the API drawer (`x`) as an `AGENT` entry.
 
 `A` does everything `a` does and additionally posts the generated prompt back
 to the work item as a Plane comment (wrapped in `<pre>` so formatting survives),
@@ -68,12 +92,24 @@ when plane-tui runs over SSH.
 
 Configuration (flag / env var):
 
-- `--codex-bin` / `PLANE_TUI_CODEX_BIN`: LLM CLI binary, default `codex`.
+- `--agent-backend` / `PLANE_TUI_AGENT_BACKEND`: `claude` (default) or `codex`.
+  Also configurable in-app with the `:backend` chooser, or directly with
+  `:backend codex` / `:backend claude [model] [effort]`; in-app changes
+  persist across restarts in
+  `~/.local/share/plane-tui/agent-backend.tsv`. Flag/env, when given, wins over
+  the persisted choice.
+- `--claude-bin` / `PLANE_TUI_CLAUDE_BIN`: Claude Code binary, default `claude`.
+  Invoked as `claude --print --model <model> --effort <effort>` with edits
+  disabled via `--disallowedTools`; the brief is read from stdout.
+- `--claude-model` / `PLANE_TUI_CLAUDE_MODEL`: default `claude-fable-5`.
+- `--claude-effort` / `PLANE_TUI_CLAUDE_EFFORT`: default `high`
+  (low/medium/high/xhigh/max).
+- `--codex-bin` / `PLANE_TUI_CODEX_BIN`: Codex CLI binary, default `codex`.
   Invoked as `codex exec --sandbox read-only --ephemeral` with the meta-prompt
   on stdin; the final message is read via `--output-last-message`.
 - `--repo-dir` / `PLANE_TUI_REPO_DIR`: optional path to the TranslateMom
-  monorepo checkout. When set, codex runs there (read-only) so it can ground
-  the prompt in the real code before writing it.
+  monorepo checkout. When set, the backend runs there (read-only) so it can
+  ground the prompt in the real code before writing it.
 - `--context-file` / `PLANE_TUI_CONTEXT_FILE`: optional plain-text/markdown
   file that replaces the embedded business context (e.g. a fresh `.md` export
   of the business dossier).
