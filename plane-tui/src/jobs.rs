@@ -405,6 +405,19 @@ pub fn reset_attempt_files(dir: &Path) {
     let _ = fs::remove_file(dir.join("result.md"));
 }
 
+/// True when the job branch actually carries commits beyond its base.
+/// Fails open (true) so a git hiccup can't block landing.
+pub fn branch_has_commits(job: &Job) -> bool {
+    let mut count = Command::new("git");
+    count
+        .arg("-C")
+        .arg(&job.worktree)
+        .args(["rev-list", "--count", &format!("{}..HEAD", job.base_ref)]);
+    run_capture(count)
+        .map(|out| out.trim() != "0")
+        .unwrap_or(true)
+}
+
 /// The repo checkout's current branch — what land `m` merges into.
 pub fn repo_head_branch(repo: &Path) -> Result<String> {
     let mut head = Command::new("git");

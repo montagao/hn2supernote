@@ -82,6 +82,8 @@ struct RepoPick {
     path: PathBuf,
     kind: &'static str, // "repo" | "submodule"
     source: RepoSource,
+    /// Default/env entry the user hid via the wizard ("!" line in repos.tsv).
+    hidden: bool,
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -113,7 +115,9 @@ fn repos_registry_path() -> Result<PathBuf> {
     Ok(plane_tui_data_dir()?.join("repos.tsv"))
 }
 
-fn saved_repos() -> Vec<(String, PathBuf)> {
+/// repos.tsv holds two kinds of lines: "name\tpath" (wizard-added repos) and
+/// "!\tpath" (a default/env entry the user hid via the wizard).
+fn read_repos_file() -> Vec<(String, PathBuf)> {
     let Ok(path) = repos_registry_path() else {
         return Vec::new();
     };
@@ -128,13 +132,43 @@ fn saved_repos() -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-fn save_repos(repos: &[(String, PathBuf)]) -> Result<()> {
+fn saved_repos() -> Vec<(String, PathBuf)> {
+    read_repos_file()
+        .into_iter()
+        .filter(|(name, _)| name != "!")
+        .collect()
+}
+
+fn hidden_repo_paths() -> Vec<PathBuf> {
+    read_repos_file()
+        .into_iter()
+        .filter(|(name, _)| name == "!")
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn write_repos_file(repos: &[(String, PathBuf)]) -> Result<()> {
     let path = repos_registry_path()?;
     let body = repos
         .iter()
         .map(|(name, path)| format!("{name}\t{}\n", path.display()))
         .collect::<String>();
     fs::write(path, body).context("writing repos.tsv")
+}
+
+fn git_toplevel(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let top = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if top.is_empty() { None } else { Some(PathBuf::from(top)) }
 }
 
 /// Repos agents can be dispatched into: --repo-dir first, then the wizard's
@@ -152,7 +186,11 @@ fn repo_registry(config: &Config) -> Vec<(String, PathBuf)> {
         }
     };
     if let Some(dir) = &config.repo_dir {
-        let path = expand_tilde(dir);
+        // normalize to the git toplevel: a --repo-dir pointing inside a repo
+        // (e.g. mono/apps) would otherwise dispatch to the enclosing repo
+        // while wearing the subdirectory's name
+        let raw = expand_tilde(dir);
+        let path = git_toplevel(&raw).unwrap_or(raw);
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
@@ -165,6 +203,8 @@ fn repo_registry(config: &Config) -> Vec<(String, PathBuf)> {
     for (name, path) in env_repos() {
         push(name, path, &mut repos);
     }
+    let hidden = hidden_repo_paths();
+    repos.retain(|(_, path)| !hidden.contains(path));
     repos
 }
 
@@ -1742,9 +1782,13 @@ impl App {
     /// plus initialized submodules of --repo-dir.
     fn discover_repos(&self) -> Vec<RepoPick> {
         let config = &self.client.config;
-        let default_path = config.repo_dir.as_deref().map(expand_tilde);
+        let default_path = config.repo_dir.as_deref().map(|dir| {
+            let raw = expand_tilde(dir);
+            git_toplevel(&raw).unwrap_or(raw)
+        });
         let env_pairs = env_repos();
         let saved = saved_repos();
+        let hidden = hidden_repo_paths();
         let mut picks: Vec<RepoPick> = Vec::new();
         let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
         let push = |name: String, path: PathBuf, kind: &'static str, picks: &mut Vec<RepoPick>, seen: &mut BTreeSet<PathBuf>| {
@@ -1760,22 +1804,41 @@ impl App {
             } else {
                 RepoSource::Unregistered
             };
+            let hidden = hidden.contains(&path);
             picks.push(RepoPick {
                 name,
                 path,
                 kind,
                 source,
+                hidden,
             });
         };
-        for (name, path) in repo_registry(config) {
-            push(name, path, "repo", &mut picks, &mut seen);
+        if let Some(path) = &default_path {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "repo".to_owned());
+            push(name, path.clone(), "repo", &mut picks, &mut seen);
         }
-        // submodules of the default repo — the case a note can't reach
-        if let Some(repo) = &default_path {
+        for (name, path) in &saved {
+            push(name.clone(), path.clone(), "repo", &mut picks, &mut seen);
+        }
+        for (name, path) in &env_pairs {
+            push(name.clone(), path.clone(), "repo", &mut picks, &mut seen);
+        }
+        // initialized submodules of every known repo — work meant for one of
+        // these is the case a dispatch note can't reach
+        let roots: Vec<PathBuf> = picks
+            .iter()
+            .filter_map(|pick| git_toplevel(&pick.path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for root in roots {
             let mut submodules = Command::new("git");
             submodules
                 .arg("-C")
-                .arg(repo)
+                .arg(&root)
                 .args([
                     "config",
                     "--file",
@@ -1789,7 +1852,7 @@ impl App {
                     let Some((_, rel)) = line.split_once(' ') else {
                         continue;
                     };
-                    let path = repo.join(rel.trim());
+                    let path = root.join(rel.trim());
                     if path.join(".git").exists() {
                         let name = path
                             .file_name()
@@ -1853,19 +1916,30 @@ impl App {
                     return Ok(());
                 };
                 match pick.source {
-                    RepoSource::Default => {
-                        self.status = format!("{} is --repo-dir — always available", pick.name);
-                    }
-                    RepoSource::Env => {
-                        self.status = format!(
-                            "{} comes from PLANE_TUI_REPOS — manage it there",
-                            pick.name
-                        );
+                    // default/env entries live elsewhere — the wizard hides
+                    // or re-enables them via a "!" marker in repos.tsv
+                    RepoSource::Default | RepoSource::Env => {
+                        let mut file = read_repos_file();
+                        if pick.hidden {
+                            file.retain(|(name, path)| !(name == "!" && *path == pick.path));
+                            self.status = format!("{} re-enabled as a dispatch target", pick.name);
+                        } else {
+                            file.push(("!".to_owned(), pick.path.clone()));
+                            self.status = format!(
+                                "{} hidden — r in the dispatch menu skips it now",
+                                pick.name
+                            );
+                        }
+                        let result = write_repos_file(&file);
+                        self.soft(result);
+                        if let Some(picks) = &mut self.repo_wizard {
+                            picks[sel].hidden = !pick.hidden;
+                        }
                     }
                     RepoSource::Saved => {
-                        let mut saved = saved_repos();
-                        saved.retain(|(_, path)| *path != pick.path);
-                        let result = save_repos(&saved);
+                        let mut file = read_repos_file();
+                        file.retain(|(name, path)| name == "!" || *path != pick.path);
+                        let result = write_repos_file(&file);
                         self.soft(result);
                         if let Some(picks) = &mut self.repo_wizard {
                             picks[sel].source = RepoSource::Unregistered;
@@ -1873,19 +1947,20 @@ impl App {
                         self.status = format!("{} removed from dispatch targets", pick.name);
                     }
                     RepoSource::Unregistered => {
-                        let mut saved = saved_repos();
+                        let mut file = read_repos_file();
                         let mut name = pick.name.clone();
-                        let taken = |name: &str, saved: &[(String, PathBuf)]| {
-                            saved.iter().any(|(have, _)| have == name)
+                        let taken = |name: &str, file: &[(String, PathBuf)]| {
+                            file.iter()
+                                .any(|(have, _)| have != "!" && have == name)
                                 || env_repos().iter().any(|(have, _)| have == name)
                         };
                         let mut n = 2;
-                        while taken(&name, &saved) {
+                        while taken(&name, &file) {
                             name = format!("{}-{n}", pick.name);
                             n += 1;
                         }
-                        saved.push((name.clone(), pick.path.clone()));
-                        let result = save_repos(&saved);
+                        file.push((name.clone(), pick.path.clone()));
+                        let result = write_repos_file(&file);
                         self.soft(result);
                         if let Some(picks) = &mut self.repo_wizard {
                             picks[sel].source = RepoSource::Saved;
@@ -1917,15 +1992,18 @@ impl App {
         let start = self.repo_wizard_sel.saturating_sub(visible.saturating_sub(1));
         for (position, pick) in picks.iter().enumerate().skip(start).take(visible) {
             let selected = position == self.repo_wizard_sel;
-            let mark = match pick.source {
-                RepoSource::Unregistered => "[ ]",
-                _ => "[✓]",
+            let mark = if pick.source == RepoSource::Unregistered || pick.hidden {
+                "[ ]"
+            } else {
+                "[✓]"
             };
-            let origin = match pick.source {
-                RepoSource::Default => "--repo-dir",
-                RepoSource::Env => "env",
-                RepoSource::Saved => "saved",
-                RepoSource::Unregistered => "",
+            let origin = match (pick.source, pick.hidden) {
+                (RepoSource::Default, true) => "default·off",
+                (RepoSource::Default, false) => "--repo-dir",
+                (RepoSource::Env, true) => "env·off",
+                (RepoSource::Env, false) => "env",
+                (RepoSource::Saved, _) => "saved",
+                (RepoSource::Unregistered, _) => "",
             };
             let text = format!(
                 " {mark} {:<18} {:<9} {:<10} {}",
@@ -2244,6 +2322,19 @@ impl App {
             return;
         };
         let job = self.agent_jobs[index].job.clone();
+        // guard the empty-PR trap: an agent that worked inside a submodule
+        // checkout leaves the job branch itself without commits
+        if !jobs::branch_has_commits(&job) {
+            self.status = format!(
+                "{}: no commits on {} — if the agent worked in a submodule, its branch lives inside {} · not landing",
+                job.item_key,
+                job.branch,
+                job.worktree.display()
+            );
+            self.jobs_open = true;
+            self.force_clear = true;
+            return;
+        }
         let verb = match how {
             'm' => "merging",
             'P' => "pushing + opening PR for",
