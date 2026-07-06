@@ -30,6 +30,9 @@ pti
 - `D`: show/hide the Done board column
 - `m`, `I`, `U`: mark, invert marks, clear marks
 - `e`: edit the selected item title, description (opens `$EDITOR`), or due date
+- `d`: dispatch a coding agent on the selected item (agent cockpit — see below)
+- `J`: fleet view for dispatched agents (`t` deep dive, `c` cancel, `r` retry,
+  `l` land, `x` discard, `esc` close)
 - `a`: craft a direct task brief for the selected item (also `:agent`)
 - `A`: same, then post the prompt back to the Plane item as a comment (also `:agent post`)
 - `esc`: cancel a running agent-prompt generation
@@ -114,3 +117,37 @@ Configuration (flag / env var):
   file that replaces the embedded business context (e.g. a fresh `.md` export
   of the business dossier).
 - `PLANE_TUI_PROMPT_DIR`: override the directory prompts are saved to.
+
+## Agent cockpit (`d` / `J`) — phase 1
+
+`d` on a work item dispatches a coding agent to actually do the work (distinct
+from `a`, which only writes a brief). Pick the executor (`1`/`enter` codex,
+`2` claude), optionally type a note that is appended to the brief, and the
+cockpit:
+
+1. creates a git worktree `$PLANE_TUI_WORKTREE_ROOT/<repo>-<key>` (default
+   `~/projects/worktrees`) on branch `<key>-<slug>`, off `--repo-dir`'s HEAD;
+2. writes the prompt (item fields + description + business context + working
+   rules: commit but never push; stop and ask with a leading `QUESTION:` line
+   when blocked) to `~/.local/share/plane-tui/jobs/<id>/prompt.md`;
+3. spawns the agent in a tmux session `pti-<key>-a<n>` — on the tmux server
+   you're already inside when plane-tui runs in tmux (resident deployment),
+   else on a dedicated `tmux -L plane-tui` socket. `remain-on-exit` keeps the
+   pane for post-mortems; `pipe-pane` mirrors output to `log.txt`;
+4. moves the item to In Progress and shows a live ⚑ badge on its card.
+
+Jobs are files plus tmux sessions: quitting plane-tui does not touch them, and
+the next launch re-attaches from `jobs/`. On success the agent's final message
+is posted back to the Plane item as a comment (retried in the background) and
+the job lands in REVIEW; a result starting with `QUESTION:` shows as `?`
+instead. In the fleet (`J`): `t` deep-dives into the live pane
+(`switch-client` when resident, else `$PLANE_TUI_TERMINAL_CMD`, default
+`kitty -e {cmd}`, else the attach command is copied), `l` lands (item → Done,
+branch kept, worktree removed — merging/PR stays yours), `x` discards
+(worktree and branch deleted), `r` retries, `c` cancels.
+
+Phase-1 limits (by design): one agent at a time, no feedback-requeue yet, and
+landing never merges for you. Extra env vars: `PLANE_TUI_WORKTREE_ROOT`,
+`PLANE_TUI_TERMINAL_CMD`, `PLANE_TUI_CLAUDE_PERM` (executor permission mode,
+default `acceptEdits`; set `bypassPermissions` if the agent should run tests
+unattended in its disposable worktree).
