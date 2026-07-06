@@ -56,8 +56,17 @@ const LIST_DUE_WIDTH: u16 = 7;
 const LIST_UPDATED_WIDTH: u16 = 9;
 const MOUSE_SCROLL_LINES: isize = 3;
 const MAX_COALESCED_NAV_KEYS: usize = 256;
-/// Phase 1 of the agent cockpit: one dispatched agent at a time.
-const AGENT_WIP: usize = 1;
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Concurrent agent cap (PLANE_TUI_AGENT_WIP, default 3); excess jobs queue.
+fn agent_wip() -> usize {
+    env_u64("PLANE_TUI_AGENT_WIP", 3).max(1) as usize
+}
 const BUSINESS_CONTEXT: &str = include_str!("business_context.md");
 const BG: Color = Color::Rgb { r: 9, g: 12, b: 17 };
 const BG_RAISE: Color = Color::Rgb {
@@ -813,6 +822,8 @@ enum MenuMode {
     Edit,
     ConfirmWip,
     Dispatch,
+    Feedback,
+    Land,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -827,6 +838,7 @@ enum InputMode {
     EditTitle,
     EditDue,
     DispatchExtra,
+    FeedbackNote,
 }
 
 impl InputMode {
@@ -948,6 +960,9 @@ struct App {
     jobs_sel: usize,
     dispatch_item: Option<String>,
     dispatch_backend: AgentBackend,
+    feedback_job: Option<String>,
+    feedback_backend: Option<AgentBackend>,
+    land_job: Option<String>,
     post_results: Vec<mpsc::Receiver<(String, std::result::Result<(), String>)>>,
 }
 
@@ -1070,6 +1085,9 @@ impl App {
             jobs_sel: 0,
             dispatch_item: None,
             dispatch_backend: AgentBackend::Codex,
+            feedback_job: None,
+            feedback_backend: None,
+            land_job: None,
             post_results: Vec::new(),
         })
     }
@@ -1571,15 +1589,6 @@ impl App {
             self.status = format!("{key} already has an active job — J opens the fleet");
             return;
         }
-        let running = self
-            .agent_jobs
-            .iter()
-            .filter(|handle| handle.job.status == jobs::JobStatus::Running)
-            .count();
-        if running >= AGENT_WIP {
-            self.status = format!("agent slot busy ({running}/{AGENT_WIP}) — J to check or cancel");
-            return;
-        }
         self.dispatch_item = Some(key);
         self.menu = Some(MenuMode::Dispatch);
         self.force_clear = true;
@@ -1669,30 +1678,219 @@ impl App {
             base_ref,
             tmux_socket: jobs::default_socket(),
             tmux_session: jobs::session_name(&item_key, attempt),
-            status: jobs::JobStatus::Running,
+            status: jobs::JobStatus::Queued,
             created_at: created.to_rfc3339(),
+            started_at: None,
         };
         jobs::save(&dir, &job)?;
         let prompt = self.build_executor_prompt(&item, &extra, &job);
         fs::write(dir.join("prompt.md"), prompt)?;
-        let permission_mode =
-            std::env::var("PLANE_TUI_CLAUDE_PERM").unwrap_or_else(|_| "acceptEdits".to_owned());
-        jobs::spawn(&job, &dir, &permission_mode)?;
-        self.agent_jobs.push(jobs::JobHandle {
-            dir,
-            job,
-            log_offset: 0,
-            tail: Vec::new(),
-            diff_stat: None,
-        });
+        self.agent_jobs.push(jobs::JobHandle::new(dir, job));
+        let index = self.agent_jobs.len() - 1;
+        if self.running_agents() < agent_wip() {
+            self.spawn_agent_job(index)?;
+            self.status = format!("{item_key} dispatched → {backend} on {branch} · J fleet");
+        } else {
+            self.status = format!(
+                "{item_key} queued ({}/{} agents busy) — starts when a slot frees",
+                self.running_agents(),
+                agent_wip()
+            );
+        }
         if item.state != StateKind::Started && item.state != StateKind::Done {
             let result =
                 self.with_single_target(&item_key, |app| app.apply_state(StateKind::Started));
             self.soft(result);
         }
-        self.status = format!("{item_key} dispatched → {backend} on {branch} · J fleet");
         self.force_clear = true;
         Ok(())
+    }
+
+    fn running_agents(&self) -> usize {
+        self.agent_jobs
+            .iter()
+            .filter(|handle| handle.job.status == jobs::JobStatus::Running)
+            .count()
+    }
+
+    fn job_index_by_id(&self, id: &str) -> Option<usize> {
+        self.agent_jobs.iter().position(|handle| handle.job.id == id)
+    }
+
+    /// (Re)start one job's agent: fresh attempt files, fresh timestamps.
+    fn spawn_agent_job(&mut self, index: usize) -> Result<()> {
+        let permission_mode =
+            std::env::var("PLANE_TUI_CLAUDE_PERM").unwrap_or_else(|_| "acceptEdits".to_owned());
+        let handle = &mut self.agent_jobs[index];
+        jobs::reset_attempt_files(&handle.dir);
+        handle.job.started_at = Some(Utc::now().to_rfc3339());
+        handle.last_activity = Some(Instant::now());
+        handle.stalled = false;
+        match jobs::spawn(&handle.job, &handle.dir, &permission_mode) {
+            Ok(()) => {
+                handle.job.status = jobs::JobStatus::Running;
+                let _ = jobs::save(&handle.dir, &handle.job);
+                Ok(())
+            }
+            Err(err) => {
+                handle.job.status = jobs::JobStatus::Failed;
+                handle.tail.push(format!("spawn failed: {err:#}"));
+                let _ = jobs::save(&handle.dir, &handle.job);
+                Err(err)
+            }
+        }
+    }
+
+    /// `f` on a finished job: thread the note (and previous result) into
+    /// prompt.md, bump the attempt, keep the worktree and its commits.
+    fn requeue_with_feedback(&mut self) -> Result<()> {
+        let Some(job_id) = self.feedback_job.take() else {
+            bail!("no feedback in progress");
+        };
+        let note = self.input.trim().to_owned();
+        let note = if note.is_empty() {
+            "address the previous result and continue".to_owned()
+        } else {
+            note
+        };
+        let Some(index) = self.job_index_by_id(&job_id) else {
+            bail!("job no longer tracked");
+        };
+        let finished_attempt = self.agent_jobs[index].job.attempt;
+        jobs::append_feedback(&self.agent_jobs[index].dir, finished_attempt, &note)?;
+        let switched = self.feedback_backend.take();
+        {
+            let handle = &mut self.agent_jobs[index];
+            jobs::kill_session(&handle.job);
+            handle.job.attempt += 1;
+            handle.job.tmux_session =
+                jobs::session_name(&handle.job.item_key, handle.job.attempt);
+            handle.diff_stat = None;
+            handle
+                .tail
+                .push(format!("── attempt {} · feedback given ──", handle.job.attempt));
+        }
+        if let Some(backend) = switched {
+            let (backend, model, effort) = match backend {
+                AgentBackend::Codex => ("codex".to_owned(), "gpt-5.5".to_owned(), String::new()),
+                AgentBackend::Claude => (
+                    "claude".to_owned(),
+                    self.client.config.claude_model.clone(),
+                    self.client.config.claude_effort.clone(),
+                ),
+            };
+            let handle = &mut self.agent_jobs[index];
+            handle.job.backend = backend;
+            handle.job.model = model;
+            handle.job.effort = effort;
+        }
+        let key = self.agent_jobs[index].job.item_key.clone();
+        if self.running_agents() < agent_wip() {
+            self.spawn_agent_job(index)?;
+            self.status = format!(
+                "{key} requeued with feedback — attempt {} running",
+                self.agent_jobs[index].job.attempt
+            );
+        } else {
+            self.agent_jobs[index].job.status = jobs::JobStatus::Queued;
+            let _ = jobs::save(&self.agent_jobs[index].dir, &self.agent_jobs[index].job);
+            self.status = format!("{key} queued with feedback — starts when a slot frees");
+        }
+        self.jobs_open = true;
+        self.force_clear = true;
+        Ok(())
+    }
+
+    /// The land menu's verdict: m merge · P push + PR · b push only.
+    fn land_selected(&mut self, how: char) {
+        let Some(job_id) = self.land_job.take() else {
+            return;
+        };
+        let Some(index) = self.job_index_by_id(&job_id) else {
+            return;
+        };
+        let job = self.agent_jobs[index].job.clone();
+        let verb = match how {
+            'm' => "merging",
+            'P' => "pushing + opening PR for",
+            _ => "pushing",
+        };
+        let job_for_thread = job.clone();
+        let outcome = self.run_busy(format!("{verb} {}", job.branch), move |_| match how {
+            'm' => jobs::land_merge(&job_for_thread).map(|target| format!("merged into {target}")),
+            'P' => jobs::land_push(&job_for_thread, true),
+            _ => jobs::land_push(&job_for_thread, false),
+        });
+        match outcome {
+            Ok(note) => {
+                self.agent_jobs[index].job.status = jobs::JobStatus::Landed;
+                let _ = jobs::save(&self.agent_jobs[index].dir, &self.agent_jobs[index].job);
+                let item_key = job.item_key.clone();
+                let result =
+                    self.with_single_target(&item_key, |app| app.apply_state(StateKind::Done));
+                self.soft(result);
+                self.post_plain_comment(
+                    &job,
+                    &format!("plane-tui: landed — {note} (branch {})", job.branch),
+                );
+                let cleanup = if how == 'm' {
+                    "branch + worktree removed"
+                } else {
+                    "worktree kept until the branch merges"
+                };
+                self.status = format!("{} landed · {note} · {cleanup}", job.item_key);
+            }
+            Err(err) => {
+                self.status = format!("land failed: {err:#} — f can send the agent back");
+            }
+        }
+        self.jobs_open = true;
+        self.force_clear = true;
+    }
+
+    /// `enter` on a reviewable job: full diff in git's own pager, TUI suspended.
+    fn view_diff_in_pager(&mut self, job: &jobs::Job) -> Result<()> {
+        disable_raw_mode()?;
+        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen, Show)?;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&job.worktree)
+            .args(["diff", &format!("{}..HEAD", job.base_ref)])
+            .status();
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
+        enable_raw_mode()?;
+        self.force_clear = true;
+        status.context("running git diff (pager)")?;
+        Ok(())
+    }
+
+    /// Background comment post with retries — plain-paragraph variant used
+    /// for landing notes; the TUI stays the only Plane writer.
+    fn post_plain_comment(&mut self, job: &jobs::Job, text: &str) {
+        let client = self.client.clone();
+        let project_id = job.project_id.clone();
+        let item_id = job.item_id.clone();
+        let key = job.item_key.clone();
+        let body_text = text.to_owned();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let body = json!({
+                "comment_html": format!("<p>{}</p>", escape_html(&body_text)),
+            });
+            let mut outcome = Err("not attempted".to_owned());
+            for attempt in 0u32..3 {
+                match client.create_comment(&project_id, &item_id, body.clone()) {
+                    Ok(_) => {
+                        outcome = Ok(());
+                        break;
+                    }
+                    Err(err) => outcome = Err(format!("{err:#}")),
+                }
+                thread::sleep(Duration::from_secs(2u64 << attempt));
+            }
+            let _ = tx.send((key, outcome));
+        });
+        self.post_results.push(rx);
     }
 
     fn executor_business_context(&self) -> String {
@@ -1753,6 +1951,71 @@ impl App {
         }
         for index in transitions {
             self.on_job_transition(index);
+        }
+        // start queued jobs as slots free
+        while self.running_agents() < agent_wip() {
+            let Some(next) = self
+                .agent_jobs
+                .iter()
+                .position(|handle| handle.job.status == jobs::JobStatus::Queued)
+            else {
+                break;
+            };
+            let key = self.agent_jobs[next].job.item_key.clone();
+            changed = true;
+            match self.spawn_agent_job(next) {
+                Ok(()) => self.status = format!("▶ {key} started — agent slot freed"),
+                Err(err) => self.status = format!("could not start {key}: {err:#}"),
+            }
+        }
+        // stall + hard-timeout supervision (spec §8 failure modes)
+        let stall_min = env_u64("PLANE_TUI_STALL_MIN", 8);
+        let timeout_min = env_u64("PLANE_TUI_JOB_TIMEOUT_MIN", 45);
+        let mut supervision_note = None;
+        for handle in &mut self.agent_jobs {
+            if handle.job.status != jobs::JobStatus::Running {
+                continue;
+            }
+            let timed_out = timeout_min > 0
+                && handle
+                    .job
+                    .started_at
+                    .as_deref()
+                    .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                    .map(|started| {
+                        Utc::now().signed_duration_since(started)
+                            > chrono::Duration::minutes(timeout_min as i64)
+                    })
+                    .unwrap_or(false);
+            if timed_out {
+                jobs::kill_session(&handle.job);
+                handle.job.status = jobs::JobStatus::Failed;
+                handle
+                    .tail
+                    .push(format!("── hard timeout after {timeout_min}m — cancelled ──"));
+                let _ = jobs::save(&handle.dir, &handle.job);
+                supervision_note =
+                    Some(format!("✗ {} timed out after {timeout_min}m", handle.job.item_key));
+                changed = true;
+                continue;
+            }
+            if stall_min > 0
+                && !handle.stalled
+                && handle
+                    .last_activity
+                    .map(|at| at.elapsed() > Duration::from_secs(stall_min * 60))
+                    .unwrap_or(false)
+            {
+                handle.stalled = true;
+                supervision_note = Some(format!(
+                    "⚠ {} quiet for {stall_min}m — J then t to look, c to cancel",
+                    handle.job.item_key
+                ));
+                changed = true;
+            }
+        }
+        if let Some(note) = supervision_note {
+            self.status = note;
         }
         let mut posted = Vec::new();
         self.post_results.retain(|rx| match rx.try_recv() {
@@ -1854,6 +2117,8 @@ impl App {
             .rev()
             .find(|handle| handle.job.item_key == key && handle.job.status.is_active())?;
         Some(match handle.job.status {
+            jobs::JobStatus::Queued => ("●", DIMMER),
+            jobs::JobStatus::Running if handle.stalled => ("⚠", AMBER),
             jobs::JobStatus::Running => ("⚑", GREEN),
             jobs::JobStatus::Review => ("⚑", AMBER),
             jobs::JobStatus::Question => ("?", AMBER),
@@ -1871,8 +2136,9 @@ impl App {
                 jobs::JobStatus::Failed => 2,
                 jobs::JobStatus::Orphaned => 3,
                 jobs::JobStatus::Running => 4,
-                jobs::JobStatus::Landed => 5,
-                jobs::JobStatus::Discarded => 6,
+                jobs::JobStatus::Queued => 5,
+                jobs::JobStatus::Landed => 6,
+                jobs::JobStatus::Discarded => 7,
             }
         }
         let mut order: Vec<usize> = (0..self.agent_jobs.len()).collect();
@@ -1918,15 +2184,59 @@ impl App {
                     }
                 }
             }
+            KeyCode::Enter => {
+                if let Some(&index) = order.get(self.jobs_sel) {
+                    let job = self.agent_jobs[index].job.clone();
+                    if matches!(
+                        job.status,
+                        jobs::JobStatus::Review | jobs::JobStatus::Question
+                    ) {
+                        let result = self.view_diff_in_pager(&job);
+                        self.soft(result);
+                    }
+                }
+            }
+            KeyCode::Char('f') => {
+                if let Some(&index) = order.get(self.jobs_sel) {
+                    let job = self.agent_jobs[index].job.clone();
+                    if matches!(
+                        job.status,
+                        jobs::JobStatus::Review
+                            | jobs::JobStatus::Question
+                            | jobs::JobStatus::Failed
+                            | jobs::JobStatus::Orphaned
+                    ) {
+                        self.feedback_job = Some(job.id.clone());
+                        self.feedback_backend = None;
+                        self.jobs_open = false;
+                        self.menu = Some(MenuMode::Feedback);
+                    }
+                }
+            }
             KeyCode::Char('c') => {
                 if let Some(&index) = order.get(self.jobs_sel) {
-                    let handle = &mut self.agent_jobs[index];
-                    if handle.job.status == jobs::JobStatus::Running {
+                    let job_status = self.agent_jobs[index].job.status;
+                    if job_status == jobs::JobStatus::Running {
+                        let handle = &mut self.agent_jobs[index];
                         jobs::kill_session(&handle.job);
                         handle.job.status = jobs::JobStatus::Failed;
                         handle.tail.push("── cancelled by you ──".to_owned());
                         let _ = jobs::save(&handle.dir, &handle.job);
                         self.status = format!("{} cancelled — r retries", handle.job.item_key);
+                    } else if job_status == jobs::JobStatus::Queued {
+                        let job = self.agent_jobs[index].job.clone();
+                        match jobs::discard(&job) {
+                            Ok(()) => {
+                                self.agent_jobs[index].job.status = jobs::JobStatus::Discarded;
+                                let _ = jobs::save(
+                                    &self.agent_jobs[index].dir,
+                                    &self.agent_jobs[index].job,
+                                );
+                                self.status =
+                                    format!("{} removed from the queue", job.item_key);
+                            }
+                            Err(err) => self.status = format!("cancel failed: {err:#}"),
+                        }
                     }
                 }
             }
@@ -1970,25 +2280,9 @@ impl App {
                         job.status,
                         jobs::JobStatus::Review | jobs::JobStatus::Question
                     ) {
-                        match jobs::accept(&job) {
-                            Ok(()) => {
-                                self.agent_jobs[index].job.status = jobs::JobStatus::Landed;
-                                let _ = jobs::save(
-                                    &self.agent_jobs[index].dir,
-                                    &self.agent_jobs[index].job,
-                                );
-                                let item_key = job.item_key.clone();
-                                let result = self.with_single_target(&item_key, |app| {
-                                    app.apply_state(StateKind::Done)
-                                });
-                                self.soft(result);
-                                self.status = format!(
-                                    "{} landed · branch {} kept in the repo · worktree removed",
-                                    job.item_key, job.branch
-                                );
-                            }
-                            Err(err) => self.status = format!("land failed: {err:#}"),
-                        }
+                        self.land_job = Some(job.id.clone());
+                        self.jobs_open = false;
+                        self.menu = Some(MenuMode::Land);
                     }
                 }
             }
@@ -2001,6 +2295,7 @@ impl App {
                             | jobs::JobStatus::Question
                             | jobs::JobStatus::Failed
                             | jobs::JobStatus::Orphaned
+                            | jobs::JobStatus::Queued
                     ) {
                         match jobs::discard(&job) {
                             Ok(()) => {
@@ -2043,13 +2338,23 @@ impl App {
             .iter()
             .filter(|handle| handle.job.status == jobs::JobStatus::Running)
             .count();
+        let queued = self
+            .agent_jobs
+            .iter()
+            .filter(|handle| handle.job.status == jobs::JobStatus::Queued)
+            .count();
+        let queued_note = if queued > 0 {
+            format!(" · {queued} queued")
+        } else {
+            String::new()
+        };
         draw_modal_shell(
             out,
             x,
             y,
             box_width,
             box_height,
-            &format!("agents · fleet · {running}/{AGENT_WIP} running"),
+            &format!("agents · fleet · {running}/{} running{queued_note}", agent_wip()),
         )?;
         let inner_x = x + 2;
         let inner_width = box_width.saturating_sub(4);
@@ -2072,14 +2377,21 @@ impl App {
             let handle = &self.agent_jobs[index];
             let job = &handle.job;
             let selected = position == self.jobs_sel;
-            let glyph = match job.status {
-                jobs::JobStatus::Running => FRAMES[self.frame],
-                jobs::JobStatus::Review => "⚑",
-                jobs::JobStatus::Question => "?",
-                jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => "✗",
-                jobs::JobStatus::Landed => "✓",
-                jobs::JobStatus::Discarded => "·",
+            let stalled = handle.stalled && job.status == jobs::JobStatus::Running;
+            let glyph = if stalled {
+                "⚠"
+            } else {
+                match job.status {
+                    jobs::JobStatus::Queued => "●",
+                    jobs::JobStatus::Running => FRAMES[self.frame],
+                    jobs::JobStatus::Review => "⚑",
+                    jobs::JobStatus::Question => "?",
+                    jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => "✗",
+                    jobs::JobStatus::Landed => "✓",
+                    jobs::JobStatus::Discarded => "·",
+                }
             };
+            let label = if stalled { "STALLED?" } else { job.status.label() };
             let tail_hint = handle
                 .tail
                 .last()
@@ -2087,7 +2399,7 @@ impl App {
                 .unwrap_or_default();
             let text = format!(
                 " {glyph} {:<9} {:<9} {:<15} a{} {}",
-                job.status.label(),
+                label,
                 job.item_key,
                 format!("{}·{}", job.backend, truncate(&job.model, 9)),
                 job.attempt,
@@ -2096,11 +2408,15 @@ impl App {
             let (fg, bg) = if selected {
                 (Color::Black, Some(PAPER))
             } else {
-                let color = match job.status {
-                    jobs::JobStatus::Running | jobs::JobStatus::Landed => GREEN,
-                    jobs::JobStatus::Review | jobs::JobStatus::Question => AMBER,
-                    jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => RED,
-                    jobs::JobStatus::Discarded => DIMMER,
+                let color = if stalled {
+                    AMBER
+                } else {
+                    match job.status {
+                        jobs::JobStatus::Running | jobs::JobStatus::Landed => GREEN,
+                        jobs::JobStatus::Review | jobs::JobStatus::Question => AMBER,
+                        jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => RED,
+                        jobs::JobStatus::Queued | jobs::JobStatus::Discarded => DIMMER,
+                    }
                 };
                 (color, Some(BG))
             };
@@ -2159,7 +2475,7 @@ impl App {
             inner_x,
             y + box_height.saturating_sub(2),
             inner_width,
-            "j/k select · t deep dive · c cancel · r retry · l land · x discard · esc close",
+            "j/k select · enter diff · t dive · f feedback · l land · c cancel · r retry · x discard · esc",
             DIM,
             Some(BG),
             false,
@@ -2587,8 +2903,13 @@ impl App {
 
     fn handle_menu_key(&mut self, menu: MenuMode, key: KeyEvent) -> Result<()> {
         if matches!(key.code, KeyCode::Esc) {
+            if matches!(self.menu, Some(MenuMode::Feedback) | Some(MenuMode::Land)) {
+                self.jobs_open = true; // back to the fleet, nothing done
+            }
             self.menu = None;
             self.dispatch_item = None;
+            self.feedback_job = None;
+            self.land_job = None;
             self.force_clear = true;
             return Ok(());
         }
@@ -2635,6 +2956,35 @@ impl App {
                     self.input.clear();
                     self.input_cursor = 0;
                     self.force_clear = true;
+                }
+            }
+            MenuMode::Feedback => {
+                let choice = match key.code {
+                    KeyCode::Char('1') | KeyCode::Enter => Some(None),
+                    KeyCode::Char('2') => Some(Some(AgentBackend::Codex)),
+                    KeyCode::Char('3') => Some(Some(AgentBackend::Claude)),
+                    _ => None,
+                };
+                if let Some(backend) = choice {
+                    self.feedback_backend = backend;
+                    self.menu = None;
+                    self.input_mode = Some(InputMode::FeedbackNote);
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.force_clear = true;
+                }
+            }
+            MenuMode::Land => {
+                let how = match key.code {
+                    KeyCode::Char('m') => Some('m'),
+                    KeyCode::Char('P') => Some('P'),
+                    KeyCode::Char('b') => Some('b'),
+                    _ => None,
+                };
+                if let Some(how) = how {
+                    self.menu = None;
+                    self.force_clear = true;
+                    self.land_selected(how);
                 }
             }
             MenuMode::ConfirmWip => match key.code {
@@ -2837,6 +3187,11 @@ impl App {
                     }
                     InputMode::DispatchExtra => {
                         let result = self.dispatch_job();
+                        self.soft(result);
+                        false
+                    }
+                    InputMode::FeedbackNote => {
+                        let result = self.requeue_with_feedback();
                         self.soft(result);
                         false
                     }
@@ -5224,6 +5579,29 @@ impl App {
                         self.dispatch_item.as_deref().unwrap_or("?"),
                         self.client.config.claude_model
                     ),
+                    MenuMode::Feedback => {
+                        let (key, backend) = self
+                            .feedback_job
+                            .as_deref()
+                            .and_then(|id| self.job_index_by_id(id))
+                            .map(|index| {
+                                let job = &self.agent_jobs[index].job;
+                                (job.item_key.clone(), job.backend.clone())
+                            })
+                            .unwrap_or_else(|| ("?".to_owned(), "?".to_owned()));
+                        format!(
+                            "feedback {key} → executor: 1/enter keep ({backend})   2 codex   3 claude · {}   esc cancel",
+                            self.client.config.claude_model
+                        )
+                    }
+                    MenuMode::Land => format!(
+                        "land {} → m merge into repo branch   P push + PR (gh)   b push only   esc cancel",
+                        self.land_job
+                            .as_deref()
+                            .and_then(|id| self.job_index_by_id(id))
+                            .map(|index| self.agent_jobs[index].job.item_key.clone())
+                            .unwrap_or_else(|| "?".to_owned())
+                    ),
                 };
                 if menu != MenuMode::Label {
                     let menu_bg = if menu == MenuMode::ConfirmWip {
@@ -5362,6 +5740,7 @@ impl App {
                 InputMode::EditTitle => "edit title → ",
                 InputMode::EditDue => "edit due → ",
                 InputMode::DispatchExtra => "dispatch note (optional, appended to the brief) → ",
+                InputMode::FeedbackNote => "feedback for the agent → ",
             };
             input_prompt(prefix, &self.input, self.input_cursor)
         } else {

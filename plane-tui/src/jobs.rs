@@ -17,6 +17,7 @@ pub const TAIL_LINES: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
+    Queued,
     Running,
     Review,
     Question,
@@ -33,6 +34,7 @@ impl JobStatus {
 
     pub fn label(self) -> &'static str {
         match self {
+            JobStatus::Queued => "QUEUED",
             JobStatus::Running => "RUNNING",
             JobStatus::Review => "REVIEW",
             JobStatus::Question => "QUESTION",
@@ -65,6 +67,9 @@ pub struct Job {
     pub tmux_session: String,
     pub status: JobStatus,
     pub created_at: String,
+    /// RFC3339 of the most recent spawn (set per attempt); None while queued.
+    #[serde(default)]
+    pub started_at: Option<String>,
 }
 
 /// Runtime view of a job: the serialized Job plus tailing state.
@@ -75,6 +80,23 @@ pub struct JobHandle {
     pub tail: Vec<String>,
     /// Cached at the Running→Review transition so drawing never shells out.
     pub diff_stat: Option<String>,
+    /// Last time the log grew (baselined at spawn/scan) — stall detection.
+    pub last_activity: Option<std::time::Instant>,
+    pub stalled: bool,
+}
+
+impl JobHandle {
+    pub fn new(dir: PathBuf, job: Job) -> Self {
+        Self {
+            dir,
+            job,
+            log_offset: 0,
+            tail: Vec::new(),
+            diff_stat: None,
+            last_activity: None,
+            stalled: false,
+        }
+    }
 }
 
 pub fn jobs_root(data_dir: &Path) -> PathBuf {
@@ -158,13 +180,7 @@ pub fn scan(root: &Path) -> Vec<JobHandle> {
         .filter_map(|entry| {
             let dir = entry.path();
             let job = load(&dir).ok()?;
-            let mut handle = JobHandle {
-                dir,
-                job,
-                log_offset: 0,
-                tail: Vec::new(),
-                diff_stat: None,
-            };
+            let mut handle = JobHandle::new(dir, job);
             pump(&mut handle); // replay log into the tail, settle status
             if matches!(handle.job.status, JobStatus::Review | JobStatus::Question) {
                 handle.diff_stat = Some(diff_stat(&handle.job));
@@ -226,7 +242,109 @@ pub fn diff_stat(job: &Job) -> String {
     text
 }
 
-/// Land-lite (phase 1): keep the branch, drop the worktree. Merging/PR stays
+/// Thread reviewer feedback into prompt.md for the next attempt: previous
+/// result + note are appended, so the whole conversation lives in the job dir
+/// and survives backend/model switches (spec v2 §4 — no native resume needed).
+pub fn append_feedback(dir: &Path, finished_attempt: u32, note: &str) -> Result<()> {
+    let result = read_result(dir);
+    let result = if result.trim().is_empty() {
+        "(no result captured)"
+    } else {
+        result.trim()
+    };
+    let mut prompt = fs::read_to_string(dir.join("prompt.md")).unwrap_or_default();
+    prompt.push_str(&format!(
+        "\n\n## attempt {finished_attempt} result\n{result}\n\n## reviewer feedback on attempt {finished_attempt}\n{note}\n\nAddress the feedback. Your previous commits are still in the worktree — build on them.\n"
+    ));
+    fs::write(dir.join("prompt.md"), prompt)?;
+    Ok(())
+}
+
+/// Reset per-attempt files so the monitor doesn't instantly re-settle a
+/// freshly respawned job on the previous attempt's exit code.
+pub fn reset_attempt_files(dir: &Path) {
+    let _ = fs::remove_file(dir.join("exit"));
+    let _ = fs::remove_file(dir.join("result.md"));
+}
+
+/// The repo checkout's current branch — what land `m` merges into.
+pub fn repo_head_branch(repo: &Path) -> Result<String> {
+    let mut head = Command::new("git");
+    head.arg("-C")
+        .arg(repo)
+        .args(["symbolic-ref", "--short", "HEAD"]);
+    run_capture(head).context("repo HEAD branch")
+}
+
+/// Land `m`: rebase the job branch onto the repo's branch (inside the job's
+/// worktree — the main checkout is only touched by the final ff-merge), then
+/// fast-forward the repo and clean up branch + worktree. A conflicting rebase
+/// aborts cleanly and reports, so `f` can send the agent back to resolve it.
+pub fn land_merge(job: &Job) -> Result<String> {
+    let target = repo_head_branch(&job.repo)?;
+    let mut rebase = Command::new("git");
+    rebase
+        .arg("-C")
+        .arg(&job.worktree)
+        .args(["rebase", &target]);
+    if let Err(err) = run_quiet(rebase) {
+        let mut abort = Command::new("git");
+        abort
+            .arg("-C")
+            .arg(&job.worktree)
+            .args(["rebase", "--abort"]);
+        let _ = run_quiet(abort);
+        bail!("rebase onto {target} conflicts — f sends the agent back to resolve ({err})");
+    }
+    let mut merge = Command::new("git");
+    merge
+        .arg("-C")
+        .arg(&job.repo)
+        .args(["merge", "--ff-only", &job.branch]);
+    run_quiet(merge).with_context(|| format!("ff-merge {} into {target}", job.branch))?;
+    kill_session(job);
+    let mut remove = Command::new("git");
+    remove
+        .arg("-C")
+        .arg(&job.repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(&job.worktree);
+    run_quiet(remove).context("git worktree remove")?;
+    let mut delete = Command::new("git");
+    delete
+        .arg("-C")
+        .arg(&job.repo)
+        .args(["branch", "-d", &job.branch]);
+    let _ = run_quiet(delete); // merged, so -d; a failure here is cosmetic
+    Ok(target)
+}
+
+/// Land `b`/`P`: push the branch (worktree kept until the PR merges);
+/// `P` additionally opens a PR via `gh` and returns its URL.
+pub fn land_push(job: &Job, create_pr: bool) -> Result<String> {
+    let mut push = Command::new("git");
+    push.arg("-C")
+        .arg(&job.worktree)
+        .args(["push", "-u", "origin", &job.branch]);
+    run_quiet(push).context("git push")?;
+    if create_pr {
+        let mut pr = Command::new("gh");
+        pr.args(["pr", "create", "--head"])
+            .arg(&job.branch)
+            .arg("--title")
+            .arg(format!("{}: {}", job.item_key, job.title))
+            .arg("--body")
+            .arg(format!(
+                "Agent-dispatched change for {} via plane-tui.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+                job.item_key
+            ))
+            .current_dir(&job.repo);
+        return run_capture(pr).context("gh pr create");
+    }
+    Ok(format!("pushed origin/{}", job.branch))
+}
+
+/// Land-lite: keep the branch, drop the worktree. Merging/PR stays
 /// a human act — agents submit, humans conclude.
 pub fn accept(job: &Job) -> Result<()> {
     kill_session(job);
@@ -383,9 +501,15 @@ pub fn pump(handle: &mut JobHandle) -> bool {
             handle.tail.drain(..excess);
         }
         handle.log_offset = bytes.len();
+        handle.last_activity = Some(std::time::Instant::now());
+        handle.stalled = false;
     }
     if handle.job.status != JobStatus::Running {
         return changed;
+    }
+    if handle.last_activity.is_none() {
+        // baseline for stall detection after a spawn or a TUI restart
+        handle.last_activity = Some(std::time::Instant::now());
     }
     // exit file first: the wrapper writes it and THEN the pane dies, so a
     // pid-first check would misread a just-finished job as orphaned
@@ -539,6 +663,7 @@ mod tests {
             tmux_session: session_name("TM-201", 2),
             status: JobStatus::Review,
             created_at: "2026-07-06T00:00:00Z".into(),
+            started_at: None,
         };
         let dir = std::env::temp_dir().join(format!("pti-job-test-{}", std::process::id()));
         save(&dir, &job).unwrap();
@@ -546,6 +671,99 @@ mod tests {
         assert_eq!(loaded.tmux_session, "pti-tm-201-a2");
         assert_eq!(loaded.status, JobStatus::Review);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn feedback_threads_into_prompt() {
+        let dir = std::env::temp_dir().join(format!("pti-fb-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("prompt.md"), "# TM-9 · original brief\n").unwrap();
+        fs::write(dir.join("result.md"), "QUESTION: renderer or workaround?").unwrap();
+        fs::write(dir.join("exit"), "0").unwrap();
+        append_feedback(&dir, 1, "firmware workaround please").unwrap();
+        reset_attempt_files(&dir);
+        let prompt = fs::read_to_string(dir.join("prompt.md")).unwrap();
+        assert!(prompt.starts_with("# TM-9 · original brief"));
+        assert!(prompt.contains("## attempt 1 result"));
+        assert!(prompt.contains("QUESTION: renderer or workaround?"));
+        assert!(prompt.contains("firmware workaround please"));
+        assert!(!dir.join("exit").exists());
+        assert!(!dir.join("result.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Full `m`-landing on a scratch repo: rebase, ff-merge, branch and
+    /// worktree cleanup — the file the "agent" committed ends up on main.
+    #[test]
+    fn land_merge_fast_forwards_the_repo() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("pti-land-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let commit = |cwd: &Path, msg: &str| {
+            let mut command = Command::new("git");
+            command
+                .arg("-C")
+                .arg(cwd)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", msg]);
+            run_quiet(command).unwrap();
+        };
+        let mut init = Command::new("git");
+        init.arg("init").arg("-q").arg(&repo);
+        run_quiet(init).unwrap();
+        fs::write(repo.join("README.md"), "hello").unwrap();
+        let mut add = Command::new("git");
+        add.arg("-C").arg(&repo).args(["add", "."]);
+        run_quiet(add).unwrap();
+        commit(&repo, "init");
+
+        let worktree = root.join("wt");
+        let base_ref = create_worktree(&repo, &worktree, "tm-2-land").unwrap();
+        fs::write(worktree.join("landed.txt"), "agent work").unwrap();
+        let mut add = Command::new("git");
+        add.arg("-C").arg(&worktree).args(["add", "landed.txt"]);
+        run_quiet(add).unwrap();
+        commit(&worktree, "agent change");
+        // the repo moves on before landing — forces a real rebase
+        fs::write(repo.join("README.md"), "hello, moved on").unwrap();
+        commit(&repo, "mainline moved");
+
+        let job = Job {
+            id: "t".into(),
+            item_key: "TM-2".into(),
+            item_id: String::new(),
+            project_id: String::new(),
+            title: "land test".into(),
+            backend: "claude".into(),
+            model: String::new(),
+            effort: String::new(),
+            attempt: 1,
+            repo: repo.clone(),
+            worktree: worktree.clone(),
+            branch: "tm-2-land".into(),
+            base_ref,
+            tmux_socket: Some("unused".into()),
+            tmux_session: "pti-tm-2-a1".into(),
+            status: JobStatus::Review,
+            created_at: String::new(),
+            started_at: None,
+        };
+        let target = land_merge(&job).unwrap();
+        assert!(!target.is_empty());
+        assert!(repo.join("landed.txt").exists(), "merge should land the file");
+        assert!(!worktree.exists(), "worktree should be removed");
+        let mut branches = Command::new("git");
+        branches
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "tm-2-land"]);
+        assert!(run_capture(branches).unwrap().is_empty(), "branch deleted");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Worktree lifecycle without tmux: branch off a scratch repo, commit as
@@ -621,6 +839,7 @@ mod tests {
             tmux_session: "pti-tm-1-a1".into(),
             status: JobStatus::Review,
             created_at: String::new(),
+            started_at: None,
         };
         assert!(diff_stat(&job).contains("fix.txt"));
         discard(&job).unwrap();
@@ -668,6 +887,7 @@ mod tests {
             tmux_session: session_name("TM-999", 1),
             status: JobStatus::Running,
             created_at: String::new(),
+            started_at: None,
         };
         save(&dir, &job).unwrap();
         spawn_raw(
@@ -684,13 +904,7 @@ mod tests {
         fs::write(dir.join("result.md"), "did the thing").unwrap();
 
         // fresh handle, as after a TUI restart
-        let mut handle = JobHandle {
-            dir: dir.clone(),
-            job: job.clone(),
-            log_offset: 0,
-            tail: Vec::new(),
-            diff_stat: None,
-        };
+        let mut handle = JobHandle::new(dir.clone(), job.clone());
         let deadline = Instant::now() + Duration::from_secs(10);
         while handle.job.status == JobStatus::Running && Instant::now() < deadline {
             pump(&mut handle);

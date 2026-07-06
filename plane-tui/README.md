@@ -118,7 +118,7 @@ Configuration (flag / env var):
   of the business dossier).
 - `PLANE_TUI_PROMPT_DIR`: override the directory prompts are saved to.
 
-## Agent cockpit (`d` / `J`) — phase 1
+## Agent cockpit (`d` / `J`)
 
 `d` on a work item dispatches a coding agent to actually do the work (distinct
 from `a`, which only writes a brief). Pick the executor (`1`/`enter` codex,
@@ -137,17 +137,34 @@ cockpit:
 4. moves the item to In Progress and shows a live ⚑ badge on its card.
 
 Jobs are files plus tmux sessions: quitting plane-tui does not touch them, and
-the next launch re-attaches from `jobs/`. On success the agent's final message
-is posted back to the Plane item as a comment (retried in the background) and
-the job lands in REVIEW; a result starting with `QUESTION:` shows as `?`
-instead. In the fleet (`J`): `t` deep-dives into the live pane
-(`switch-client` when resident, else `$PLANE_TUI_TERMINAL_CMD`, default
-`kitty -e {cmd}`, else the attach command is copied), `l` lands (item → Done,
-branch kept, worktree removed — merging/PR stays yours), `x` discards
-(worktree and branch deleted), `r` retries, `c` cancels.
+the next launch re-attaches from `jobs/`. Up to `PLANE_TUI_AGENT_WIP` agents
+(default 3) run at once; further dispatches queue and start automatically as
+slots free. A running job with no output for `PLANE_TUI_STALL_MIN` minutes
+(default 8) is flagged `⚠ STALLED?`; after `PLANE_TUI_JOB_TIMEOUT_MIN` minutes
+(default 45, `0` disables) it is cancelled and marked failed.
 
-Phase-1 limits (by design): one agent at a time, no feedback-requeue yet, and
-landing never merges for you. Extra env vars: `PLANE_TUI_WORKTREE_ROOT`,
-`PLANE_TUI_TERMINAL_CMD`, `PLANE_TUI_CLAUDE_PERM` (executor permission mode,
-default `acceptEdits`; set `bypassPermissions` if the agent should run tests
-unattended in its disposable worktree).
+On success the agent's final message is posted back to the Plane item as a
+comment (retried in the background) and the job lands in REVIEW; a result
+starting with `QUESTION:` shows as `?` instead. In the fleet (`J`):
+
+- `enter`: full diff in git's pager (TUI suspends; quit the pager to return)
+- `t`: deep dive into the live pane (`switch-client` when resident, else
+  `$PLANE_TUI_TERMINAL_CMD`, default `kitty -e {cmd}`, else the attach
+  command is copied to the clipboard)
+- `f`: feedback → requeue. Pick the executor for the next attempt
+  (`1`/`enter` keep current, `2` codex, `3` claude — one keystroke escalates
+  a cheap attempt to the smart model), then type the note. The previous
+  result plus your note are appended to `prompt.md`, and the same worktree
+  keeps its commits. This is also how you answer a `?` QUESTION.
+- `l`: land menu — `m` rebases the branch onto the repo's current branch,
+  fast-forwards it, and removes branch + worktree (a conflicting rebase
+  aborts cleanly and `f` can send the agent back to resolve it); `P` pushes
+  and opens a PR via `gh`; `b` pushes the branch only. Every path marks the
+  item Done and posts a landing comment.
+- `c`: cancel a running job / remove a queued one · `r`: retry a failure ·
+  `x`: discard (worktree removed, branch deleted)
+
+Other env vars: `PLANE_TUI_WORKTREE_ROOT` (default `~/projects/worktrees`)
+and `PLANE_TUI_CLAUDE_PERM` (executor permission mode, default `acceptEdits`;
+set `bypassPermissions` if the agent should run tests unattended in its
+disposable worktree).
