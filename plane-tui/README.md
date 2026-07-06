@@ -186,7 +186,8 @@ starting with `QUESTION:` shows as `?` instead. In the fleet (`J`):
   and opens a PR via `gh`; `b` pushes the branch only. Every path marks the
   item Done and posts a landing comment.
 - `c`: cancel a running job / remove a queued one · `r`: retry a failure ·
-  `x`: discard (worktree removed, branch deleted)
+  `x`: discard (worktree removed, branch deleted; on a LANDED job, the item is
+  reopened In Progress so you can dispatch it again)
 
 Headless claude runs use `--output-format stream-json`, so the fleet tail
 shows structured verbs (`→ Edit services/upload/queue.py`) instead of raw

@@ -147,9 +147,7 @@ fn scan_skill_root(
         if !seen.insert(name.to_lowercase()) {
             continue;
         }
-        let selected = selected
-            .iter()
-            .any(|have| have.eq_ignore_ascii_case(&name));
+        let selected = selected.iter().any(|have| have.eq_ignore_ascii_case(&name));
         picks.push(SkillPick {
             name,
             description,
@@ -267,7 +265,11 @@ fn git_toplevel(path: &Path) -> Option<PathBuf> {
         return None;
     }
     let top = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if top.is_empty() { None } else { Some(PathBuf::from(top)) }
+    if top.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(top))
+    }
 }
 
 /// Repos agents can be dispatched into: --repo-dir first, then the wizard's
@@ -1910,16 +1912,42 @@ impl App {
         let mut picks = Vec::new();
         let mut seen = BTreeSet::new();
         if let Some(repo) = &repo {
-            scan_skill_root(&repo.join(".claude/skills"), "repo", &selected, &mut picks, &mut seen);
-            scan_skill_root(&repo.join(".codex/skills"), "repo", &selected, &mut picks, &mut seen);
+            scan_skill_root(
+                &repo.join(".claude/skills"),
+                "repo",
+                &selected,
+                &mut picks,
+                &mut seen,
+            );
+            scan_skill_root(
+                &repo.join(".codex/skills"),
+                "repo",
+                &selected,
+                &mut picks,
+                &mut seen,
+            );
         }
         if let Ok(home) = std::env::var("HOME") {
             let home = PathBuf::from(home);
-            scan_skill_root(&home.join(".claude/skills"), "claude", &selected, &mut picks, &mut seen);
-            scan_skill_root(&home.join(".codex/skills"), "codex", &selected, &mut picks, &mut seen);
+            scan_skill_root(
+                &home.join(".claude/skills"),
+                "claude",
+                &selected,
+                &mut picks,
+                &mut seen,
+            );
+            scan_skill_root(
+                &home.join(".codex/skills"),
+                "codex",
+                &selected,
+                &mut picks,
+                &mut seen,
+            );
         }
         if picks.is_empty() {
-            self.status = "no skills found (~/.claude/skills, ~/.codex/skills, <repo>/.claude/skills)".to_owned();
+            self.status =
+                "no skills found (~/.claude/skills, ~/.codex/skills, <repo>/.claude/skills)"
+                    .to_owned();
             return;
         }
         self.skill_wizard = Some(picks);
@@ -1995,7 +2023,9 @@ impl App {
         let inner_width = box_width.saturating_sub(4);
         let mut row = y + 2;
         let visible = box_height.saturating_sub(5) as usize;
-        let start = self.skill_wizard_sel.saturating_sub(visible.saturating_sub(1));
+        let start = self
+            .skill_wizard_sel
+            .saturating_sub(visible.saturating_sub(1));
         for (position, pick) in picks.iter().enumerate().skip(start).take(visible) {
             let selected = position == self.skill_wizard_sel;
             let mark = if pick.selected { "[✓]" } else { "[ ]" };
@@ -2056,7 +2086,11 @@ impl App {
         let hidden = hidden_repo_paths();
         let mut picks: Vec<RepoPick> = Vec::new();
         let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-        let push = |name: String, path: PathBuf, kind: &'static str, picks: &mut Vec<RepoPick>, seen: &mut BTreeSet<PathBuf>| {
+        let push = |name: String,
+                    path: PathBuf,
+                    kind: &'static str,
+                    picks: &mut Vec<RepoPick>,
+                    seen: &mut BTreeSet<PathBuf>| {
             if !seen.insert(path.clone()) {
                 return;
             }
@@ -2132,7 +2166,11 @@ impl App {
         let projects_dir = std::env::var("PLANE_TUI_PROJECTS_DIR")
             .map(|raw| expand_tilde(&raw))
             .ok()
-            .or_else(|| default_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)))
+            .or_else(|| {
+                default_path
+                    .as_ref()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+            })
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
@@ -2215,8 +2253,7 @@ impl App {
                         let mut file = read_repos_file();
                         let mut name = pick.name.clone();
                         let taken = |name: &str, file: &[(String, PathBuf)]| {
-                            file.iter()
-                                .any(|(have, _)| have != "!" && have == name)
+                            file.iter().any(|(have, _)| have != "!" && have == name)
                                 || env_repos().iter().any(|(have, _)| have == name)
                         };
                         let mut n = 2;
@@ -2230,8 +2267,7 @@ impl App {
                         if let Some(picks) = &mut self.repo_wizard {
                             picks[sel].source = RepoSource::Saved;
                         }
-                        self.status =
-                            format!("{name} added — r in the dispatch menu selects it");
+                        self.status = format!("{name} added — r in the dispatch menu selects it");
                     }
                 }
             }
@@ -2254,7 +2290,9 @@ impl App {
         let inner_width = box_width.saturating_sub(4);
         let mut row = y + 2;
         let visible = box_height.saturating_sub(5) as usize;
-        let start = self.repo_wizard_sel.saturating_sub(visible.saturating_sub(1));
+        let start = self
+            .repo_wizard_sel
+            .saturating_sub(visible.saturating_sub(1));
         for (position, pick) in picks.iter().enumerate().skip(start).take(visible) {
             let selected = position == self.repo_wizard_sel;
             let mark = if pick.source == RepoSource::Unregistered || pick.hidden {
@@ -2707,13 +2745,37 @@ impl App {
         let mut seen = BTreeSet::new();
         let registry = repo_registry(&self.client.config);
         for (_, repo) in &registry {
-            scan_skill_root(&repo.join(".claude/skills"), "repo", &[], &mut catalog, &mut seen);
-            scan_skill_root(&repo.join(".codex/skills"), "repo", &[], &mut catalog, &mut seen);
+            scan_skill_root(
+                &repo.join(".claude/skills"),
+                "repo",
+                &[],
+                &mut catalog,
+                &mut seen,
+            );
+            scan_skill_root(
+                &repo.join(".codex/skills"),
+                "repo",
+                &[],
+                &mut catalog,
+                &mut seen,
+            );
         }
         if let Ok(home) = std::env::var("HOME") {
             let home = PathBuf::from(home);
-            scan_skill_root(&home.join(".claude/skills"), "claude", &[], &mut catalog, &mut seen);
-            scan_skill_root(&home.join(".codex/skills"), "codex", &[], &mut catalog, &mut seen);
+            scan_skill_root(
+                &home.join(".claude/skills"),
+                "claude",
+                &[],
+                &mut catalog,
+                &mut seen,
+            );
+            scan_skill_root(
+                &home.join(".codex/skills"),
+                "codex",
+                &[],
+                &mut catalog,
+                &mut seen,
+            );
         }
         let mut lines = String::new();
         for name in skills {
@@ -2777,7 +2839,10 @@ impl App {
         let context = if repo_has_docs && config.context_file.is_none() {
             String::new()
         } else {
-            format!("\n## business context\n{}\n", self.executor_business_context())
+            format!(
+                "\n## business context\n{}\n",
+                self.executor_business_context()
+            )
         };
         format!(
             "# {key} · {title}\n\nstate {state:?} · priority {priority} · labels {labels} · due {due}\nplane: {url}\n\n## task\n{description}\n{reviewer_note}{stance}{skills}{context}{envelope}",
@@ -3339,7 +3404,9 @@ impl App {
                             | jobs::JobStatus::Failed
                             | jobs::JobStatus::Orphaned
                             | jobs::JobStatus::Queued
+                            | jobs::JobStatus::Landed
                     ) {
+                        let was_landed = job.status == jobs::JobStatus::Landed;
                         match jobs::discard(&job) {
                             Ok(()) => {
                                 self.agent_jobs[index].job.status = jobs::JobStatus::Discarded;
@@ -3347,10 +3414,30 @@ impl App {
                                     &self.agent_jobs[index].dir,
                                     &self.agent_jobs[index].job,
                                 );
-                                self.status = format!(
-                                    "{} discarded · branch {} deleted",
-                                    job.item_key, job.branch
-                                );
+                                if was_landed {
+                                    let item_key = job.item_key.clone();
+                                    match self.with_single_target(&item_key, |app| {
+                                        app.apply_state(StateKind::Started)
+                                    }) {
+                                        Ok(()) => {
+                                            self.status = format!(
+                                                "{} landed job discarded · item reopened for redo",
+                                                job.item_key
+                                            );
+                                        }
+                                        Err(err) => {
+                                            self.status = format!(
+                                                "{} discarded locally, but reopen failed: {err:#}",
+                                                job.item_key
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    self.status = format!(
+                                        "{} discarded · branch {} deleted",
+                                        job.item_key, job.branch
+                                    );
+                                }
                             }
                             Err(err) => self.status = format!("discard failed: {err:#}"),
                         }
@@ -4068,8 +4155,7 @@ impl App {
                         self.menu = None;
                         self.dispatch_item = None;
                         self.open_repo_wizard();
-                        self.status =
-                            "repo wizard — press d again after picking".to_owned();
+                        self.status = "repo wizard — press d again after picking".to_owned();
                         None
                     }
                     _ => None,
@@ -6724,9 +6810,21 @@ impl App {
                                 AgentBackend::Codex => "codex",
                                 AgentBackend::Claude => "claude",
                             },
-                            if self.dispatch_interactive { "on" } else { "off" },
-                            if self.dispatch_brief { "fable-5" } else { "env" },
-                            if self.dispatch_explore { "explore" } else { "impl" },
+                            if self.dispatch_interactive {
+                                "on"
+                            } else {
+                                "off"
+                            },
+                            if self.dispatch_brief {
+                                "fable-5"
+                            } else {
+                                "env"
+                            },
+                            if self.dispatch_explore {
+                                "explore"
+                            } else {
+                                "impl"
+                            },
                             self.dispatch_skills.len(),
                             repo_label,
                         )

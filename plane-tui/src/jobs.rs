@@ -425,10 +425,11 @@ pub fn reset_attempt_files(dir: &Path) {
 /// Fails open (true) so a git hiccup can't block landing.
 pub fn branch_has_commits(job: &Job) -> bool {
     let mut count = Command::new("git");
-    count
-        .arg("-C")
-        .arg(&job.worktree)
-        .args(["rev-list", "--count", &format!("{}..HEAD", job.base_ref)]);
+    count.arg("-C").arg(&job.worktree).args([
+        "rev-list",
+        "--count",
+        &format!("{}..HEAD", job.base_ref),
+    ]);
     run_capture(count)
         .map(|out| out.trim() != "0")
         .unwrap_or(true)
@@ -515,6 +516,12 @@ pub fn land_push(job: &Job, create_pr: bool) -> Result<String> {
 /// a human act — agents submit, humans conclude.
 pub fn accept(job: &Job) -> Result<()> {
     kill_session(job);
+    if !job.worktree.exists() {
+        let mut prune = Command::new("git");
+        prune.arg("-C").arg(&job.repo).args(["worktree", "prune"]);
+        let _ = run_quiet(prune);
+        return Ok(());
+    }
     let mut remove = Command::new("git");
     remove
         .arg("-C")
@@ -527,6 +534,15 @@ pub fn accept(job: &Job) -> Result<()> {
 /// Discard: drop the worktree and delete the branch.
 pub fn discard(job: &Job) -> Result<()> {
     accept(job)?;
+    let mut exists = Command::new("git");
+    exists
+        .arg("-C")
+        .arg(&job.repo)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{}", job.branch));
+    if !exists.status().context("git show-ref")?.success() {
+        return Ok(());
+    }
     let mut delete = Command::new("git");
     delete
         .arg("-C")
@@ -551,8 +567,7 @@ fn stream_json_enabled() -> bool {
 /// disposable, and an approval prompt in an unattended pane is a stall.
 /// Set PLANE_TUI_CODEX_SANDBOX=workspace-write to re-tighten.
 fn codex_sandbox() -> String {
-    std::env::var("PLANE_TUI_CODEX_SANDBOX")
-        .unwrap_or_else(|_| "danger-full-access".to_owned())
+    std::env::var("PLANE_TUI_CODEX_SANDBOX").unwrap_or_else(|_| "danger-full-access".to_owned())
 }
 
 fn agent_command(job: &Job, dir: &Path, claude_permission_mode: &str) -> String {
@@ -1221,6 +1236,79 @@ mod tests {
             .arg(&repo)
             .args(["branch", "--list", "tm-2-land"]);
         assert!(run_capture(branches).unwrap().is_empty(), "branch deleted");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A merged landed job may already have had both the worktree and branch
+    /// removed. Discard still needs to succeed so the UI can mark the job
+    /// discarded and reopen the Plane item for another run.
+    #[test]
+    fn discard_tolerates_already_cleaned_landed_job() {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git not installed — skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("pti-discard-landed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut init = Command::new("git");
+        init.arg("init").arg("-q").arg(&repo);
+        run_quiet(init).unwrap();
+        fs::write(repo.join("README.md"), "hello").unwrap();
+        let mut add = Command::new("git");
+        add.arg("-C").arg(&repo).args(["add", "."]);
+        run_quiet(add).unwrap();
+        let mut commit = Command::new("git");
+        commit.arg("-C").arg(&repo).args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        run_quiet(commit).unwrap();
+        let mut branch = Command::new("git");
+        branch.arg("-C").arg(&repo).args(["branch", "tm-3-landed"]);
+        run_quiet(branch).unwrap();
+
+        let job = Job {
+            id: "t".into(),
+            item_key: "TM-3".into(),
+            item_id: String::new(),
+            project_id: String::new(),
+            title: "landed discard".into(),
+            backend: "codex".into(),
+            model: String::new(),
+            effort: String::new(),
+            attempt: 1,
+            repo: repo.clone(),
+            worktree: root.join("missing-wt"),
+            branch: "tm-3-landed".into(),
+            base_ref: String::new(),
+            tmux_socket: Some("unused".into()),
+            tmux_session: "pti-tm-3-a1".into(),
+            status: JobStatus::Landed,
+            created_at: String::new(),
+            started_at: None,
+            mode: JobMode::Headless,
+            stance: JobStance::Implement,
+            skills: Vec::new(),
+        };
+
+        discard(&job).unwrap();
+        let mut branches = Command::new("git");
+        branches
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "tm-3-landed"]);
+        assert!(
+            run_capture(branches).unwrap().is_empty(),
+            "leftover branch should be deleted"
+        );
+        discard(&job).unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 
