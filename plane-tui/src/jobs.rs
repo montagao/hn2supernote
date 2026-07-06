@@ -204,9 +204,9 @@ pub fn scan(root: &Path) -> Vec<JobHandle> {
                     handle.job.status = JobStatus::Queued;
                 } else {
                     handle.job.status = JobStatus::Failed;
-                    handle
-                        .tail
-                        .push("brief was lost when the TUI exited — x discard, then d again".to_owned());
+                    handle.tail.push(
+                        "brief was lost when the TUI exited — x discard, then d again".to_owned(),
+                    );
                 }
                 let _ = save(&handle.dir, &handle.job);
             }
@@ -581,8 +581,7 @@ pub fn format_stream_event(line: &str) -> StreamLine {
             StreamLine::Show(format!("· session started — {model}"))
         }
         Some("assistant") => {
-            let Some(content) = event.pointer("/message/content").and_then(Value::as_array)
-            else {
+            let Some(content) = event.pointer("/message/content").and_then(Value::as_array) else {
                 return StreamLine::Skip;
             };
             for block in content {
@@ -601,8 +600,7 @@ pub fn format_stream_event(line: &str) -> StreamLine {
                     }
                     Some("text") => {
                         let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-                        let Some(first) = text.lines().find(|line| !line.trim().is_empty())
-                        else {
+                        let Some(first) = text.lines().find(|line| !line.trim().is_empty()) else {
                             return StreamLine::Skip;
                         };
                         return StreamLine::Show(clip(first.trim(), 90));
@@ -931,10 +929,15 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         let commit = |cwd: &Path, msg: &str| {
             let mut command = Command::new("git");
-            command
-                .arg("-C")
-                .arg(cwd)
-                .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", msg]);
+            command.arg("-C").arg(cwd).args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qam",
+                msg,
+            ]);
             run_quiet(command).unwrap();
         };
         let mut init = Command::new("git");
@@ -980,7 +983,10 @@ mod tests {
         };
         let target = land_merge(&job).unwrap();
         assert!(!target.is_empty());
-        assert!(repo.join("landed.txt").exists(), "merge should land the file");
+        assert!(
+            repo.join("landed.txt").exists(),
+            "merge should land the file"
+        );
         assert!(!worktree.exists(), "worktree should be removed");
         let mut branches = Command::new("git");
         branches

@@ -1759,17 +1759,17 @@ impl App {
         let index = self.agent_jobs.len() - 1;
         if brief_stage {
             self.generate_dispatch_brief(&item, &extra, job_id);
-            self.status =
-                format!("{item_key} briefing with {} — executes when the brief is ready",
-                    self.client.config.agent_backend.name());
+            self.status = format!(
+                "{item_key} briefing with {} — executes when the brief is ready",
+                self.client.config.agent_backend.name()
+            );
         } else if self.running_agents() < agent_wip() {
             self.spawn_agent_job(index)?;
             if interactive {
                 let job = self.agent_jobs[index].job.clone();
                 self.deep_dive_job(&job);
             } else {
-                self.status =
-                    format!("{item_key} dispatched → {backend} on {branch} · J fleet");
+                self.status = format!("{item_key} dispatched → {backend} on {branch} · J fleet");
             }
         } else {
             self.status = format!(
@@ -1795,7 +1795,9 @@ impl App {
     }
 
     fn job_index_by_id(&self, id: &str) -> Option<usize> {
-        self.agent_jobs.iter().position(|handle| handle.job.id == id)
+        self.agent_jobs
+            .iter()
+            .position(|handle| handle.job.id == id)
     }
 
     /// (Re)start one job's agent: fresh attempt files, fresh timestamps.
@@ -1844,12 +1846,12 @@ impl App {
             let handle = &mut self.agent_jobs[index];
             jobs::kill_session(&handle.job);
             handle.job.attempt += 1;
-            handle.job.tmux_session =
-                jobs::session_name(&handle.job.item_key, handle.job.attempt);
+            handle.job.tmux_session = jobs::session_name(&handle.job.item_key, handle.job.attempt);
             handle.diff_stat = None;
-            handle
-                .tail
-                .push(format!("── attempt {} · feedback given ──", handle.job.attempt));
+            handle.tail.push(format!(
+                "── attempt {} · feedback given ──",
+                handle.job.attempt
+            ));
         }
         if let Some(backend) = switched {
             let (backend, model, effort) = match backend {
@@ -1932,7 +1934,12 @@ impl App {
     /// `enter` on a reviewable job: full diff in git's own pager, TUI suspended.
     fn view_diff_in_pager(&mut self, job: &jobs::Job) -> Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen, Show)?;
+        execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        )?;
         let status = Command::new("git")
             .arg("-C")
             .arg(&job.worktree)
@@ -2196,12 +2203,14 @@ impl App {
             if timed_out {
                 jobs::kill_session(&handle.job);
                 handle.job.status = jobs::JobStatus::Failed;
-                handle
-                    .tail
-                    .push(format!("── hard timeout after {timeout_min}m — cancelled ──"));
+                handle.tail.push(format!(
+                    "── hard timeout after {timeout_min}m — cancelled ──"
+                ));
                 let _ = jobs::save(&handle.dir, &handle.job);
-                supervision_note =
-                    Some(format!("✗ {} timed out after {timeout_min}m", handle.job.item_key));
+                supervision_note = Some(format!(
+                    "✗ {} timed out after {timeout_min}m",
+                    handle.job.item_key
+                ));
                 changed = true;
                 continue;
             }
@@ -2426,8 +2435,7 @@ impl App {
                                     &self.agent_jobs[index].dir,
                                     &self.agent_jobs[index].job,
                                 );
-                                self.status =
-                                    format!("{} removed from the queue", job.item_key);
+                                self.status = format!("{} removed from the queue", job.item_key);
                             }
                             Err(err) => self.status = format!("cancel failed: {err:#}"),
                         }
@@ -2555,7 +2563,10 @@ impl App {
             y,
             box_width,
             box_height,
-            &format!("agents · fleet · {running}/{} running{queued_note}", agent_wip()),
+            &format!(
+                "agents · fleet · {running}/{} running{queued_note}",
+                agent_wip()
+            ),
         )?;
         let inner_x = x + 2;
         let inner_width = box_width.saturating_sub(4);
@@ -2593,7 +2604,11 @@ impl App {
                     jobs::JobStatus::Discarded => "·",
                 }
             };
-            let label = if stalled { "STALLED?" } else { job.status.label() };
+            let label = if stalled {
+                "STALLED?"
+            } else {
+                job.status.label()
+            };
             let interactive = job.mode == jobs::JobMode::Interactive;
             let tail_hint = if interactive && job.status == jobs::JobStatus::Running {
                 "live session — t to enter".to_owned()
@@ -5810,8 +5825,16 @@ impl App {
                             AgentBackend::Codex => "codex",
                             AgentBackend::Claude => "claude",
                         },
-                        if self.dispatch_interactive { "on" } else { "off" },
-                        if self.dispatch_brief { "fable-5" } else { "envelope" },
+                        if self.dispatch_interactive {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                        if self.dispatch_brief {
+                            "fable-5"
+                        } else {
+                            "envelope"
+                        },
                     ),
                     MenuMode::Feedback => {
                         let (key, backend) = self
