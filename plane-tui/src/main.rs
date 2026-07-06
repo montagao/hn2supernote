@@ -1689,7 +1689,7 @@ impl App {
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_owned());
-        let worktree = worktree_root.join(format!("{repo_name}-{}", item_key.to_lowercase()));
+        let worktree_base = worktree_root.join(format!("{repo_name}-{}", item_key.to_lowercase()));
         let attempt = 1 + self
             .agent_jobs
             .iter()
@@ -1704,7 +1704,13 @@ impl App {
             item_key.to_lowercase()
         );
         let dir = jobs::jobs_root(&plane_tui_data_dir()?).join(&id);
+        let (worktree, branch, slot_note) =
+            jobs::allocate_worktree(&repo, &worktree_base, &branch)?;
         let base_ref = jobs::create_worktree(&repo, &worktree, &branch)?;
+        if let Some(note) = &slot_note {
+            self.api_log
+                .push(ApiLog::new("AGENT", &item_key, note, "ok", 0));
+        }
         let (backend, model, effort) = match self.dispatch_backend {
             AgentBackend::Codex => ("codex".to_owned(), "gpt-5.5".to_owned(), String::new()),
             AgentBackend::Claude => (
@@ -1782,6 +1788,9 @@ impl App {
             let result =
                 self.with_single_target(&item_key, |app| app.apply_state(StateKind::Started));
             self.soft(result);
+        }
+        if let Some(note) = slot_note {
+            self.status = format!("{} · {note}", self.status);
         }
         self.force_clear = true;
         Ok(())

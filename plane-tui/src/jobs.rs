@@ -222,6 +222,116 @@ pub fn scan(root: &Path) -> Vec<JobHandle> {
 
 // -------------------------------------------------------------- worktrees
 
+fn branch_exists(repo: &Path, name: &str) -> bool {
+    let mut verify = Command::new("git");
+    verify
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{name}"));
+    verify
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+pub fn worktree_head_branch(worktree: &Path) -> Result<String> {
+    let mut head = Command::new("git");
+    head.arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"]);
+    run_capture(head)
+}
+
+/// A leftover worktree is disposable when it holds no work: clean tree and
+/// no commits beyond the repo's current HEAD.
+fn worktree_is_disposable(repo: &Path, worktree: &Path) -> bool {
+    let mut status = Command::new("git");
+    status
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain"]);
+    let clean = run_capture(status)
+        .map(|out| out.is_empty())
+        .unwrap_or(false);
+    if !clean {
+        return false;
+    }
+    let Ok(repo_head) = run_capture({
+        let mut head = Command::new("git");
+        head.arg("-C").arg(repo).args(["rev-parse", "HEAD"]);
+        head
+    }) else {
+        return false;
+    };
+    let mut ahead = Command::new("git");
+    ahead
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-list", "--count", &format!("{repo_head}..HEAD")]);
+    run_capture(ahead)
+        .map(|count| count.trim() == "0")
+        .unwrap_or(false)
+}
+
+/// Choose a creatable (worktree, branch) pair for a dispatch. A leftover
+/// worktree with no work in it is reclaimed; one holding commits or dirty
+/// files is preserved and the new job gets a `-N` suffix — never destroy
+/// work, never require manual cleanup. Lingering branch names (e.g. from a
+/// push-only landing) are suffixed the same way.
+pub fn allocate_worktree(
+    repo: &Path,
+    worktree_base: &Path,
+    branch_base: &str,
+) -> Result<(PathBuf, String, Option<String>)> {
+    let mut note = None;
+    if worktree_base.exists() && worktree_is_disposable(repo, worktree_base) {
+        let old_branch = worktree_head_branch(worktree_base).ok();
+        let mut remove = Command::new("git");
+        remove
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree_base);
+        run_quiet(remove).context("reclaiming leftover worktree")?;
+        if let Some(old_branch) = old_branch {
+            let mut delete = Command::new("git");
+            delete
+                .arg("-C")
+                .arg(repo)
+                .args(["branch", "-D", &old_branch]);
+            let _ = run_quiet(delete);
+        }
+        note = Some("reclaimed leftover worktree (it held no work)".to_owned());
+    }
+    for n in 1..=20u32 {
+        let (worktree, branch) = if n == 1 {
+            (worktree_base.to_path_buf(), branch_base.to_owned())
+        } else {
+            (
+                PathBuf::from(format!("{}-{n}", worktree_base.display())),
+                format!("{branch_base}-{n}"),
+            )
+        };
+        if !worktree.exists() && !branch_exists(repo, &branch) {
+            if n > 1 {
+                note = Some(format!(
+                    "previous worktree has work — kept it, using {} on {branch}",
+                    worktree.display()
+                ));
+            }
+            return Ok((worktree, branch, note));
+        }
+    }
+    bail!(
+        "no free worktree slot near {} — clean up old ones",
+        worktree_base.display()
+    )
+}
+
 /// Create the job's worktree + branch off the repo's current HEAD.
 /// Returns the base ref the diff is later computed against.
 pub fn create_worktree(repo: &Path, worktree: &Path, branch: &str) -> Result<String> {
