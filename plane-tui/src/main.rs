@@ -5798,14 +5798,13 @@ impl App {
                         self.wip_limit()
                     ),
                     MenuMode::Dispatch => format!(
-                        "dispatch {} → enter {}{}   1 codex   2 claude · {}   i interactive   b brief:{}   esc",
+                        "dispatch {} → enter {}{}  1 codex  2 claude  i interactive  b brief:{}  esc",
                         self.dispatch_item.as_deref().unwrap_or("?"),
                         match self.dispatch_backend {
                             AgentBackend::Codex => "codex",
                             AgentBackend::Claude => "claude",
                         },
-                        if self.dispatch_interactive { " (interactive)" } else { "" },
-                        self.client.config.claude_model,
+                        if self.dispatch_interactive { "·i" } else { "" },
                         if self.dispatch_brief { "fable-5" } else { "envelope" },
                     ),
                     MenuMode::Feedback => {
@@ -7719,7 +7718,7 @@ fn draw_card_border(
 
 fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
     let box_width = min(width.saturating_sub(8), 112);
-    let box_height = min(height.saturating_sub(6), 26);
+    let box_height = min(height.saturating_sub(6), 27);
     if box_width < 48 || box_height < 10 {
         return draw_overlay(
             out,
@@ -7822,8 +7821,17 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         left,
         value_x,
         row,
-        "d / J",
-        "dispatch an agent into a worktree · fleet view (t dive, l land)",
+        "d",
+        "dispatch agent → enter default · 1 codex · 2 claude · i interactive · b brief",
+    )?;
+    row += 1;
+    draw_shortcut_row(
+        out,
+        left,
+        value_x,
+        row,
+        "J",
+        "fleet · enter diff · t deep dive · f feedback · l land · c/r/x",
     )?;
     row += 1;
     draw_shortcut_row(
