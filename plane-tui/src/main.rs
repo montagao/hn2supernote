@@ -7718,7 +7718,7 @@ fn draw_card_border(
 
 fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
     let box_width = min(width.saturating_sub(8), 112);
-    let box_height = min(height.saturating_sub(6), 27);
+    let box_height = min(height.saturating_sub(6), 29);
     if box_width < 48 || box_height < 10 {
         return draw_overlay(
             out,
@@ -7832,6 +7832,24 @@ fn draw_help_panel(out: &mut io::Stdout, width: u16, height: u16) -> Result<()> 
         row,
         "J",
         "fleet · enter diff · t deep dive · f feedback · l land · c/r/x",
+    )?;
+    row += 1;
+    draw_shortcut_row(
+        out,
+        left,
+        value_x,
+        row,
+        "card badge",
+        "⚑ agent working (green) / needs review (amber) · ? asked a question",
+    )?;
+    row += 1;
+    draw_shortcut_row(
+        out,
+        left,
+        value_x,
+        row,
+        "",
+        "✗ failed · ● queued · ✎ writing brief · ⚠ quiet too long — J to act",
     )?;
     row += 1;
     draw_shortcut_row(
