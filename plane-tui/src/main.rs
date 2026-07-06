@@ -1078,6 +1078,46 @@ enum ViewMode {
     List,
 }
 
+/// The fleet groups jobs by what they ask of you, in `fleet_order()` rank
+/// order (so the group boundaries are always contiguous).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FleetBucket {
+    NeedsYou = 0,
+    Running = 1,
+    Queued = 2,
+    Done = 3,
+}
+
+impl FleetBucket {
+    fn of(status: jobs::JobStatus) -> Self {
+        match status {
+            jobs::JobStatus::Question
+            | jobs::JobStatus::Review
+            | jobs::JobStatus::Failed
+            | jobs::JobStatus::Orphaned => FleetBucket::NeedsYou,
+            jobs::JobStatus::Running | jobs::JobStatus::Briefing => FleetBucket::Running,
+            jobs::JobStatus::Queued => FleetBucket::Queued,
+            jobs::JobStatus::Landed | jobs::JobStatus::Discarded => FleetBucket::Done,
+        }
+    }
+    fn title(self) -> &'static str {
+        match self {
+            FleetBucket::NeedsYou => "NEEDS YOU",
+            FleetBucket::Running => "RUNNING",
+            FleetBucket::Queued => "QUEUED",
+            FleetBucket::Done => "DONE",
+        }
+    }
+    fn color(self) -> Color {
+        match self {
+            FleetBucket::NeedsYou => AMBER,
+            FleetBucket::Running => GREEN,
+            FleetBucket::Queued => ACCENT,
+            FleetBucket::Done => DIMMER,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterMode {
     All,
@@ -3291,6 +3331,12 @@ impl App {
                 let pos = current_pos.saturating_sub(1);
                 self.jobs_sel_id = order.get(pos).map(|&i| self.agent_jobs[i].job.id.clone());
             }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.jobs_sel_id = order.first().map(|&i| self.agent_jobs[i].job.id.clone());
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.jobs_sel_id = order.last().map(|&i| self.agent_jobs[i].job.id.clone());
+            }
             KeyCode::Char('t') => {
                 if let Some(index) = selected {
                     let job = self.agent_jobs[index].job.clone();
@@ -3453,229 +3499,328 @@ impl App {
         Ok(())
     }
 
-    fn draw_jobs_overlay(&self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
-        let box_width = min(width.saturating_sub(6), 112);
-        let box_height = min(height.saturating_sub(4), 30);
-        if box_width < 60 || box_height < 12 {
-            return draw_overlay(
-                out,
-                width,
-                height,
-                &[" agents ", "terminal too small for the fleet view"],
-            );
-        }
-        let x = width.saturating_sub(box_width) / 2;
-        let y = height.saturating_sub(box_height) / 2;
-        let running = self
-            .agent_jobs
-            .iter()
-            .filter(|handle| handle.job.status == jobs::JobStatus::Running)
-            .count();
-        let queued = self
-            .agent_jobs
-            .iter()
-            .filter(|handle| handle.job.status == jobs::JobStatus::Queued)
-            .count();
-        let queued_note = if queued > 0 {
-            format!(" · {queued} queued")
-        } else {
-            String::new()
-        };
-        draw_modal_shell(
-            out,
-            x,
-            y,
-            box_width,
-            box_height,
-            &format!(
-                "agents · fleet · {running}/{} running{queued_note}",
-                agent_wip()
-            ),
-        )?;
-        let inner_x = x + 2;
-        let inner_width = box_width.saturating_sub(4);
+    fn draw_fleet(&self, out: &mut Screen, x: u16, y: u16, width: u16, height: u16) -> Result<()> {
         let order = self.fleet_order();
-        let mut row = y + 2;
+
+        // ── health summary bar ───────────────────────────────────────────
+        let (mut running, mut queued, mut needs, mut failed) = (0usize, 0usize, 0usize, 0usize);
+        for &i in &order {
+            let st = self.agent_jobs[i].job.status;
+            match st {
+                jobs::JobStatus::Running => running += 1,
+                jobs::JobStatus::Queued => queued += 1,
+                _ => {}
+            }
+            if matches!(st, jobs::JobStatus::Failed | jobs::JobStatus::Orphaned) {
+                failed += 1;
+            }
+            if FleetBucket::of(st) == FleetBucket::NeedsYou {
+                needs += 1;
+            }
+        }
+        draw_cell(out, x, y, width, "", DIM, Some(BG), false)?;
+        let mut hx = x + 1;
+        draw_span(out, &mut hx, y, "fleet", PAPER, Some(BG), true)?;
+        draw_span(out, &mut hx, y, "   ", DIM, Some(BG), false)?;
+        draw_span(
+            out,
+            &mut hx,
+            y,
+            &format!("running {running}/{}", agent_wip()),
+            if running > 0 { GREEN } else { DIM },
+            Some(BG),
+            false,
+        )?;
+        for (text, color, on) in [
+            (format!("{needs} need you"), AMBER, needs > 0),
+            (format!("{failed} failed"), RED, failed > 0),
+            (format!("{queued} queued"), ACCENT, queued > 0),
+        ] {
+            draw_span(out, &mut hx, y, "  ·  ", DIMMER, Some(BG), false)?;
+            draw_span(
+                out,
+                &mut hx,
+                y,
+                &text,
+                if on { color } else { DIM },
+                Some(BG),
+                on,
+            )?;
+        }
+        let mut dx = x;
+        draw_span(
+            out,
+            &mut dx,
+            y + 1,
+            &"─".repeat(width as usize),
+            LINE,
+            Some(BG),
+            false,
+        )?;
+
+        let list_top = y + 2;
+        let list_height = height.saturating_sub(2);
         if order.is_empty() {
             draw_cell(
                 out,
-                inner_x,
-                row,
-                inner_width,
-                "no agents yet — press d on an item to dispatch one",
+                x + 1,
+                list_top,
+                width.saturating_sub(2),
+                "no agents yet — press d on a work item to dispatch one",
                 DIM,
                 Some(BG),
                 false,
             )?;
+            return Ok(());
+        }
+
+        let show_detail = width >= 96;
+        let left_width = if show_detail {
+            (width * 42 / 100).clamp(46, 70)
+        } else {
+            width
+        };
+        if show_detail {
+            for r in 0..list_height {
+                let mut vx = x + left_width;
+                draw_span(out, &mut vx, list_top + r, "│", LINE, Some(BG), false)?;
+            }
+        }
+
+        // ── grouped, scroll-windowed job rail ────────────────────────────
+        enum FleetRow {
+            Header(FleetBucket, usize),
+            Job(usize),
+        }
+        let mut bcount = [0usize; 4];
+        for &i in &order {
+            bcount[FleetBucket::of(self.agent_jobs[i].job.status) as usize] += 1;
+        }
+        let mut rows: Vec<FleetRow> = Vec::new();
+        let mut last: Option<FleetBucket> = None;
+        for (pos, &i) in order.iter().enumerate() {
+            let bucket = FleetBucket::of(self.agent_jobs[i].job.status);
+            if last != Some(bucket) {
+                rows.push(FleetRow::Header(bucket, bcount[bucket as usize]));
+                last = Some(bucket);
+            }
+            rows.push(FleetRow::Job(pos));
         }
         let sel_pos = self
             .jobs_sel_id
             .as_deref()
             .and_then(|id| order.iter().position(|&i| self.agent_jobs[i].job.id == id))
             .unwrap_or(0);
-        let list_cap = min(order.len(), 8);
-        // window the list around the selection so it scrolls past the 8th job
-        let window_start = if sel_pos >= list_cap {
-            sel_pos + 1 - list_cap
+        let sel_display = rows
+            .iter()
+            .position(|r| matches!(r, FleetRow::Job(p) if *p == sel_pos))
+            .unwrap_or(0);
+        let cap = list_height as usize;
+        let start = if cap > 0 && sel_display >= cap {
+            sel_display + 1 - cap
         } else {
             0
         };
-        let window_end = min(window_start + list_cap, order.len());
-        for (position, &index) in order.iter().enumerate().skip(window_start).take(list_cap) {
-            let handle = &self.agent_jobs[index];
-            let job = &handle.job;
-            let selected = match self.jobs_sel_id.as_deref() {
-                Some(id) => handle.job.id == id,
-                None => position == 0,
-            };
-            let stalled = handle.stalled && job.status == jobs::JobStatus::Running;
-            let glyph = if stalled {
-                "⚠"
-            } else {
-                match job.status {
-                    jobs::JobStatus::Briefing => "✎",
-                    jobs::JobStatus::Queued => "●",
-                    jobs::JobStatus::Running => FRAMES[self.frame],
-                    jobs::JobStatus::Review => "⚑",
-                    jobs::JobStatus::Question => "?",
-                    jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => "✗",
-                    jobs::JobStatus::Landed => "✓",
-                    jobs::JobStatus::Discarded => "·",
+        let end = min(start + cap, rows.len());
+        let rail_width = left_width.saturating_sub(1);
+        let mut r = list_top;
+        for row in &rows[start..end] {
+            match row {
+                FleetRow::Header(bucket, n) => draw_cell(
+                    out,
+                    x + 1,
+                    r,
+                    rail_width,
+                    &format!("{} · {n}", bucket.title()),
+                    bucket.color(),
+                    Some(BG),
+                    true,
+                )?,
+                FleetRow::Job(pos) => {
+                    let handle = &self.agent_jobs[order[*pos]];
+                    let job = &handle.job;
+                    let stalled = handle.stalled && job.status == jobs::JobStatus::Running;
+                    let glyph = fleet_glyph(job.status, stalled, self.frame);
+                    let label = if stalled {
+                        "STALLED?"
+                    } else {
+                        job.status.label()
+                    };
+                    let model_col = if job.mode == jobs::JobMode::Interactive {
+                        format!("{}·int", job.backend)
+                    } else {
+                        format!("{}·{}", job.backend, truncate(&job.model, 7))
+                    };
+                    let selected = pos == &sel_pos;
+                    let text = format!(
+                        "  {glyph} {:<10} {:<9} {} a{}",
+                        job.item_key, label, model_col, job.attempt
+                    );
+                    let (fg, bg) = if selected {
+                        (Color::Black, Some(PAPER))
+                    } else {
+                        (fleet_color(job.status, stalled), Some(BG))
+                    };
+                    draw_cell(out, x + 1, r, rail_width, &text, fg, bg, selected)?;
                 }
-            };
-            let label = if stalled {
-                "STALLED?"
-            } else {
-                job.status.label()
-            };
-            let interactive = job.mode == jobs::JobMode::Interactive;
-            let tail_hint = if interactive && job.status == jobs::JobStatus::Running {
-                "live session — t to enter".to_owned()
-            } else {
-                handle
-                    .tail
-                    .last()
-                    .map(|line| truncate(line, 40))
-                    .unwrap_or_default()
-            };
-            let model_col = if interactive {
-                format!("{}·int", job.backend)
-            } else {
-                format!("{}·{}", job.backend, truncate(&job.model, 9))
-            };
-            let text = format!(
-                " {glyph} {:<9} {:<9} {:<15} a{} {}",
-                label, job.item_key, model_col, job.attempt, tail_hint
-            );
-            let (fg, bg) = if selected {
-                (Color::Black, Some(PAPER))
-            } else {
-                let color = if stalled {
-                    AMBER
-                } else {
-                    match job.status {
-                        jobs::JobStatus::Running | jobs::JobStatus::Landed => GREEN,
-                        jobs::JobStatus::Review
-                        | jobs::JobStatus::Question
-                        | jobs::JobStatus::Briefing => AMBER,
-                        jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => RED,
-                        jobs::JobStatus::Queued | jobs::JobStatus::Discarded => DIMMER,
-                    }
-                };
-                (color, Some(BG))
-            };
-            draw_cell(out, inner_x, row, inner_width, &text, fg, bg, selected)?;
-            row += 1;
+            }
+            r += 1;
         }
-        if window_start > 0 || window_end < order.len() {
-            let above = window_start;
-            let below = order.len().saturating_sub(window_end);
+        if start > 0 || end < rows.len() {
+            let above = rows[..start]
+                .iter()
+                .filter(|r| matches!(r, FleetRow::Job(_)))
+                .count();
+            let below = rows[end..]
+                .iter()
+                .filter(|r| matches!(r, FleetRow::Job(_)))
+                .count();
             let hint = match (above, below) {
-                (a, b) if a > 0 && b > 0 => format!("↑ {a} above · ↓ {b} below"),
-                (a, _) if a > 0 => format!("↑ {a} above"),
-                (_, b) => format!("↓ {b} below"),
+                (a, b) if a > 0 && b > 0 => format!("  ↑ {a} · ↓ {b} more"),
+                (a, _) if a > 0 => format!("  ↑ {a} more"),
+                (_, b) => format!("  ↓ {b} more"),
             };
-            draw_cell(out, inner_x, row, inner_width, &hint, DIMMER, Some(BG), false)?;
-        }
-        row += 1;
-        let detail_bottom = y + box_height.saturating_sub(3);
-        let detail_index = self
-            .jobs_sel_id
-            .as_deref()
-            .and_then(|id| {
-                order
-                    .iter()
-                    .copied()
-                    .find(|&i| self.agent_jobs[i].job.id == id)
-            })
-            .or_else(|| order.first().copied());
-        if let Some(index) = detail_index {
-            let handle = &self.agent_jobs[index];
-            let job = &handle.job;
             draw_cell(
                 out,
-                inner_x,
-                row,
-                inner_width,
-                &format!(
-                    "{} · {}{} · worktree {} · branch {}",
-                    job.item_key,
-                    truncate(&job.title, 40),
-                    if job.stance == jobs::JobStance::Explore {
-                        " · explore"
-                    } else {
-                        ""
-                    },
-                    job.worktree.display(),
-                    job.branch
-                ),
+                x + 1,
+                list_top + list_height.saturating_sub(1),
+                rail_width,
+                &hint,
+                DIMMER,
+                Some(BG),
+                false,
+            )?;
+        }
+
+        if show_detail {
+            let dx = x + left_width + 2;
+            let dwidth = width.saturating_sub(left_width + 3);
+            self.draw_fleet_detail(out, dx, list_top, dwidth, list_height, order[sel_pos])?;
+        }
+        Ok(())
+    }
+
+    fn draw_fleet_detail(
+        &self,
+        out: &mut Screen,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        index: usize,
+    ) -> Result<()> {
+        let handle = &self.agent_jobs[index];
+        let job = &handle.job;
+        let bottom = y + height;
+        let mut row = y;
+        let key_room = width.saturating_sub(job.item_key.len() as u16 + 3) as usize;
+        draw_cell(
+            out,
+            x,
+            row,
+            width,
+            &format!("{} · {}", job.item_key, truncate(&job.title, key_room)),
+            PAPER,
+            Some(BG),
+            true,
+        )?;
+        row += 1;
+        let stance = if job.stance == jobs::JobStance::Explore {
+            "explore"
+        } else {
+            "implement"
+        };
+        for (text, color) in [
+            (
+                format!("{} · {stance} · attempt {}", job.backend, job.attempt),
                 DIM,
+            ),
+            (
+                format!(
+                    "branch {}",
+                    truncate(&job.branch, width.saturating_sub(7) as usize)
+                ),
+                DIMMER,
+            ),
+            (format!("{}", job.worktree.display()), DIMMER),
+        ] {
+            if row >= bottom {
+                break;
+            }
+            draw_cell(
+                out,
+                x,
+                row,
+                width,
+                &truncate(&text, width as usize),
+                color,
                 Some(BG),
                 false,
             )?;
             row += 1;
-            let mut lines: Vec<String> = Vec::new();
-            match job.status {
-                jobs::JobStatus::Review | jobs::JobStatus::Question => {
-                    let result = jobs::read_result(&handle.dir);
-                    lines.extend(result.trim().lines().take(8).map(str::to_owned));
-                    lines.push(String::new());
-                    if let Some(diff) = &handle.diff_stat {
-                        lines.push("diff:".to_owned());
-                        lines.extend(diff.lines().map(str::to_owned));
+        }
+        if row < bottom {
+            let mut sx = x;
+            draw_span(
+                out,
+                &mut sx,
+                row,
+                &"─".repeat(width as usize),
+                LINE,
+                Some(BG),
+                false,
+            )?;
+            row += 1;
+        }
+
+        let mut lines: Vec<(String, Color)> = Vec::new();
+        match job.status {
+            jobs::JobStatus::Review | jobs::JobStatus::Question => {
+                for l in jobs::read_result(&handle.dir).trim().lines() {
+                    lines.push((l.to_owned(), TEXT));
+                }
+                if let Some(diff) = &handle.diff_stat {
+                    lines.push((String::new(), DIM));
+                    lines.push(("diff:".to_owned(), DIM));
+                    for l in diff.lines() {
+                        lines.push((l.to_owned(), GREEN));
                     }
                 }
-                jobs::JobStatus::Running if job.mode == jobs::JobMode::Interactive => {
-                    lines.push(format!(
+            }
+            jobs::JobStatus::Running if job.mode == jobs::JobMode::Interactive => {
+                lines.push((
+                    format!(
                         "interactive {} session — press t to enter the pane",
                         job.backend
-                    ));
-                    lines.push("(no log tail: the pane scrollback is the record)".to_owned());
-                }
-                _ => {
-                    let available = detail_bottom.saturating_sub(row) as usize;
-                    let start = handle.tail.len().saturating_sub(available);
-                    lines.extend(handle.tail[start..].iter().cloned());
-                }
+                    ),
+                    TEXT,
+                ));
+                lines.push(("(the pane scrollback is the record)".to_owned(), DIMMER));
             }
-            for line in lines {
-                if row >= detail_bottom {
-                    break;
+            _ => {
+                for l in &handle.tail {
+                    lines.push((l.clone(), TEXT));
                 }
-                draw_cell(out, inner_x, row, inner_width, &line, TEXT, Some(BG), false)?;
-                row += 1;
             }
         }
-        draw_cell(
-            out,
-            inner_x,
-            y + box_height.saturating_sub(2),
-            inner_width,
-            "j/k select · enter diff · t dive · f feedback · l land · c cancel · r retry · x discard · esc",
-            DIM,
-            Some(BG),
-            false,
-        )?;
+        let available = bottom.saturating_sub(row) as usize;
+        let skip = lines.len().saturating_sub(available);
+        for (text, color) in lines.into_iter().skip(skip) {
+            if row >= bottom {
+                break;
+            }
+            draw_cell(
+                out,
+                x,
+                row,
+                width,
+                &truncate(&text, width as usize),
+                color,
+                Some(BG),
+                false,
+            )?;
+            row += 1;
+        }
         Ok(())
     }
 
@@ -5682,18 +5827,27 @@ impl App {
             0
         };
         let board_width = frame.width.saturating_sub(inspector_width);
-        match self.view {
-            ViewMode::Board => self.draw_board(out, frame.x, body_top, board_width, body_height)?,
-            ViewMode::List => self.draw_list(out, frame.x, body_top, board_width, body_height)?,
-        }
-        if inspector_width > 0 {
-            self.draw_inspector(
-                out,
-                frame.x + board_width,
-                body_top,
-                inspector_width,
-                body_height,
-            )?;
+        if self.jobs_open {
+            // fleet is a full-screen workspace, not a modal
+            self.draw_fleet(out, frame.x, body_top, frame.width, body_height)?;
+        } else {
+            match self.view {
+                ViewMode::Board => {
+                    self.draw_board(out, frame.x, body_top, board_width, body_height)?
+                }
+                ViewMode::List => {
+                    self.draw_list(out, frame.x, body_top, board_width, body_height)?
+                }
+            }
+            if inspector_width > 0 {
+                self.draw_inspector(
+                    out,
+                    frame.x + board_width,
+                    body_top,
+                    inspector_width,
+                    body_height,
+                )?;
+            }
         }
         self.draw_footer(
             out,
@@ -5716,9 +5870,6 @@ impl App {
         }
         if self.prompt_view.is_some() {
             self.draw_prompt_overlay(out, width, height)?;
-        }
-        if self.jobs_open {
-            self.draw_jobs_overlay(out, width, height)?;
         }
         if self.repo_wizard.is_some() {
             self.draw_repo_wizard(out, width, height)?;
@@ -5827,10 +5978,28 @@ impl App {
             right_segments.push((format!("f:{}", self.filter.label()), ACCENT, false));
         }
         right_segments.push((format!("sort:{}", self.sort.label()), DIM, false));
-        if self.busy.is_some() {
-            right_segments.push((format!("J 1 {}", FRAMES[self.frame]), AMBER, true));
+        // fleet indicator: ⚑N need you (amber) + running count with a spinner
+        let fleet_running = self
+            .agent_jobs
+            .iter()
+            .filter(|handle| handle.job.status == jobs::JobStatus::Running)
+            .count();
+        let fleet_needs = self
+            .agent_jobs
+            .iter()
+            .filter(|handle| FleetBucket::of(handle.job.status) == FleetBucket::NeedsYou)
+            .count();
+        if fleet_needs > 0 {
+            right_segments.push((format!("⚑{fleet_needs}"), AMBER, true));
+        }
+        if fleet_running > 0 {
+            right_segments.push((
+                format!("J{fleet_running} {}", FRAMES[self.frame]),
+                GREEN,
+                false,
+            ));
         } else {
-            right_segments.push(("J 0".to_owned(), DIMMER, false));
+            right_segments.push(("J".to_owned(), DIMMER, false));
         }
         let sync_secs = self.project().loaded_at.elapsed().as_secs();
         let (sync_text, sync_color) = if sync_secs < 60 {
@@ -6909,16 +7078,12 @@ impl App {
             row += 1;
         }
         if row < y + height {
-            draw_cell(
-                out,
-                inner_x,
-                row,
-                inner_width,
-                "j/k h/l move · enter detail · e edit · a/A agent · m mark · s state · p priority · t label · D done · T triage · v view · / search · : cmd · x api · ? keys · q quit",
-                DIMMER,
-                None,
-                false,
-            )?;
+            let hint = if self.jobs_open {
+                "j/k select · enter diff · t dive · f feedback · l land · r retry · c cancel · x discard · J/esc board"
+            } else {
+                "j/k h/l move · enter detail · e edit · a/A agent · m mark · s state · p priority · t label · D done · T triage · v view · J fleet · / search · : cmd · x api · ? keys · q quit"
+            };
+            draw_cell(out, inner_x, row, inner_width, hint, DIMMER, None, false)?;
         }
         Ok(())
     }
@@ -8319,6 +8484,34 @@ fn list_due(value: Option<&str>) -> (String, Color) {
     };
     let color = if days <= 3 { RED } else { TEXT };
     (text, color)
+}
+
+fn fleet_glyph(status: jobs::JobStatus, stalled: bool, frame: usize) -> &'static str {
+    if stalled {
+        return "\u{26a0}";
+    }
+    match status {
+        jobs::JobStatus::Briefing => "\u{270e}",
+        jobs::JobStatus::Queued => "\u{25cf}",
+        jobs::JobStatus::Running => FRAMES[frame],
+        jobs::JobStatus::Review => "\u{2691}",
+        jobs::JobStatus::Question => "?",
+        jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => "\u{2717}",
+        jobs::JobStatus::Landed => "\u{2713}",
+        jobs::JobStatus::Discarded => "\u{b7}",
+    }
+}
+
+fn fleet_color(status: jobs::JobStatus, stalled: bool) -> Color {
+    if stalled {
+        return AMBER;
+    }
+    match status {
+        jobs::JobStatus::Running | jobs::JobStatus::Landed => GREEN,
+        jobs::JobStatus::Review | jobs::JobStatus::Question | jobs::JobStatus::Briefing => AMBER,
+        jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => RED,
+        jobs::JobStatus::Queued | jobs::JobStatus::Discarded => DIMMER,
+    }
 }
 
 fn truncate(value: &str, width: usize) -> String {
