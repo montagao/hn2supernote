@@ -734,7 +734,7 @@ pub fn attach_command(job: &Job) -> String {
 pub fn deep_dive(job: &Job, terminal_cmd: Option<&str>) -> Result<DeepDive> {
     if std::env::var_os("TMUX").is_some() && job.tmux_socket.is_none() {
         let mut tmux = tmux_command(&None);
-        tmux.args(["switch-client", "-t", &job.tmux_session]);
+        tmux.args(["switch-client", "-t", &format!("={}", job.tmux_session)]);
         run_quiet(tmux).context("tmux switch-client")?;
         return Ok(DeepDive::Switched);
     }

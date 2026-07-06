@@ -990,7 +990,7 @@ struct App {
     force_clear: bool,
     agent_jobs: Vec<jobs::JobHandle>,
     jobs_open: bool,
-    jobs_sel: usize,
+    jobs_sel_id: Option<String>,
     dispatch_item: Option<String>,
     dispatch_backend: AgentBackend,
     dispatch_interactive: bool,
@@ -1117,7 +1117,7 @@ impl App {
                 .map(|dir| jobs::scan(&jobs::jobs_root(&dir)))
                 .unwrap_or_default(),
             jobs_open: false,
-            jobs_sel: 0,
+            jobs_sel_id: None,
             dispatch_item: None,
             dispatch_backend: AgentBackend::Codex,
             dispatch_interactive: false,
@@ -2123,6 +2123,37 @@ impl App {
     /// Enter a job's tmux pane: switch-client when resident, spawned terminal
     /// otherwise, clipboard as the last resort.
     fn deep_dive_job(&mut self, job: &jobs::Job) {
+        match job.status {
+            jobs::JobStatus::Queued => {
+                self.status = format!(
+                    "{} hasn't started yet — it's queued for an agent slot",
+                    job.item_key
+                );
+                return;
+            }
+            jobs::JobStatus::Briefing => {
+                self.status = format!(
+                    "{} is still being briefed — the session starts after the brief",
+                    job.item_key
+                );
+                return;
+            }
+            _ => {}
+        }
+        if !jobs::session_alive(job) {
+            let hint = match job.status {
+                jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => " · r respawns it",
+                jobs::JobStatus::Landed | jobs::JobStatus::Discarded => {
+                    " (cleaned up on land/discard)"
+                }
+                _ => " (tmux server restarted?) — log and result are still in the job dir",
+            };
+            self.status = format!(
+                "{}'s pane is gone — {} no longer exists{hint}",
+                job.item_key, job.tmux_session
+            );
+            return;
+        }
         let terminal_cmd = std::env::var("PLANE_TUI_TERMINAL_CMD").ok();
         let template = terminal_cmd.as_deref().unwrap_or("kitty -e {cmd}");
         match jobs::deep_dive(job, Some(template)) {
@@ -2370,25 +2401,39 @@ impl App {
     }
 
     fn handle_jobs_key(&mut self, key: KeyEvent) -> Result<()> {
+        // selection tracks the JOB, not a row number: the list reorders
+        // itself on status transitions, and a positional index would let a
+        // keypress land on a different job than the one on screen
         let order = self.fleet_order();
+        let current_pos = self
+            .jobs_sel_id
+            .as_deref()
+            .and_then(|id| order.iter().position(|&i| self.agent_jobs[i].job.id == id))
+            .unwrap_or(0);
+        let selected: Option<usize> = order.get(current_pos).copied();
+        if let Some(index) = selected {
+            self.jobs_sel_id = Some(self.agent_jobs[index].job.id.clone());
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('J') | KeyCode::Char('q') => {
                 self.jobs_open = false;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.jobs_sel = min(self.jobs_sel + 1, order.len().saturating_sub(1));
+                let pos = min(current_pos + 1, order.len().saturating_sub(1));
+                self.jobs_sel_id = order.get(pos).map(|&i| self.agent_jobs[i].job.id.clone());
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.jobs_sel = self.jobs_sel.saturating_sub(1);
+                let pos = current_pos.saturating_sub(1);
+                self.jobs_sel_id = order.get(pos).map(|&i| self.agent_jobs[i].job.id.clone());
             }
             KeyCode::Char('t') => {
-                if let Some(&index) = order.get(self.jobs_sel) {
+                if let Some(index) = selected {
                     let job = self.agent_jobs[index].job.clone();
                     self.deep_dive_job(&job);
                 }
             }
             KeyCode::Enter => {
-                if let Some(&index) = order.get(self.jobs_sel) {
+                if let Some(index) = selected {
                     let job = self.agent_jobs[index].job.clone();
                     if matches!(
                         job.status,
@@ -2400,7 +2445,7 @@ impl App {
                 }
             }
             KeyCode::Char('f') => {
-                if let Some(&index) = order.get(self.jobs_sel) {
+                if let Some(index) = selected {
                     let job = self.agent_jobs[index].job.clone();
                     if matches!(
                         job.status,
@@ -2417,7 +2462,7 @@ impl App {
                 }
             }
             KeyCode::Char('c') => {
-                if let Some(&index) = order.get(self.jobs_sel) {
+                if let Some(index) = selected {
                     let job_status = self.agent_jobs[index].job.status;
                     if job_status == jobs::JobStatus::Running {
                         let handle = &mut self.agent_jobs[index];
@@ -2443,7 +2488,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(&index) = order.get(self.jobs_sel) {
+                if let Some(index) = selected {
                     let handle = &mut self.agent_jobs[index];
                     if matches!(
                         handle.job.status,
@@ -2457,33 +2502,25 @@ impl App {
                             return Ok(());
                         }
                         jobs::kill_session(&handle.job);
-                        let _ = fs::remove_file(handle.dir.join("exit"));
-                        let _ = fs::remove_file(handle.dir.join("result.md"));
                         handle.job.attempt += 1;
                         handle.job.tmux_session =
                             jobs::session_name(&handle.job.item_key, handle.job.attempt);
-                        let permission_mode = std::env::var("PLANE_TUI_CLAUDE_PERM")
-                            .unwrap_or_else(|_| "acceptEdits".to_owned());
-                        match jobs::spawn(&handle.job, &handle.dir, &permission_mode) {
+                        handle
+                            .tail
+                            .push(format!("── attempt {} ──", handle.job.attempt));
+                        let key = handle.job.item_key.clone();
+                        let attempt = handle.job.attempt;
+                        match self.spawn_agent_job(index) {
                             Ok(()) => {
-                                handle.job.status = jobs::JobStatus::Running;
-                                handle
-                                    .tail
-                                    .push(format!("── attempt {} ──", handle.job.attempt));
-                                self.status = format!(
-                                    "{} retrying (attempt {})",
-                                    handle.job.item_key, handle.job.attempt
-                                );
+                                self.status = format!("{key} retrying (attempt {attempt})");
                             }
                             Err(err) => self.status = format!("retry failed: {err:#}"),
                         }
-                        let job_snapshot = self.agent_jobs[index].job.clone();
-                        let _ = jobs::save(&self.agent_jobs[index].dir, &job_snapshot);
                     }
                 }
             }
             KeyCode::Char('l') => {
-                if let Some(&index) = order.get(self.jobs_sel) {
+                if let Some(index) = selected {
                     let job = self.agent_jobs[index].job.clone();
                     if matches!(
                         job.status,
@@ -2496,7 +2533,7 @@ impl App {
                 }
             }
             KeyCode::Char('x') => {
-                if let Some(&index) = order.get(self.jobs_sel) {
+                if let Some(index) = selected {
                     let job = self.agent_jobs[index].job.clone();
                     if matches!(
                         job.status,
@@ -2588,7 +2625,10 @@ impl App {
         for (position, &index) in order.iter().enumerate().take(list_rows as usize) {
             let handle = &self.agent_jobs[index];
             let job = &handle.job;
-            let selected = position == self.jobs_sel;
+            let selected = match self.jobs_sel_id.as_deref() {
+                Some(id) => handle.job.id == id,
+                None => position == 0,
+            };
             let stalled = handle.stalled && job.status == jobs::JobStatus::Running;
             let glyph = if stalled {
                 "⚠"
@@ -2650,7 +2690,17 @@ impl App {
         }
         row += 1;
         let detail_bottom = y + box_height.saturating_sub(3);
-        if let Some(&index) = order.get(self.jobs_sel) {
+        let detail_index = self
+            .jobs_sel_id
+            .as_deref()
+            .and_then(|id| {
+                order
+                    .iter()
+                    .copied()
+                    .find(|&i| self.agent_jobs[i].job.id == id)
+            })
+            .or_else(|| order.first().copied());
+        if let Some(index) = detail_index {
             let handle = &self.agent_jobs[index];
             let job = &handle.job;
             draw_cell(
@@ -2866,7 +2916,7 @@ impl App {
             KeyCode::Char('d') => self.start_dispatch(),
             KeyCode::Char('J') => {
                 self.jobs_open = true;
-                self.jobs_sel = 0;
+                self.jobs_sel_id = None;
                 self.force_clear = true;
             }
             KeyCode::Char('s') => self.menu = Some(MenuMode::State),
