@@ -5751,8 +5751,9 @@ impl App {
              url: {url}\n\
              description:\n{description}\n\
              </work_item>\n\n\
-             Write the brief you would want to receive if you were the agent taking on this task. Use your judgment about structure, length, and what to include — whatever best serves this particular work item. It is an assignment (what and why), not an implementation plan (how); leave design decisions to the agent doing the work.\n\
-             Two things matter: everything in the brief must be true — grounded in the business context or the repository, with open questions flagged as assumptions to verify rather than guessed at — and it must be specific to this work item rather than a restatement of general context.\n\n\
+             Write the brief you would want to receive if you were the agent taking on this task. The agent is a top-tier model: it will read the repo, find the right files, and make good design and process decisions on its own. The brief is an assignment (what and why), not an implementation plan (how).\n\
+             Leave out everything the agent can figure out itself or that the dispatch harness already handles: no git/branch/commit instructions, no lists of files to touch, no step-by-step plans, no testing checklists, no restating repo conventions. Include only what the agent cannot derive from the repo: the goal, why it matters, and any non-obvious constraints or gotchas — with open questions flagged as assumptions to verify rather than guessed at.\n\
+             Everything in the brief must be true and specific to this work item. Shorter is better; a few tight paragraphs usually beat a structured document.\n\n\
              Output only the final Markdown brief, with no preamble or commentary.\n",
             key = item.key,
             project_id = project.identifier,
