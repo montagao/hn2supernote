@@ -135,8 +135,8 @@ same worktree with the design threaded into the prompt. `s` opens a
 repo's `.claude/skills` / `.codex/skills` first, then `~/.claude/skills`
 and `~/.codex/skills`, deduped by name); picked skills are hinted in the
 prompt by name + description ("use them where they genuinely help"), and
-referenced in the fable-5 brief when `b` is on. `i` toggles
-**interactive** mode for whichever executor you pick
+referenced in the fable-5 brief when `b` is on. Dispatches default to
+**interactive** mode for whichever executor you pick; `i` toggles it off/on
 (the pane runs the agent's own TUI — claude or codex — with the brief
 preloaded; dispatching deep-dives you straight into it; human-paced, so
 exempt from stall/timeout supervision), and `b` toggles

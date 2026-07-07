@@ -1438,7 +1438,7 @@ impl App {
             jobs_sel_id: None,
             dispatch_item: None,
             dispatch_backend: AgentBackend::Codex,
-            dispatch_interactive: false,
+            dispatch_interactive: true,
             dispatch_brief: false,
             dispatch_explore: false,
             dispatch_repo: 0,
@@ -2403,7 +2403,7 @@ impl App {
             return;
         }
         self.dispatch_backend = label_executor(&item.labels).unwrap_or(AgentBackend::Codex);
-        self.dispatch_interactive = false;
+        self.dispatch_interactive = true;
         self.dispatch_explore = false;
         self.dispatch_repo = 0;
         self.dispatch_skills.clear();
