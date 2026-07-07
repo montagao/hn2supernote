@@ -255,6 +255,41 @@ fn write_repos_file(repos: &[(String, PathBuf)]) -> Result<()> {
     fs::write(path, body).context("writing repos.tsv")
 }
 
+fn work_folders_path() -> Result<PathBuf> {
+    Ok(plane_tui_data_dir()?.join("work-folders.tsv"))
+}
+
+/// Folders previously picked for `w` work sessions, most recent first.
+fn saved_work_folders() -> Vec<PathBuf> {
+    let Ok(path) = work_folders_path() else {
+        return Vec::new();
+    };
+    let Ok(body) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn remember_work_folder(folder: &Path) -> Result<()> {
+    let mut folders = saved_work_folders();
+    folders.retain(|have| have != folder);
+    folders.insert(0, folder.to_path_buf());
+    folders.truncate(20);
+    let path = work_folders_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let body = folders
+        .iter()
+        .map(|folder| format!("{}\n", folder.display()))
+        .collect::<String>();
+    fs::write(path, body).context("writing work-folders.tsv")
+}
+
 fn git_toplevel(path: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .arg("-C")
@@ -1179,6 +1214,7 @@ enum InputMode {
     EditDue,
     DispatchExtra,
     FeedbackNote,
+    WorkFolder,
 }
 
 impl InputMode {
@@ -1212,6 +1248,26 @@ struct PromptView {
     text: String,
     file: String,
     scroll: usize,
+}
+
+/// A live `w` session as seen on the tmux server — the fleet's WORKBENCH
+/// section. tmux is the source of truth: no job.json, no lifecycle.
+#[derive(Debug, Clone, PartialEq)]
+struct WorkSession {
+    session: String,
+    item_key: String,
+    cwd: PathBuf,
+}
+
+/// The `w` flow: pick a folder for the selected item and get a human-driven
+/// interactive agent session there, latest generated prompt on the clipboard.
+#[derive(Debug)]
+struct WorkWizard {
+    item_key: String,
+    /// (origin tag, folder) — remembered picks first, then dispatch repos.
+    /// One virtual "type a path…" row trails the list.
+    folders: Vec<(&'static str, PathBuf)>,
+    sel: usize,
 }
 
 struct CodexJob {
@@ -1310,6 +1366,12 @@ struct App {
     dispatch_repo: usize,
     repo_wizard: Option<Vec<RepoPick>>,
     repo_wizard_sel: usize,
+    work_wizard: Option<WorkWizard>,
+    /// Item key carried across the "type a path…" input hop of the `w` flow.
+    work_item: Option<String>,
+    /// Live `w` sessions shown in the fleet's WORKBENCH section.
+    work_sessions: Vec<WorkSession>,
+    work_sessions_at: Option<Instant>,
     skill_wizard: Option<Vec<SkillPick>>,
     skill_wizard_sel: usize,
     dispatch_skills: Vec<String>,
@@ -1444,6 +1506,10 @@ impl App {
             dispatch_repo: 0,
             repo_wizard: None,
             repo_wizard_sel: 0,
+            work_wizard: None,
+            work_item: None,
+            work_sessions: Vec::new(),
+            work_sessions_at: None,
             skill_wizard: None,
             skill_wizard_sel: 0,
             dispatch_skills: Vec::new(),
@@ -2382,6 +2448,262 @@ impl App {
     }
 
     /// `d` on the selected item: choose an executor, then an optional note.
+    /// `w`: one keystroke from the selected item to a human-driven agent
+    /// session — pick a folder (remembered across runs), the item's latest
+    /// generated prompt lands on the clipboard, and an interactive
+    /// claude/codex opens there in a tmux pane.
+    fn open_work_wizard(&mut self) {
+        let Some(item) = self.current_item() else {
+            self.status = "no item selected".to_owned();
+            return;
+        };
+        let item_key = item.key.clone();
+        let mut folders: Vec<(&'static str, PathBuf)> = Vec::new();
+        for folder in saved_work_folders() {
+            if !folders.iter().any(|(_, have)| *have == folder) {
+                folders.push(("recent", folder));
+            }
+        }
+        for (_, path) in repo_registry(&self.client.config) {
+            if !folders.iter().any(|(_, have)| *have == path) {
+                folders.push(("repo", path));
+            }
+        }
+        self.work_wizard = Some(WorkWizard {
+            item_key,
+            folders,
+            sel: 0,
+        });
+        self.force_clear = true;
+    }
+
+    fn handle_work_wizard_key(&mut self, key: KeyEvent) -> Result<()> {
+        // + 1: the trailing "type a path…" row
+        let len = self
+            .work_wizard
+            .as_ref()
+            .map(|wizard| wizard.folders.len() + 1)
+            .unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.work_wizard = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(wizard) = &mut self.work_wizard {
+                    wizard.sel = min(wizard.sel + 1, len.saturating_sub(1));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(wizard) = &mut self.work_wizard {
+                    wizard.sel = wizard.sel.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter => {
+                let Some(wizard) = self.work_wizard.take() else {
+                    return Ok(());
+                };
+                match wizard.folders.get(wizard.sel) {
+                    Some((_, folder)) => {
+                        let folder = folder.clone();
+                        self.launch_work_session(&wizard.item_key, &folder);
+                    }
+                    None => {
+                        self.work_item = Some(wizard.item_key);
+                        self.input_mode = Some(InputMode::WorkFolder);
+                        self.input.clear();
+                        self.input_cursor = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.force_clear = true;
+        Ok(())
+    }
+
+    fn draw_work_wizard(&self, out: &mut Screen, width: u16, height: u16) -> Result<()> {
+        let Some(wizard) = &self.work_wizard else {
+            return Ok(());
+        };
+        let rows = wizard.folders.len() + 1;
+        let box_width = min(width.saturating_sub(6), 100);
+        let box_height = min(height.saturating_sub(4), (rows as u16 + 6).max(10));
+        let x = width.saturating_sub(box_width) / 2;
+        let y = height.saturating_sub(box_height) / 2;
+        draw_modal_shell(
+            out,
+            x,
+            y,
+            box_width,
+            box_height,
+            &format!("work on {} · pick a folder", wizard.item_key),
+        )?;
+        let inner_x = x + 2;
+        let inner_width = box_width.saturating_sub(4);
+        let mut row = y + 2;
+        let visible = box_height.saturating_sub(5) as usize;
+        let start = wizard.sel.saturating_sub(visible.saturating_sub(1));
+        for position in start..min(rows, start + visible) {
+            let selected = position == wizard.sel;
+            let text = match wizard.folders.get(position) {
+                Some((origin, path)) => {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    format!(
+                        " {:<20} {:<7} {}",
+                        truncate(&name, 20),
+                        origin,
+                        truncate(&path.display().to_string(), 60),
+                    )
+                }
+                None => " type a path…".to_owned(),
+            };
+            let (fg, bg) = if selected {
+                (Color::Black, Some(PAPER))
+            } else {
+                (TEXT, Some(BG))
+            };
+            draw_cell(out, inner_x, row, inner_width, &text, fg, bg, selected)?;
+            row += 1;
+        }
+        draw_cell(
+            out,
+            inner_x,
+            y + box_height.saturating_sub(2),
+            inner_width,
+            "enter open interactive session here (prompt → clipboard) · j/k move · esc cancel",
+            DIM,
+            Some(BG),
+            false,
+        )?;
+        Ok(())
+    }
+
+    /// The freshest generated prompt for an item: the `a`/`A` prompt file and
+    /// any dispatched job's prompt.md compete on mtime.
+    fn latest_item_prompt(&self, item_key: &str) -> Option<String> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(dir) = prompt_dir() {
+            candidates.push(dir.join(format!("{}-agent-prompt.md", item_key.to_lowercase())));
+        }
+        for handle in &self.agent_jobs {
+            if handle.job.item_key == item_key {
+                candidates.push(handle.dir.join("prompt.md"));
+            }
+        }
+        candidates
+            .into_iter()
+            .filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path)))
+            .max_by_key(|(modified, _)| *modified)
+            .and_then(|(_, path)| fs::read_to_string(path).ok())
+            .filter(|text| !text.trim().is_empty())
+    }
+
+    /// Open (or rejoin) the item's interactive work session in `folder`,
+    /// with the latest generated prompt on the clipboard for pasting. Unlike
+    /// dispatch jobs this is plain human-driven work: no worktree, no
+    /// wrapper script, approvals at the agent's defaults.
+    fn launch_work_session(&mut self, item_key: &str, folder: &Path) {
+        if !folder.is_dir() {
+            self.status = format!("{} is not a directory", folder.display());
+            return;
+        }
+        let _ = remember_work_folder(folder);
+        let clip_note = match self.latest_item_prompt(item_key) {
+            Some(prompt) => match copy_to_clipboard(&prompt) {
+                Ok(()) => "prompt on clipboard",
+                Err(_) => "clipboard failed",
+            },
+            None => "no generated prompt yet (a generates one)",
+        };
+        let config = &self.client.config;
+        let socket = jobs::default_socket();
+        let session = format!("pti-work-{}", item_key.to_lowercase());
+        let mut verb = "rejoined";
+        if !jobs::session_alive_raw(&socket, &session) {
+            verb = "opened";
+            // same approvals-off posture as an interactive dispatch, so the
+            // agent never stops for a permission dialog in the pane
+            let permission_mode = std::env::var("PLANE_TUI_CLAUDE_PERM")
+                .unwrap_or_else(|_| "bypassPermissions".to_owned());
+            let command = jobs::interactive_agent_argv(
+                config.agent_backend.name(),
+                config.agent_bin(),
+                &config.claude_model,
+                &config.claude_effort,
+                &permission_mode,
+            );
+            if let Err(err) = jobs::spawn_raw(&socket, &session, folder, &command, None) {
+                self.status = format!("work session failed: {err:#}");
+                return;
+            }
+        }
+        let terminal_cmd = std::env::var("PLANE_TUI_TERMINAL_CMD").ok();
+        let template = terminal_cmd.as_deref().unwrap_or("kitty -e {cmd}");
+        // a rejoined session keeps the cwd it was created with, which may
+        // not be the folder just picked — don't claim otherwise
+        let place = if verb == "opened" {
+            format!(" in {}", folder.display())
+        } else {
+            String::new()
+        };
+        match jobs::deep_dive_session(&socket, &session, Some(template)) {
+            Ok(jobs::DeepDive::Switched) | Ok(jobs::DeepDive::SpawnedTerminal(_)) => {
+                self.status = format!("{verb} {session}{place} · {clip_note}");
+            }
+            // the prompt owns the clipboard — show the attach command
+            // instead of copying it over the prompt like deep dive does
+            Ok(jobs::DeepDive::CopyCommand(cmd)) => {
+                self.status = format!("{verb} {session} · attach: {cmd} · {clip_note}");
+            }
+            Err(err) => {
+                self.status = format!("{verb} {session}, but couldn't enter it: {err:#}");
+            }
+        }
+        self.refresh_work_sessions();
+        self.force_clear = true;
+    }
+
+    /// Sync the fleet's WORKBENCH section with the tmux server (one
+    /// list-panes round trip). Returns whether the list changed.
+    fn refresh_work_sessions(&mut self) -> bool {
+        let sessions: Vec<WorkSession> =
+            jobs::list_sessions_with_prefix(&jobs::default_socket(), "pti-work-")
+                .into_iter()
+                .map(|(session, cwd)| WorkSession {
+                    item_key: session
+                        .trim_start_matches("pti-work-")
+                        .to_uppercase(),
+                    session,
+                    cwd,
+                })
+                .collect();
+        self.work_sessions_at = Some(Instant::now());
+        if sessions != self.work_sessions {
+            self.work_sessions = sessions;
+            return true;
+        }
+        false
+    }
+
+    /// Re-enter a live work session from the fleet.
+    fn enter_work_session(&mut self, session: &str) {
+        let socket = jobs::default_socket();
+        let terminal_cmd = std::env::var("PLANE_TUI_TERMINAL_CMD").ok();
+        let template = terminal_cmd.as_deref().unwrap_or("kitty -e {cmd}");
+        match jobs::deep_dive_session(&socket, session, Some(template)) {
+            Ok(jobs::DeepDive::Switched) => self.status = format!("→ {session}"),
+            Ok(jobs::DeepDive::SpawnedTerminal(cmd)) => self.status = format!("→ {cmd}"),
+            Ok(jobs::DeepDive::CopyCommand(cmd)) => {
+                let _ = copy_to_clipboard(&cmd);
+                self.status = format!("attach command copied · {cmd}");
+            }
+            Err(err) => self.status = format!("couldn't enter {session}: {err:#}"),
+        }
+    }
+
     fn start_dispatch(&mut self) {
         if repo_registry(&self.client.config).is_empty() {
             self.status =
@@ -3080,6 +3402,15 @@ impl App {
     /// drain background comment posts. Returns true when a redraw is due.
     fn pump_agent_jobs(&mut self) -> bool {
         let mut changed = false;
+        // keep the WORKBENCH rail honest while the fleet is on screen —
+        // throttled so the tmux round trip doesn't run every tick
+        if self.jobs_open
+            && self
+                .work_sessions_at
+                .map_or(true, |at| at.elapsed() >= Duration::from_secs(2))
+        {
+            changed |= self.refresh_work_sessions();
+        }
         let mut transitions = Vec::new();
         for (index, handle) in self.agent_jobs.iter_mut().enumerate() {
             let before = handle.job.status;
@@ -3305,42 +3636,65 @@ impl App {
         order
     }
 
+    /// Fleet selection space: dispatched jobs in rail order, then live `w`
+    /// work sessions as "work:<session>" ids.
+    fn fleet_ids(&self, order: &[usize]) -> Vec<String> {
+        let mut ids: Vec<String> = order
+            .iter()
+            .map(|&i| self.agent_jobs[i].job.id.clone())
+            .collect();
+        ids.extend(
+            self.work_sessions
+                .iter()
+                .map(|session| format!("work:{}", session.session)),
+        );
+        ids
+    }
+
     fn handle_jobs_key(&mut self, key: KeyEvent) -> Result<()> {
         // selection tracks the JOB, not a row number: the list reorders
         // itself on status transitions, and a positional index would let a
         // keypress land on a different job than the one on screen
         let order = self.fleet_order();
+        let ids = self.fleet_ids(&order);
         let current_pos = self
             .jobs_sel_id
             .as_deref()
-            .and_then(|id| order.iter().position(|&i| self.agent_jobs[i].job.id == id))
+            .and_then(|id| ids.iter().position(|have| have == id))
             .unwrap_or(0);
-        let selected: Option<usize> = order.get(current_pos).copied();
-        if let Some(index) = selected {
-            self.jobs_sel_id = Some(self.agent_jobs[index].job.id.clone());
+        if let Some(id) = ids.get(current_pos) {
+            self.jobs_sel_id = Some(id.clone());
         }
+        // exactly one of these is Some: a job row or a WORKBENCH row
+        let selected: Option<usize> = (current_pos < order.len()).then(|| order[current_pos]);
+        let selected_work: Option<usize> = current_pos
+            .checked_sub(order.len())
+            .filter(|&work| work < self.work_sessions.len());
         match key.code {
             KeyCode::Esc | KeyCode::Char('J') | KeyCode::Char('q') => {
                 self.jobs_open = false;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                let pos = min(current_pos + 1, order.len().saturating_sub(1));
-                self.jobs_sel_id = order.get(pos).map(|&i| self.agent_jobs[i].job.id.clone());
+                let pos = min(current_pos + 1, ids.len().saturating_sub(1));
+                self.jobs_sel_id = ids.get(pos).cloned();
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 let pos = current_pos.saturating_sub(1);
-                self.jobs_sel_id = order.get(pos).map(|&i| self.agent_jobs[i].job.id.clone());
+                self.jobs_sel_id = ids.get(pos).cloned();
             }
             KeyCode::Char('g') | KeyCode::Home => {
-                self.jobs_sel_id = order.first().map(|&i| self.agent_jobs[i].job.id.clone());
+                self.jobs_sel_id = ids.first().cloned();
             }
             KeyCode::Char('G') | KeyCode::End => {
-                self.jobs_sel_id = order.last().map(|&i| self.agent_jobs[i].job.id.clone());
+                self.jobs_sel_id = ids.last().cloned();
             }
             KeyCode::Char('t') => {
                 if let Some(index) = selected {
                     let job = self.agent_jobs[index].job.clone();
                     self.deep_dive_job(&job);
+                } else if let Some(work) = selected_work {
+                    let session = self.work_sessions[work].session.clone();
+                    self.enter_work_session(&session);
                 }
             }
             KeyCode::Enter => {
@@ -3396,6 +3750,8 @@ impl App {
                             Err(err) => self.status = format!("cancel failed: {err:#}"),
                         }
                     }
+                } else if let Some(work) = selected_work {
+                    self.end_work_session(work);
                 }
             }
             KeyCode::Char('r') => {
@@ -3491,12 +3847,23 @@ impl App {
                             Err(err) => self.status = format!("discard failed: {err:#}"),
                         }
                     }
+                } else if let Some(work) = selected_work {
+                    self.end_work_session(work);
                 }
             }
             _ => {}
         }
         self.force_clear = true;
         Ok(())
+    }
+
+    fn end_work_session(&mut self, work: usize) {
+        let Some(session) = self.work_sessions.get(work).cloned() else {
+            return;
+        };
+        jobs::kill_session_raw(&jobs::default_socket(), &session.session);
+        self.refresh_work_sessions();
+        self.status = format!("{} work session ended", session.item_key);
     }
 
     fn draw_fleet(&self, out: &mut Screen, x: u16, y: u16, width: u16, height: u16) -> Result<()> {
@@ -3531,10 +3898,12 @@ impl App {
             Some(BG),
             false,
         )?;
+        let yours = self.work_sessions.len();
         for (text, color, on) in [
             (format!("{needs} need you"), AMBER, needs > 0),
             (format!("{failed} failed"), RED, failed > 0),
             (format!("{queued} queued"), ACCENT, queued > 0),
+            (format!("{yours} yours"), GREEN, yours > 0),
         ] {
             draw_span(out, &mut hx, y, "  ·  ", DIMMER, Some(BG), false)?;
             draw_span(
@@ -3560,13 +3929,13 @@ impl App {
 
         let list_top = y + 2;
         let list_height = height.saturating_sub(2);
-        if order.is_empty() {
+        if order.is_empty() && self.work_sessions.is_empty() {
             draw_cell(
                 out,
                 x + 1,
                 list_top,
                 width.saturating_sub(2),
-                "no agents yet — press d on a work item to dispatch one",
+                "no agents yet — d dispatches one · w opens a hands-on work session",
                 DIM,
                 Some(BG),
                 false,
@@ -3591,6 +3960,8 @@ impl App {
         enum FleetRow {
             Header(FleetBucket, usize),
             Job(usize),
+            WorkHeader(usize),
+            Work(usize),
         }
         let mut bcount = [0usize; 4];
         for &i in &order {
@@ -3606,14 +3977,25 @@ impl App {
             }
             rows.push(FleetRow::Job(pos));
         }
+        if !self.work_sessions.is_empty() {
+            rows.push(FleetRow::WorkHeader(self.work_sessions.len()));
+            for work in 0..self.work_sessions.len() {
+                rows.push(FleetRow::Work(work));
+            }
+        }
+        let ids = self.fleet_ids(&order);
         let sel_pos = self
             .jobs_sel_id
             .as_deref()
-            .and_then(|id| order.iter().position(|&i| self.agent_jobs[i].job.id == id))
+            .and_then(|id| ids.iter().position(|have| have == id))
             .unwrap_or(0);
         let sel_display = rows
             .iter()
-            .position(|r| matches!(r, FleetRow::Job(p) if *p == sel_pos))
+            .position(|row| match row {
+                FleetRow::Job(pos) => *pos == sel_pos,
+                FleetRow::Work(work) => order.len() + *work == sel_pos,
+                _ => false,
+            })
             .unwrap_or(0);
         let cap = list_height as usize;
         let start = if cap > 0 && sel_display >= cap {
@@ -3663,17 +4045,48 @@ impl App {
                     };
                     draw_cell(out, x + 1, r, rail_width, &text, fg, bg, selected)?;
                 }
+                FleetRow::WorkHeader(n) => draw_cell(
+                    out,
+                    x + 1,
+                    r,
+                    rail_width,
+                    &format!("WORKBENCH · {n}"),
+                    GREEN,
+                    Some(BG),
+                    true,
+                )?,
+                FleetRow::Work(work) => {
+                    let session = &self.work_sessions[*work];
+                    let folder = session
+                        .cwd
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| session.cwd.display().to_string());
+                    let selected = order.len() + work == sel_pos;
+                    let text = format!(
+                        "  ◆ {:<10} {:<9} you       {}",
+                        session.item_key,
+                        "OPEN",
+                        truncate(&folder, 18),
+                    );
+                    let (fg, bg) = if selected {
+                        (Color::Black, Some(PAPER))
+                    } else {
+                        (GREEN, Some(BG))
+                    };
+                    draw_cell(out, x + 1, r, rail_width, &text, fg, bg, selected)?;
+                }
             }
             r += 1;
         }
         if start > 0 || end < rows.len() {
             let above = rows[..start]
                 .iter()
-                .filter(|r| matches!(r, FleetRow::Job(_)))
+                .filter(|r| matches!(r, FleetRow::Job(_) | FleetRow::Work(_)))
                 .count();
             let below = rows[end..]
                 .iter()
-                .filter(|r| matches!(r, FleetRow::Job(_)))
+                .filter(|r| matches!(r, FleetRow::Job(_) | FleetRow::Work(_)))
                 .count();
             let hint = match (above, below) {
                 (a, b) if a > 0 && b > 0 => format!("  ↑ {a} · ↓ {b} more"),
@@ -3695,7 +4108,61 @@ impl App {
         if show_detail {
             let dx = x + left_width + 2;
             let dwidth = width.saturating_sub(left_width + 3);
-            self.draw_fleet_detail(out, dx, list_top, dwidth, list_height, order[sel_pos])?;
+            if sel_pos < order.len() {
+                self.draw_fleet_detail(out, dx, list_top, dwidth, list_height, order[sel_pos])?;
+            } else if let Some(session) = self.work_sessions.get(sel_pos - order.len()) {
+                self.draw_work_detail(out, dx, list_top, dwidth, list_height, session)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_work_detail(
+        &self,
+        out: &mut Screen,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        session: &WorkSession,
+    ) -> Result<()> {
+        let bottom = y + height;
+        let mut row = y;
+        draw_cell(
+            out,
+            x,
+            row,
+            width,
+            &format!("{} · work session", session.item_key),
+            PAPER,
+            Some(BG),
+            true,
+        )?;
+        row += 1;
+        for (text, color) in [
+            (
+                "human-driven — no worktree, changes land wherever you make them".to_owned(),
+                DIM,
+            ),
+            (format!("folder {}", session.cwd.display()), DIMMER),
+            (format!("tmux   {}", session.session), DIMMER),
+            (String::new(), DIM),
+            ("t enter the pane · c/x end the session".to_owned(), TEXT),
+        ] {
+            if row >= bottom {
+                break;
+            }
+            draw_cell(
+                out,
+                x,
+                row,
+                width,
+                &truncate(&text, width as usize),
+                color,
+                Some(BG),
+                false,
+            )?;
+            row += 1;
         }
         Ok(())
     }
@@ -3920,6 +4387,9 @@ impl App {
         if self.repo_wizard.is_some() {
             return self.handle_repo_wizard_key(key);
         }
+        if self.work_wizard.is_some() {
+            return self.handle_work_wizard_key(key);
+        }
         if self.jobs_open {
             return self.handle_jobs_key(key);
         }
@@ -3979,6 +4449,7 @@ impl App {
                 self.force_clear = true;
             }
             KeyCode::Char('d') => self.start_dispatch(),
+            KeyCode::Char('w') => self.open_work_wizard(),
             KeyCode::Char('J') => {
                 self.jobs_open = true;
                 self.jobs_sel_id = None;
@@ -4524,6 +4995,7 @@ impl App {
                 self.input_cursor = 0;
                 self.editing_key = None;
                 self.new_project_name = None;
+                self.work_item = None;
                 if mode == InputMode::Search {
                     self.search.clear();
                     self.force_clear = true;
@@ -4574,6 +5046,13 @@ impl App {
                     InputMode::FeedbackNote => {
                         let result = self.requeue_with_feedback();
                         self.soft(result);
+                        false
+                    }
+                    InputMode::WorkFolder => {
+                        let folder = expand_tilde(self.input.trim());
+                        if let Some(item_key) = self.work_item.take() {
+                            self.launch_work_session(&item_key, &folder);
+                        }
                         false
                     }
                 };
@@ -4629,6 +5108,7 @@ impl App {
         self.input_cursor = 0;
         self.editing_key = None;
         self.new_project_name = None;
+        self.work_item = None;
     }
 
     fn run_command(&mut self) -> Result<bool> {
@@ -5877,6 +6357,9 @@ impl App {
         }
         if self.skill_wizard.is_some() {
             self.draw_skill_wizard(out, width, height)?;
+        }
+        if self.work_wizard.is_some() {
+            self.draw_work_wizard(out, width, height)?;
         }
         self.present(buf, width, height)
     }
@@ -7188,6 +7671,7 @@ impl App {
                 InputMode::EditDue => "edit due → ",
                 InputMode::DispatchExtra => "dispatch note (optional, appended to the brief) → ",
                 InputMode::FeedbackNote => "feedback for the agent → ",
+                InputMode::WorkFolder => "folder for the work session → ",
             };
             input_prompt(prefix, &self.input, self.input_cursor)
         } else {
@@ -9517,8 +10001,17 @@ fn draw_help_panel(out: &mut Screen, width: u16, height: u16) -> Result<()> {
         left,
         value_x,
         row,
+        "w",
+        "work session · pick a folder → interactive agent there, latest prompt on clipboard",
+    )?;
+    row += 1;
+    draw_shortcut_row(
+        out,
+        left,
+        value_x,
+        row,
         "J",
-        "fleet · enter diff · t deep dive · f feedback · l land · c/r/x",
+        "fleet · enter diff · t deep dive · f feedback · l land · c/r/x · w sessions too",
     )?;
     row += 1;
     draw_shortcut_row(

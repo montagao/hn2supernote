@@ -31,6 +31,11 @@ pti
 - `m`, `I`, `U`: mark, invert marks, clear marks
 - `e`: edit the selected item title, description (opens `$EDITOR`), or due date
 - `d`: dispatch a coding agent on the selected item (agent cockpit — see below)
+- `w`: work on the selected item yourself — pick a folder (remembered across runs
+  in `~/.local/share/plane-tui/work-folders.tsv`, or type a path) and an interactive
+  claude/codex session opens there with the item's latest generated prompt on the
+  clipboard, ready to paste; `w` again rejoins the session. Live `w` sessions show
+  up in the fleet view under WORKBENCH (`t` enters, `c`/`x` ends the session)
 - `J`: fleet view for dispatched agents (`t` deep dive, `c` cancel, `r` retry,
   `l` land, `x` discard, `esc` close)
 - `a`: craft a direct task brief for the selected item (also `:agent`)

@@ -553,7 +553,7 @@ pub fn discard(job: &Job) -> Result<()> {
 
 // ------------------------------------------------------------------ spawn
 
-fn shell_quote(value: &str) -> String {
+pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
@@ -570,32 +570,52 @@ fn codex_sandbox() -> String {
     std::env::var("PLANE_TUI_CODEX_SANDBOX").unwrap_or_else(|_| "danger-full-access".to_owned())
 }
 
+/// The interactive-agent invocation minus any preloaded prompt — a full
+/// human-driven TUI with approvals bypassed (an unattended "proceed?" in a
+/// disposable pane is a stall). Shared by dispatched interactive jobs and
+/// `w` work sessions so their permission posture never drifts.
+pub fn interactive_agent_argv(
+    backend: &str,
+    bin: &str,
+    model: &str,
+    effort: &str,
+    claude_permission_mode: &str,
+) -> String {
+    let bin = shell_quote(bin);
+    if backend == "codex" {
+        let sandbox = codex_sandbox();
+        if sandbox == "danger-full-access" {
+            format!("{bin} --dangerously-bypass-approvals-and-sandbox")
+        } else {
+            format!(
+                "{bin} --sandbox {} --ask-for-approval never",
+                shell_quote(&sandbox),
+            )
+        }
+    } else {
+        format!(
+            "{bin} --model {} --effort {} --permission-mode {}",
+            shell_quote(model),
+            shell_quote(effort),
+            shell_quote(claude_permission_mode),
+        )
+    }
+}
+
 fn agent_command(job: &Job, dir: &Path, claude_permission_mode: &str) -> String {
     let prompt = shell_quote(&dir.join("prompt.md").display().to_string());
     let result = shell_quote(&dir.join("result.md").display().to_string());
     if job.mode == JobMode::Interactive {
         // full agent TUI with the brief preloaded; the human drives it —
-        // works with either backend, they both take an initial prompt arg.
-        // approvals stay off even here: an unattended "proceed?" is a stall
-        let bin = shell_quote(&job.model_binary());
-        return if job.backend.as_str() == "codex" {
-            let sandbox = codex_sandbox();
-            if sandbox == "danger-full-access" {
-                format!("{bin} --dangerously-bypass-approvals-and-sandbox \"$(cat {prompt})\"")
-            } else {
-                format!(
-                    "{bin} --sandbox {} --ask-for-approval never \"$(cat {prompt})\"",
-                    shell_quote(&sandbox),
-                )
-            }
-        } else {
-            format!(
-                "{bin} --model {} --effort {} --permission-mode {} \"$(cat {prompt})\"",
-                shell_quote(&job.model),
-                shell_quote(&job.effort),
-                shell_quote(claude_permission_mode),
-            )
-        };
+        // works with either backend, they both take an initial prompt arg
+        let argv = interactive_agent_argv(
+            job.backend.as_str(),
+            &job.model_binary(),
+            &job.model,
+            &job.effort,
+            claude_permission_mode,
+        );
+        return format!("{argv} \"$(cat {prompt})\"");
     }
     if job.backend.as_str() == "codex" {
         return format!(
@@ -684,8 +704,12 @@ pub fn spawn_raw(
 }
 
 pub fn session_alive(job: &Job) -> bool {
-    let mut tmux = tmux_command(&job.tmux_socket);
-    tmux.args(["has-session", "-t", &format!("={}", job.tmux_session)]);
+    session_alive_raw(&job.tmux_socket, &job.tmux_session)
+}
+
+pub fn session_alive_raw(socket: &Option<String>, session: &str) -> bool {
+    let mut tmux = tmux_command(socket);
+    tmux.args(["has-session", "-t", &format!("={session}")]);
     tmux.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -695,13 +719,53 @@ pub fn session_alive(job: &Job) -> bool {
 }
 
 pub fn kill_session(job: &Job) {
-    let mut tmux = tmux_command(&job.tmux_socket);
-    tmux.args(["kill-session", "-t", &format!("={}", job.tmux_session)]);
+    kill_session_raw(&job.tmux_socket, &job.tmux_session)
+}
+
+pub fn kill_session_raw(socket: &Option<String>, session: &str) {
+    let mut tmux = tmux_command(socket);
+    tmux.args(["kill-session", "-t", &format!("={session}")]);
     let _ = tmux
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Live sessions on the server whose names start with `prefix`, with each
+/// session's current pane path: (session, cwd). One `list-panes -a` round
+/// trip; sessions with several panes are deduped to their first pane.
+pub fn list_sessions_with_prefix(socket: &Option<String>, prefix: &str) -> Vec<(String, PathBuf)> {
+    let mut tmux = tmux_command(socket);
+    tmux.args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}\t#{pane_current_path}",
+    ]);
+    let Ok(output) = tmux
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.splitn(2, '\t');
+        let (Some(name), Some(path)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !name.starts_with(prefix) || sessions.iter().any(|(have, _)| have == name) {
+            continue;
+        }
+        sessions.push((name.to_owned(), PathBuf::from(path)));
+    }
+    sessions.sort();
+    sessions
 }
 
 // ------------------------------------------------------------- monitoring
@@ -962,10 +1026,10 @@ pub enum DeepDive {
     CopyCommand(String),
 }
 
-pub fn attach_command(job: &Job) -> String {
-    match &job.tmux_socket {
-        Some(socket) => format!("tmux -L {socket} attach -t {}", job.tmux_session),
-        None => format!("tmux attach -t {}", job.tmux_session),
+pub fn attach_command_raw(socket: &Option<String>, session: &str) -> String {
+    match socket {
+        Some(socket) => format!("tmux -L {socket} attach -t {session}"),
+        None => format!("tmux attach -t {session}"),
     }
 }
 
@@ -973,13 +1037,21 @@ pub fn attach_command(job: &Job) -> String {
 /// Standalone with a terminal command configured: spawn a window.
 /// Otherwise: hand back the attach command for the caller to copy.
 pub fn deep_dive(job: &Job, terminal_cmd: Option<&str>) -> Result<DeepDive> {
-    if std::env::var_os("TMUX").is_some() && job.tmux_socket.is_none() {
+    deep_dive_session(&job.tmux_socket, &job.tmux_session, terminal_cmd)
+}
+
+pub fn deep_dive_session(
+    socket: &Option<String>,
+    session: &str,
+    terminal_cmd: Option<&str>,
+) -> Result<DeepDive> {
+    if std::env::var_os("TMUX").is_some() && socket.is_none() {
         let mut tmux = tmux_command(&None);
-        tmux.args(["switch-client", "-t", &format!("={}", job.tmux_session)]);
+        tmux.args(["switch-client", "-t", &format!("={session}")]);
         run_quiet(tmux).context("tmux switch-client")?;
         return Ok(DeepDive::Switched);
     }
-    let attach = attach_command(job);
+    let attach = attach_command_raw(socket, session);
     if let Some(template) = terminal_cmd {
         let full = template.replace("{cmd}", &attach);
         let mut parts = full.split_whitespace();
@@ -1609,6 +1681,43 @@ mod tests {
         assert!(session_alive(&job), "pane should linger after exit");
         kill_session(&job);
         assert!(!session_alive(&job));
+        let mut kill_server = tmux_command(&socket);
+        kill_server.arg("kill-server");
+        let _ = run_quiet(kill_server);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn work_sessions_list_and_kill() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux not installed — skipping integration test");
+            return;
+        }
+        let socket = Some(format!("pti-work-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pti-work-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        spawn_raw(&socket, "pti-work-tm-7", &dir, "sleep 30", None).unwrap();
+        spawn_raw(&socket, "pti-other", &dir, "sleep 30", None).unwrap();
+
+        let sessions = list_sessions_with_prefix(&socket, "pti-work-");
+        assert_eq!(
+            sessions.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            vec!["pti-work-tm-7"],
+            "prefix filter should hide pti-other"
+        );
+        let cwd = &sessions[0].1;
+        assert_eq!(
+            cwd.canonicalize().unwrap(),
+            dir.canonicalize().unwrap(),
+            "pane cwd should be the folder the session was started in"
+        );
+
+        assert!(session_alive_raw(&socket, "pti-work-tm-7"));
+        kill_session_raw(&socket, "pti-work-tm-7");
+        assert!(!session_alive_raw(&socket, "pti-work-tm-7"));
+        assert!(list_sessions_with_prefix(&socket, "pti-work-").is_empty());
+
         let mut kill_server = tmux_command(&socket);
         kill_server.arg("kill-server");
         let _ = run_quiet(kill_server);
