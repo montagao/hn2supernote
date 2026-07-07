@@ -817,6 +817,68 @@ pub fn extract_stream_result(dir: &Path) -> Option<String> {
     None
 }
 
+fn log_has_incomplete_background_task(log: &str) -> bool {
+    if log.contains("Background tasks still running after") && log.contains("terminating") {
+        return true;
+    }
+    for line in log.lines() {
+        let clean = strip_ansi(line);
+        let trimmed = clean.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) == Some("system")
+            && event.get("subtype").and_then(Value::as_str) == Some("task_notification")
+            && event.get("status").and_then(Value::as_str) == Some("stopped")
+            && event
+                .get("output_file")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn result_mentions_pending_delegated_work(result: &str) -> bool {
+    let lower = result.to_lowercase();
+    (lower.contains("waiting on") || lower.contains("wait on"))
+        && (lower.contains("background")
+            || lower.contains("subagent")
+            || lower.contains("sub-agent")
+            || lower.contains("investigation")
+            || lower.contains("agents' work")
+            || lower.contains("agents’ work"))
+}
+
+fn incomplete_success_reason(dir: &Path, result: &str) -> Option<&'static str> {
+    let log = fs::read_to_string(dir.join("log.txt")).unwrap_or_default();
+    if log_has_incomplete_background_task(&log) {
+        return Some("Claude stopped with unfinished background task output");
+    }
+    if result_mentions_pending_delegated_work(result) {
+        return Some("Claude reported that delegated background work was still pending");
+    }
+    None
+}
+
+fn mark_incomplete_success_as_question(dir: &Path, result: &str, reason: &str) {
+    let trimmed = result.trim();
+    let body = if trimmed.is_empty() {
+        format!("QUESTION: {reason}. The agent exited before this work was actually complete.")
+    } else {
+        format!(
+            "QUESTION: {reason}. The agent exited before this work was actually complete.\n\n{trimmed}"
+        )
+    };
+    let _ = fs::write(dir.join("result.md"), body);
+}
+
 /// One monitoring tick: tail new log bytes, then settle Running jobs into
 /// Review / Question / Failed / Orphaned. Returns true when anything changed.
 pub fn pump(handle: &mut JobHandle) -> bool {
@@ -867,10 +929,11 @@ pub fn pump(handle: &mut JobHandle) -> bool {
                     let _ = fs::write(handle.dir.join("result.md"), result);
                 }
             }
-            if read_result(&handle.dir)
-                .trim_start()
-                .starts_with("QUESTION:")
-            {
+            let result = read_result(&handle.dir);
+            if result.trim_start().starts_with("QUESTION:") {
+                Some(JobStatus::Question)
+            } else if let Some(reason) = incomplete_success_reason(&handle.dir, &result) {
+                mark_incomplete_success_as_question(&handle.dir, &result, reason);
                 Some(JobStatus::Question)
             } else {
                 Some(JobStatus::Review)
@@ -1082,6 +1145,57 @@ mod tests {
         assert_eq!(
             extract_stream_result(&dir).as_deref(),
             Some("Fixed the retry loop; 61 tests pass.")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incomplete_background_result_becomes_question() {
+        let dir = std::env::temp_dir().join(format!("pti-bg-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let result = "Waiting on the two background investigations now: one tracing AI transform, one tracing Translate tab.";
+        fs::write(
+            dir.join("log.txt"),
+            format!(
+                "Background tasks still running after 600s; terminating.\n{{\"type\":\"result\",\"subtype\":\"success\",\"result\":{}}}\n",
+                serde_json::to_string(result).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("exit"), "0").unwrap();
+        let job = Job {
+            id: "t".into(),
+            item_key: "TM-625".into(),
+            item_id: String::new(),
+            project_id: String::new(),
+            title: "AI transform".into(),
+            backend: "claude".into(),
+            model: "claude-fable-5".into(),
+            effort: "high".into(),
+            attempt: 1,
+            repo: dir.clone(),
+            worktree: dir.clone(),
+            branch: "tm-625".into(),
+            base_ref: String::new(),
+            tmux_socket: Some("unused".into()),
+            tmux_session: "pti-tm-625-a1".into(),
+            status: JobStatus::Running,
+            created_at: String::new(),
+            started_at: None,
+            mode: JobMode::Headless,
+            stance: JobStance::Implement,
+            skills: Vec::new(),
+        };
+        let mut handle = JobHandle::new(dir.clone(), job);
+
+        pump(&mut handle);
+
+        assert_eq!(handle.job.status, JobStatus::Question);
+        assert!(
+            read_result(&dir).starts_with("QUESTION:"),
+            "result should ask for human follow-up: {}",
+            read_result(&dir)
         );
         let _ = fs::remove_dir_all(&dir);
     }
