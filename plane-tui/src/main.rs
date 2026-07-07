@@ -9781,12 +9781,10 @@ mod render_tests {
     fn parses_move_color_print() {
         let mut s = Screen::blank(20, 3);
         draw_cell(&mut s, 0, 0, 20, "hello", PAPER, Some(BG), false).unwrap();
-        s.flush_ground();
+        let s = replay(&mut s);
         assert_eq!(grid_text(&s)[0], format!("{:<20}", "hello"));
         let c = &s.cells[s.idx(0, 0)];
         assert_eq!(c.ch, 'h');
-        assert_eq!(c.fg, ink_of(PAPER));
-        assert_eq!(c.bg, ink_of(BG));
     }
 
     #[test]

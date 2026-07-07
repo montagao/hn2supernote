@@ -749,7 +749,13 @@ pub fn format_stream_event(line: &str) -> StreamLine {
     };
     match event.get("type").and_then(Value::as_str) {
         Some("system") => {
-            let model = event.get("model").and_then(Value::as_str).unwrap_or("?");
+            if event.get("subtype").and_then(Value::as_str) != Some("init") {
+                return StreamLine::Skip;
+            }
+            let model = event
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("claude");
             StreamLine::Show(format!("· session started — {model}"))
         }
         Some("assistant") => {
@@ -1037,6 +1043,17 @@ mod tests {
         assert!(matches!(
             format_stream_event(r#"{"type":"result","subtype":"success","result":"done"}"#),
             StreamLine::Show(_)
+        ));
+        match format_stream_event(r#"{"type":"system","subtype":"init","model":"claude-fable-5"}"#)
+        {
+            StreamLine::Show(line) => assert_eq!(line, "· session started — claude-fable-5"),
+            _ => panic!("system init should render"),
+        }
+        assert!(matches!(
+            format_stream_event(
+                r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":50}"#
+            ),
+            StreamLine::Skip
         ));
         assert!(matches!(
             format_stream_event("plain codex output line"),
