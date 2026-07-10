@@ -1259,6 +1259,56 @@ struct WorkSession {
     cwd: PathBuf,
 }
 
+// tmux allocates session names dynamically, but keeping them bounded makes
+// status lines and attach commands usable. The item key always wins; the title
+// gets every remaining byte.
+const WORK_SESSION_NAME_MAX_BYTES: usize = 200;
+const WORK_SESSION_PREFIX: &str = "pti-work-";
+
+fn work_session_name(item_key: &str, title: &str) -> String {
+    let base = format!("{WORK_SESSION_PREFIX}{}", item_key.to_lowercase());
+    let mut slug = String::new();
+    let mut separator_pending = false;
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            if separator_pending && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(ch);
+            separator_pending = false;
+        } else if !slug.is_empty() {
+            separator_pending = true;
+        }
+    }
+    if slug.is_empty() || base.len() + 2 >= WORK_SESSION_NAME_MAX_BYTES {
+        return base;
+    }
+
+    let available = WORK_SESSION_NAME_MAX_BYTES - base.len() - 2;
+    let end = slug
+        .char_indices()
+        .take_while(|(index, ch)| index + ch.len_utf8() <= available)
+        .map(|(index, ch)| index + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let slug = slug[..end].trim_end_matches('-');
+    if slug.is_empty() {
+        base
+    } else {
+        format!("{base}--{slug}")
+    }
+}
+
+fn work_session_item_key(session: &str) -> Option<String> {
+    let rest = session.strip_prefix(WORK_SESSION_PREFIX)?;
+    let key = rest.split_once("--").map_or(rest, |(key, _)| key);
+    (!key.is_empty()).then(|| key.to_uppercase())
+}
+
+fn work_session_matches_item(session: &str, item_key: &str) -> bool {
+    work_session_item_key(session).is_some_and(|key| key.eq_ignore_ascii_case(item_key))
+}
+
 /// The `w` flow: pick a folder for the selected item and get a human-driven
 /// interactive agent session there, latest generated prompt on the clipboard.
 #[derive(Debug)]
@@ -2620,7 +2670,18 @@ impl App {
         };
         let config = &self.client.config;
         let socket = jobs::default_socket();
-        let session = format!("pti-work-{}", item_key.to_lowercase());
+        let title = self
+            .find_index_by_key(item_key)
+            .map(|index| self.project().items[index].title.as_str())
+            .unwrap_or_default();
+        let preferred_session = work_session_name(item_key, title);
+        // Rejoin both legacy key-only sessions and title-bearing sessions made
+        // before an item was renamed instead of opening a duplicate.
+        let session = jobs::list_sessions_with_prefix(&socket, WORK_SESSION_PREFIX)
+            .into_iter()
+            .map(|(session, _)| session)
+            .find(|session| work_session_matches_item(session, item_key))
+            .unwrap_or(preferred_session);
         let mut verb = "rejoined";
         if !jobs::session_alive_raw(&socket, &session) {
             verb = "opened";
@@ -2670,14 +2731,14 @@ impl App {
     /// list-panes round trip). Returns whether the list changed.
     fn refresh_work_sessions(&mut self) -> bool {
         let sessions: Vec<WorkSession> =
-            jobs::list_sessions_with_prefix(&jobs::default_socket(), "pti-work-")
+            jobs::list_sessions_with_prefix(&jobs::default_socket(), WORK_SESSION_PREFIX)
                 .into_iter()
-                .map(|(session, cwd)| WorkSession {
-                    item_key: session
-                        .trim_start_matches("pti-work-")
-                        .to_uppercase(),
-                    session,
-                    cwd,
+                .filter_map(|(session, cwd)| {
+                    Some(WorkSession {
+                        item_key: work_session_item_key(&session)?,
+                        session,
+                        cwd,
+                    })
                 })
                 .collect();
         self.work_sessions_at = Some(Instant::now());
@@ -10244,6 +10305,40 @@ fn draw_overlay(out: &mut Screen, width: u16, height: u16, lines: &[&str]) -> Re
 #[cfg(test)]
 mod render_tests {
     use super::*;
+
+    #[test]
+    fn work_session_names_include_the_item_title() {
+        assert_eq!(
+            work_session_name("TM-201", "Upload retry loop (phase 2)"),
+            "pti-work-tm-201--upload-retry-loop-phase-2"
+        );
+        assert_eq!(
+            work_session_item_key("pti-work-tm-201--upload-retry-loop-phase-2").as_deref(),
+            Some("TM-201")
+        );
+    }
+
+    #[test]
+    fn work_session_names_use_all_safe_space_without_splitting_unicode() {
+        let name = work_session_name("TM-201", &"é".repeat(200));
+
+        assert!(name.len() <= WORK_SESSION_NAME_MAX_BYTES);
+        assert!(name.starts_with("pti-work-tm-201--"));
+        assert!(name.is_char_boundary(name.len()));
+    }
+
+    #[test]
+    fn work_session_matching_supports_legacy_names_without_key_prefix_collisions() {
+        assert!(work_session_matches_item("pti-work-tm-1", "TM-1"));
+        assert!(work_session_matches_item(
+            "pti-work-tm-1--short-title",
+            "TM-1"
+        ));
+        assert!(!work_session_matches_item(
+            "pti-work-tm-10--short-title",
+            "TM-1"
+        ));
+    }
 
     fn grid_text(s: &Screen) -> Vec<String> {
         (0..s.h)
