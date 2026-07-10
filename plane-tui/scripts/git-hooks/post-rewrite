@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Runs after `git rebase` / `git commit --amend` (e.g. `git pull --rebase`).
+# Delegates to the shared autobuild logic; stdin (the rewrite map) is ignored.
+exec "$(git rev-parse --show-toplevel)/plane-tui/scripts/git-hooks/_pti-autobuild.sh" "$@"

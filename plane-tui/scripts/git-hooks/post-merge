@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Runs after `git merge` / `git pull`. Delegates to the shared autobuild logic.
+exec "$(git rev-parse --show-toplevel)/plane-tui/scripts/git-hooks/_pti-autobuild.sh" "$@"
