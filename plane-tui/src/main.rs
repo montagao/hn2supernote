@@ -403,62 +403,131 @@ fn label_executor(labels: &[String]) -> Option<AgentBackend> {
     None
 }
 const BUSINESS_CONTEXT: &str = include_str!("business_context.md");
-const BG: Color = Color::Rgb { r: 9, g: 12, b: 17 };
-const BG_RAISE: Color = Color::Rgb {
-    r: 13,
-    g: 17,
-    b: 24,
+const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    Color::Rgb { r, g, b }
+}
+
+/// A named color scheme. Every drawing routine reads its colors from the
+/// process-wide active theme via the `theme()` accessor, so switching schemes
+/// at runtime only means swapping the active `Theme` and repainting.
+#[derive(Clone, Copy)]
+struct Theme {
+    name: &'static str,
+    /// App background (the darkest/base surface).
+    bg: Color,
+    /// Slightly raised panels and headers.
+    bg_raise: Color,
+    /// Card / cell fill.
+    cell_bg: Color,
+    /// Borders and dividers.
+    line: Color,
+    /// Brightest text — headings, selection foreground.
+    paper: Color,
+    /// Foreground for text painted on top of a bright/highlight fill (selection,
+    /// tabs, active menu rows). Dark on light schemes, light on dark ones.
+    ink: Color,
+    /// Muted secondary text.
+    dim: Color,
+    /// Faint tertiary text and hairlines.
+    dimmer: Color,
+    /// Primary accent — selection, links, active state.
+    accent: Color,
+    /// Body text (warm).
+    text: Color,
+    /// Warning / in-progress.
+    amber: Color,
+    /// Error / urgent.
+    red: Color,
+    /// Success / done.
+    green: Color,
+}
+
+/// The original warm-on-indigo dark scheme — the default.
+const THEME_MIDNIGHT: Theme = Theme {
+    name: "midnight",
+    bg: rgb(9, 12, 17),
+    bg_raise: rgb(13, 17, 24),
+    cell_bg: rgb(15, 19, 27),
+    line: rgb(35, 42, 54),
+    paper: rgb(207, 194, 165),
+    ink: Color::Black,
+    dim: rgb(102, 101, 111),
+    dimmer: rgb(70, 72, 84),
+    accent: rgb(91, 113, 202),
+    text: rgb(205, 174, 132),
+    amber: rgb(211, 151, 54),
+    red: rgb(224, 105, 91),
+    green: rgb(101, 203, 142),
 };
-const CELL_BG: Color = Color::Rgb {
-    r: 15,
-    g: 19,
-    b: 27,
+
+/// Gruvbox-flavored warm dark scheme.
+const THEME_GRUVBOX: Theme = Theme {
+    name: "gruvbox",
+    bg: rgb(29, 32, 33),
+    bg_raise: rgb(40, 40, 40),
+    cell_bg: rgb(50, 48, 47),
+    line: rgb(80, 73, 69),
+    paper: rgb(251, 241, 199),
+    ink: Color::Black,
+    dim: rgb(168, 153, 132),
+    dimmer: rgb(124, 111, 100),
+    accent: rgb(131, 165, 152),
+    text: rgb(235, 219, 178),
+    amber: rgb(250, 189, 47),
+    red: rgb(251, 73, 52),
+    green: rgb(184, 187, 38),
 };
-const LINE: Color = Color::Rgb {
-    r: 35,
-    g: 42,
-    b: 54,
+
+/// Light scheme — dark ink on warm off-white.
+const THEME_DAYLIGHT: Theme = Theme {
+    name: "daylight",
+    bg: rgb(245, 242, 235),
+    bg_raise: rgb(237, 233, 223),
+    cell_bg: rgb(231, 226, 214),
+    line: rgb(208, 199, 182),
+    paper: rgb(41, 37, 32),
+    ink: rgb(247, 245, 240),
+    dim: rgb(112, 104, 92),
+    dimmer: rgb(163, 155, 141),
+    accent: rgb(45, 90, 185),
+    text: rgb(60, 52, 42),
+    amber: rgb(171, 116, 20),
+    red: rgb(188, 61, 50),
+    green: rgb(43, 130, 74),
 };
-const PAPER: Color = Color::Rgb {
-    r: 207,
-    g: 194,
-    b: 165,
-};
-const DIM: Color = Color::Rgb {
-    r: 102,
-    g: 101,
-    b: 111,
-};
-const DIMMER: Color = Color::Rgb {
-    r: 70,
-    g: 72,
-    b: 84,
-};
-const ACCENT: Color = Color::Rgb {
-    r: 91,
-    g: 113,
-    b: 202,
-};
-const TEXT: Color = Color::Rgb {
-    r: 205,
-    g: 174,
-    b: 132,
-};
-const AMBER: Color = Color::Rgb {
-    r: 211,
-    g: 151,
-    b: 54,
-};
-const RED: Color = Color::Rgb {
-    r: 224,
-    g: 105,
-    b: 91,
-};
-const GREEN: Color = Color::Rgb {
-    r: 101,
-    g: 203,
-    b: 142,
-};
+
+/// All selectable schemes, in cycle order. The first entry is the default.
+const THEMES: &[Theme] = &[THEME_MIDNIGHT, THEME_GRUVBOX, THEME_DAYLIGHT];
+
+thread_local! {
+    static ACTIVE_THEME: std::cell::Cell<Theme> = std::cell::Cell::new(THEME_MIDNIGHT);
+}
+
+/// The active color scheme. Cheap (a `Copy` of ~64 bytes from a thread-local);
+/// rendering happens on the main thread, which is where the theme is set.
+fn theme() -> Theme {
+    ACTIVE_THEME.with(|t| t.get())
+}
+
+/// Swap the active color scheme for the current (rendering) thread.
+fn set_active_theme(scheme: Theme) {
+    ACTIVE_THEME.with(|t| t.set(scheme));
+}
+
+/// Look up a scheme by (case-insensitive) name.
+fn theme_by_name(name: &str) -> Option<Theme> {
+    let name = name.trim();
+    THEMES
+        .iter()
+        .copied()
+        .find(|t| t.name.eq_ignore_ascii_case(name))
+}
+
+/// The scheme after `name` in cycle order (wraps); falls back to the default.
+fn next_theme(name: &str) -> Theme {
+    let index = THEMES.iter().position(|t| t.name == name).unwrap_or(0);
+    THEMES[(index + 1) % THEMES.len()]
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -495,6 +564,9 @@ struct Args {
     auto_refresh: u64,
     #[arg(long, env = "PLANE_TUI_WIP_LIMIT", default_value_t = 2)]
     wip_limit: usize,
+    /// Color scheme: midnight, gruvbox, or daylight (also cycled live with C / :theme).
+    #[arg(long, env = "PLANE_TUI_THEME")]
+    theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,6 +609,7 @@ struct Config {
     context_file: Option<String>,
     auto_refresh_mins: u64,
     wip_limit: usize,
+    theme_name: String,
 }
 
 impl Config {
@@ -615,6 +688,11 @@ impl Config {
             context_file: args.context_file,
             auto_refresh_mins: args.auto_refresh,
             wip_limit: args.wip_limit,
+            theme_name: args
+                .theme
+                .filter(|name| !name.trim().is_empty())
+                .or_else(saved_theme_name)
+                .unwrap_or_else(|| THEME_MIDNIGHT.name.to_owned()),
         })
     }
 }
@@ -938,11 +1016,11 @@ impl StateKind {
 
     fn color(self) -> Color {
         match self {
-            Self::Backlog => DIM,
-            Self::Todo => PAPER,
-            Self::Started => AMBER,
-            Self::Done => GREEN,
-            Self::Cancelled => RED,
+            Self::Backlog => theme().dim,
+            Self::Todo => theme().paper,
+            Self::Started => theme().amber,
+            Self::Done => theme().green,
+            Self::Cancelled => theme().red,
         }
     }
 }
@@ -989,8 +1067,8 @@ impl Priority {
 
     fn color(self) -> Color {
         match self {
-            Self::Urgent => RED,
-            Self::High => AMBER,
+            Self::Urgent => theme().red,
+            Self::High => theme().amber,
             Self::Medium => Color::Rgb {
                 r: 218,
                 g: 201,
@@ -1001,7 +1079,7 @@ impl Priority {
                 g: 166,
                 b: 207,
             },
-            Self::None => DIM,
+            Self::None => theme().dim,
         }
     }
 }
@@ -1145,10 +1223,10 @@ impl FleetBucket {
     }
     fn color(self) -> Color {
         match self {
-            FleetBucket::NeedsYou => AMBER,
-            FleetBucket::Running => GREEN,
-            FleetBucket::Queued => ACCENT,
-            FleetBucket::Done => DIMMER,
+            FleetBucket::NeedsYou => theme().amber,
+            FleetBucket::Running => theme().green,
+            FleetBucket::Queued => theme().accent,
+            FleetBucket::Done => theme().dimmer,
         }
     }
 }
@@ -1257,6 +1335,56 @@ struct WorkSession {
     session: String,
     item_key: String,
     cwd: PathBuf,
+}
+
+// tmux allocates session names dynamically, but keeping them bounded makes
+// status lines and attach commands usable. The item key always wins; the title
+// gets every remaining byte.
+const WORK_SESSION_NAME_MAX_BYTES: usize = 200;
+const WORK_SESSION_PREFIX: &str = "pti-work-";
+
+fn work_session_name(item_key: &str, title: &str) -> String {
+    let base = format!("{WORK_SESSION_PREFIX}{}", item_key.to_lowercase());
+    let mut slug = String::new();
+    let mut separator_pending = false;
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            if separator_pending && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(ch);
+            separator_pending = false;
+        } else if !slug.is_empty() {
+            separator_pending = true;
+        }
+    }
+    if slug.is_empty() || base.len() + 2 >= WORK_SESSION_NAME_MAX_BYTES {
+        return base;
+    }
+
+    let available = WORK_SESSION_NAME_MAX_BYTES - base.len() - 2;
+    let end = slug
+        .char_indices()
+        .take_while(|(index, ch)| index + ch.len_utf8() <= available)
+        .map(|(index, ch)| index + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let slug = slug[..end].trim_end_matches('-');
+    if slug.is_empty() {
+        base
+    } else {
+        format!("{base}--{slug}")
+    }
+}
+
+fn work_session_item_key(session: &str) -> Option<String> {
+    let rest = session.strip_prefix(WORK_SESSION_PREFIX)?;
+    let key = rest.split_once("--").map_or(rest, |(key, _)| key);
+    (!key.is_empty()).then(|| key.to_uppercase())
+}
+
+fn work_session_matches_item(session: &str, item_key: &str) -> bool {
+    work_session_item_key(session).is_some_and(|key| key.eq_ignore_ascii_case(item_key))
 }
 
 /// The `w` flow: pick a folder for the selected item and get a human-driven
@@ -1959,6 +2087,42 @@ impl App {
             .map(|index| &self.project().items[index])
     }
 
+    fn select_item_by_key(&mut self, key: &str) -> bool {
+        let Some(index) = self.find_index_by_key(key) else {
+            self.clamp_selection();
+            return false;
+        };
+        let state = self.project().items[index].state;
+        if !self.matches(&self.project().items[index]) {
+            self.search.clear();
+            self.filter = FilterMode::All;
+        }
+
+        let mut selected = false;
+        if let Some(column) = self
+            .board_states()
+            .iter()
+            .position(|candidate| *candidate == state)
+        {
+            self.column = column;
+            let indices = self.filtered_indices_for_state(state);
+            if let Some(row) = indices.iter().position(|candidate| *candidate == index) {
+                self.row = row;
+                selected = true;
+            }
+        }
+        let indices = self.flat_indices();
+        if let Some(cursor) = indices.iter().position(|candidate| *candidate == index) {
+            self.cursor = cursor;
+            selected = true;
+        }
+        if !selected {
+            self.clamp_selection();
+        }
+        self.force_clear = true;
+        selected
+    }
+
     fn clamp_selection(&mut self) {
         let states = self.board_states();
         self.column = self.column.min(states.len().saturating_sub(1));
@@ -2145,11 +2309,11 @@ impl App {
                 truncate(&pick.description, 58),
             );
             let (fg, bg) = if selected {
-                (Color::Black, Some(PAPER))
+                (theme().ink, Some(theme().paper))
             } else if pick.selected {
-                (TEXT, Some(BG))
+                (theme().text, Some(theme().bg))
             } else {
-                (DIM, Some(BG))
+                (theme().dim, Some(theme().bg))
             };
             draw_cell(out, inner_x, row, inner_width, &text, fg, bg, selected)?;
             row += 1;
@@ -2160,8 +2324,8 @@ impl App {
             y + box_height.saturating_sub(2),
             inner_width,
             "enter/space toggle · j/k move · esc back to dispatch",
-            DIM,
-            Some(BG),
+            theme().dim,
+            Some(theme().bg),
             false,
         )?;
         Ok(())
@@ -2425,11 +2589,11 @@ impl App {
                 truncate(&pick.path.display().to_string(), 48),
             );
             let (fg, bg) = if selected {
-                (Color::Black, Some(PAPER))
+                (theme().ink, Some(theme().paper))
             } else if pick.source == RepoSource::Unregistered {
-                (DIM, Some(BG))
+                (theme().dim, Some(theme().bg))
             } else {
-                (TEXT, Some(BG))
+                (theme().text, Some(theme().bg))
             };
             draw_cell(out, inner_x, row, inner_width, &text, fg, bg, selected)?;
             row += 1;
@@ -2440,8 +2604,8 @@ impl App {
             y + box_height.saturating_sub(2),
             inner_width,
             "enter/space add·remove · j/k move · esc close · r in dispatch menu cycles these",
-            DIM,
-            Some(BG),
+            theme().dim,
+            Some(theme().bg),
             false,
         )?;
         Ok(())
@@ -2561,9 +2725,9 @@ impl App {
                 None => " type a path…".to_owned(),
             };
             let (fg, bg) = if selected {
-                (Color::Black, Some(PAPER))
+                (theme().ink, Some(theme().paper))
             } else {
-                (TEXT, Some(BG))
+                (theme().text, Some(theme().bg))
             };
             draw_cell(out, inner_x, row, inner_width, &text, fg, bg, selected)?;
             row += 1;
@@ -2574,8 +2738,8 @@ impl App {
             y + box_height.saturating_sub(2),
             inner_width,
             "enter open interactive session here (prompt → clipboard) · j/k move · esc cancel",
-            DIM,
-            Some(BG),
+            theme().dim,
+            Some(theme().bg),
             false,
         )?;
         Ok(())
@@ -2620,7 +2784,18 @@ impl App {
         };
         let config = &self.client.config;
         let socket = jobs::default_socket();
-        let session = format!("pti-work-{}", item_key.to_lowercase());
+        let title = self
+            .find_index_by_key(item_key)
+            .map(|index| self.project().items[index].title.as_str())
+            .unwrap_or_default();
+        let preferred_session = work_session_name(item_key, title);
+        // Rejoin both legacy key-only sessions and title-bearing sessions made
+        // before an item was renamed instead of opening a duplicate.
+        let session = jobs::list_sessions_with_prefix(&socket, WORK_SESSION_PREFIX)
+            .into_iter()
+            .map(|(session, _)| session)
+            .find(|session| work_session_matches_item(session, item_key))
+            .unwrap_or(preferred_session);
         let mut verb = "rejoined";
         if !jobs::session_alive_raw(&socket, &session) {
             verb = "opened";
@@ -2670,14 +2845,14 @@ impl App {
     /// list-panes round trip). Returns whether the list changed.
     fn refresh_work_sessions(&mut self) -> bool {
         let sessions: Vec<WorkSession> =
-            jobs::list_sessions_with_prefix(&jobs::default_socket(), "pti-work-")
+            jobs::list_sessions_with_prefix(&jobs::default_socket(), WORK_SESSION_PREFIX)
                 .into_iter()
-                .map(|(session, cwd)| WorkSession {
-                    item_key: session
-                        .trim_start_matches("pti-work-")
-                        .to_uppercase(),
-                    session,
-                    cwd,
+                .filter_map(|(session, cwd)| {
+                    Some(WorkSession {
+                        item_key: work_session_item_key(&session)?,
+                        session,
+                        cwd,
+                    })
                 })
                 .collect();
         self.work_sessions_at = Some(Instant::now());
@@ -3599,13 +3774,13 @@ impl App {
             .rev()
             .find(|handle| handle.job.item_key == key && handle.job.status.is_active())?;
         Some(match handle.job.status {
-            jobs::JobStatus::Briefing => ("✎", AMBER),
-            jobs::JobStatus::Queued => ("●", DIMMER),
-            jobs::JobStatus::Running if handle.stalled => ("⚠", AMBER),
-            jobs::JobStatus::Running => ("⚑", GREEN),
-            jobs::JobStatus::Review => ("⚑", AMBER),
-            jobs::JobStatus::Question => ("?", AMBER),
-            jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => ("✗", RED),
+            jobs::JobStatus::Briefing => ("✎", theme().amber),
+            jobs::JobStatus::Queued => ("●", theme().dimmer),
+            jobs::JobStatus::Running if handle.stalled => ("⚠", theme().amber),
+            jobs::JobStatus::Running => ("⚑", theme().green),
+            jobs::JobStatus::Review => ("⚑", theme().amber),
+            jobs::JobStatus::Question => ("?", theme().amber),
+            jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => ("✗", theme().red),
             _ => return None,
         })
     }
@@ -3885,34 +4060,34 @@ impl App {
                 needs += 1;
             }
         }
-        draw_cell(out, x, y, width, "", DIM, Some(BG), false)?;
+        draw_cell(out, x, y, width, "", theme().dim, Some(theme().bg), false)?;
         let mut hx = x + 1;
-        draw_span(out, &mut hx, y, "fleet", PAPER, Some(BG), true)?;
-        draw_span(out, &mut hx, y, "   ", DIM, Some(BG), false)?;
+        draw_span(out, &mut hx, y, "fleet", theme().paper, Some(theme().bg), true)?;
+        draw_span(out, &mut hx, y, "   ", theme().dim, Some(theme().bg), false)?;
         draw_span(
             out,
             &mut hx,
             y,
             &format!("running {running}/{}", agent_wip()),
-            if running > 0 { GREEN } else { DIM },
-            Some(BG),
+            if running > 0 { theme().green } else { theme().dim },
+            Some(theme().bg),
             false,
         )?;
         let yours = self.work_sessions.len();
         for (text, color, on) in [
-            (format!("{needs} need you"), AMBER, needs > 0),
-            (format!("{failed} failed"), RED, failed > 0),
-            (format!("{queued} queued"), ACCENT, queued > 0),
-            (format!("{yours} yours"), GREEN, yours > 0),
+            (format!("{needs} need you"), theme().amber, needs > 0),
+            (format!("{failed} failed"), theme().red, failed > 0),
+            (format!("{queued} queued"), theme().accent, queued > 0),
+            (format!("{yours} yours"), theme().green, yours > 0),
         ] {
-            draw_span(out, &mut hx, y, "  ·  ", DIMMER, Some(BG), false)?;
+            draw_span(out, &mut hx, y, "  ·  ", theme().dimmer, Some(theme().bg), false)?;
             draw_span(
                 out,
                 &mut hx,
                 y,
                 &text,
-                if on { color } else { DIM },
-                Some(BG),
+                if on { color } else { theme().dim },
+                Some(theme().bg),
                 on,
             )?;
         }
@@ -3922,8 +4097,8 @@ impl App {
             &mut dx,
             y + 1,
             &"─".repeat(width as usize),
-            LINE,
-            Some(BG),
+            theme().line,
+            Some(theme().bg),
             false,
         )?;
 
@@ -3936,8 +4111,8 @@ impl App {
                 list_top,
                 width.saturating_sub(2),
                 "no agents yet — d dispatches one · w opens a hands-on work session",
-                DIM,
-                Some(BG),
+                theme().dim,
+                Some(theme().bg),
                 false,
             )?;
             return Ok(());
@@ -3952,7 +4127,7 @@ impl App {
         if show_detail {
             for r in 0..list_height {
                 let mut vx = x + left_width;
-                draw_span(out, &mut vx, list_top + r, "│", LINE, Some(BG), false)?;
+                draw_span(out, &mut vx, list_top + r, "│", theme().line, Some(theme().bg), false)?;
             }
         }
 
@@ -4015,7 +4190,7 @@ impl App {
                     rail_width,
                     &format!("{} · {n}", bucket.title()),
                     bucket.color(),
-                    Some(BG),
+                    Some(theme().bg),
                     true,
                 )?,
                 FleetRow::Job(pos) => {
@@ -4039,9 +4214,9 @@ impl App {
                         job.item_key, label, model_col, job.attempt
                     );
                     let (fg, bg) = if selected {
-                        (Color::Black, Some(PAPER))
+                        (theme().ink, Some(theme().paper))
                     } else {
-                        (fleet_color(job.status, stalled), Some(BG))
+                        (fleet_color(job.status, stalled), Some(theme().bg))
                     };
                     draw_cell(out, x + 1, r, rail_width, &text, fg, bg, selected)?;
                 }
@@ -4051,8 +4226,8 @@ impl App {
                     r,
                     rail_width,
                     &format!("WORKBENCH · {n}"),
-                    GREEN,
-                    Some(BG),
+                    theme().green,
+                    Some(theme().bg),
                     true,
                 )?,
                 FleetRow::Work(work) => {
@@ -4070,9 +4245,9 @@ impl App {
                         truncate(&folder, 18),
                     );
                     let (fg, bg) = if selected {
-                        (Color::Black, Some(PAPER))
+                        (theme().ink, Some(theme().paper))
                     } else {
-                        (GREEN, Some(BG))
+                        (theme().green, Some(theme().bg))
                     };
                     draw_cell(out, x + 1, r, rail_width, &text, fg, bg, selected)?;
                 }
@@ -4099,8 +4274,8 @@ impl App {
                 list_top + list_height.saturating_sub(1),
                 rail_width,
                 &hint,
-                DIMMER,
-                Some(BG),
+                theme().dimmer,
+                Some(theme().bg),
                 false,
             )?;
         }
@@ -4134,20 +4309,20 @@ impl App {
             row,
             width,
             &format!("{} · work session", session.item_key),
-            PAPER,
-            Some(BG),
+            theme().paper,
+            Some(theme().bg),
             true,
         )?;
         row += 1;
         for (text, color) in [
             (
                 "human-driven — no worktree, changes land wherever you make them".to_owned(),
-                DIM,
+                theme().dim,
             ),
-            (format!("folder {}", session.cwd.display()), DIMMER),
-            (format!("tmux   {}", session.session), DIMMER),
-            (String::new(), DIM),
-            ("t enter the pane · c/x end the session".to_owned(), TEXT),
+            (format!("folder {}", session.cwd.display()), theme().dimmer),
+            (format!("tmux   {}", session.session), theme().dimmer),
+            (String::new(), theme().dim),
+            ("t enter the pane · c/x end the session".to_owned(), theme().text),
         ] {
             if row >= bottom {
                 break;
@@ -4159,7 +4334,7 @@ impl App {
                 width,
                 &truncate(&text, width as usize),
                 color,
-                Some(BG),
+                Some(theme().bg),
                 false,
             )?;
             row += 1;
@@ -4187,8 +4362,8 @@ impl App {
             row,
             width,
             &format!("{} · {}", job.item_key, truncate(&job.title, key_room)),
-            PAPER,
-            Some(BG),
+            theme().paper,
+            Some(theme().bg),
             true,
         )?;
         row += 1;
@@ -4200,16 +4375,16 @@ impl App {
         for (text, color) in [
             (
                 format!("{} · {stance} · attempt {}", job.backend, job.attempt),
-                DIM,
+                theme().dim,
             ),
             (
                 format!(
                     "branch {}",
                     truncate(&job.branch, width.saturating_sub(7) as usize)
                 ),
-                DIMMER,
+                theme().dimmer,
             ),
-            (format!("{}", job.worktree.display()), DIMMER),
+            (format!("{}", job.worktree.display()), theme().dimmer),
         ] {
             if row >= bottom {
                 break;
@@ -4221,7 +4396,7 @@ impl App {
                 width,
                 &truncate(&text, width as usize),
                 color,
-                Some(BG),
+                Some(theme().bg),
                 false,
             )?;
             row += 1;
@@ -4233,8 +4408,8 @@ impl App {
                 &mut sx,
                 row,
                 &"─".repeat(width as usize),
-                LINE,
-                Some(BG),
+                theme().line,
+                Some(theme().bg),
                 false,
             )?;
             row += 1;
@@ -4244,13 +4419,13 @@ impl App {
         match job.status {
             jobs::JobStatus::Review | jobs::JobStatus::Question => {
                 for l in jobs::read_result(&handle.dir).trim().lines() {
-                    lines.push((l.to_owned(), TEXT));
+                    lines.push((l.to_owned(), theme().text));
                 }
                 if let Some(diff) = &handle.diff_stat {
-                    lines.push((String::new(), DIM));
-                    lines.push(("diff:".to_owned(), DIM));
+                    lines.push((String::new(), theme().dim));
+                    lines.push(("diff:".to_owned(), theme().dim));
                     for l in diff.lines() {
-                        lines.push((l.to_owned(), GREEN));
+                        lines.push((l.to_owned(), theme().green));
                     }
                 }
             }
@@ -4260,13 +4435,13 @@ impl App {
                         "interactive {} session — press t to enter the pane",
                         job.backend
                     ),
-                    TEXT,
+                    theme().text,
                 ));
-                lines.push(("(the pane scrollback is the record)".to_owned(), DIMMER));
+                lines.push(("(the pane scrollback is the record)".to_owned(), theme().dimmer));
             }
             _ => {
                 for l in &handle.tail {
-                    lines.push((l.clone(), TEXT));
+                    lines.push((l.clone(), theme().text));
                 }
             }
         }
@@ -4283,7 +4458,7 @@ impl App {
                 width,
                 &truncate(&text, width as usize),
                 color,
-                Some(BG),
+                Some(theme().bg),
                 false,
             )?;
             row += 1;
@@ -4485,6 +4660,7 @@ impl App {
                 self.cycle_sort();
                 self.force_clear = true;
             }
+            KeyCode::Char('C') => self.cycle_theme(),
             KeyCode::Char('/') => {
                 self.input_mode = Some(InputMode::Search);
                 self.input.clear();
@@ -5203,6 +5379,28 @@ impl App {
                 self.force_clear = true;
                 false
             }
+            "theme" | "colors" | "colorscheme" => {
+                match rest {
+                    "" | "next" => self.cycle_theme(),
+                    "list" => {
+                        let active = theme().name;
+                        let names = THEMES
+                            .iter()
+                            .map(|t| {
+                                if t.name == active {
+                                    format!("[{}]", t.name)
+                                } else {
+                                    t.name.to_owned()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("  ");
+                        self.status = format!("themes · {names}");
+                    }
+                    name => self.set_theme_by_name(name),
+                }
+                false
+            }
             "" => false,
             other => {
                 self.status = format!("unknown command :{other}");
@@ -5627,6 +5825,8 @@ impl App {
         ));
         let item: ApiItem = serde_json::from_value(raw)?;
         self.refresh()?;
+        let key = format!("{}-{}", self.project().identifier, item.sequence_id);
+        self.select_item_by_key(&key);
         let mut notes = String::new();
         if priority != Priority::None {
             notes.push_str(&format!(" · {}", priority.as_plane()));
@@ -6270,7 +6470,7 @@ impl App {
         if self.screen.w != width || self.screen.h != height {
             queue!(
                 stdout,
-                SetBackgroundColor(BG),
+                SetBackgroundColor(theme().bg),
                 Clear(ClearType::All),
                 ResetColor
             )?;
@@ -6288,6 +6488,33 @@ impl App {
     fn invalidate_screen(&mut self) {
         self.screen = Screen::default();
         self.force_clear = true;
+    }
+
+    /// Switch the active color scheme, persist the choice, and force a full
+    /// repaint (every cell's background changes, so the diff model is reset).
+    fn apply_theme(&mut self, scheme: Theme) {
+        set_active_theme(scheme);
+        save_theme_name(scheme.name);
+        self.invalidate_screen();
+        self.status = format!("theme · {}", scheme.name);
+    }
+
+    fn cycle_theme(&mut self) {
+        self.apply_theme(next_theme(theme().name));
+    }
+
+    fn set_theme_by_name(&mut self, name: &str) {
+        match theme_by_name(name) {
+            Some(scheme) => self.apply_theme(scheme),
+            None => {
+                let names = THEMES
+                    .iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.status = format!("unknown theme {name:?} · try: {names}");
+            }
+        }
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -6421,15 +6648,15 @@ impl App {
     }
 
     fn draw_header(&self, out: &mut Screen, start_x: u16, width: u16, y: u16) -> Result<()> {
-        draw_cell(out, start_x, y, width, "", DIM, Some(BG), false)?;
+        draw_cell(out, start_x, y, width, "", theme().dim, Some(theme().bg), false)?;
         let mut x = start_x;
         draw_span(
             out,
             &mut x,
             y,
             " plane-tui ",
-            Color::Black,
-            Some(ACCENT),
+            theme().ink,
+            Some(theme().accent),
             true,
         )?;
         draw_text(
@@ -6437,16 +6664,16 @@ impl App {
             &mut x,
             y,
             &format!(" {} │ ", self.client.config.workspace),
-            DIM,
+            theme().dim,
         )?;
         for (index, project) in self.projects.iter().enumerate() {
             let tab = format!("{}:{} {} ", index + 1, project.identifier, project.name);
             if index == self.active_project {
-                draw_span(out, &mut x, y, &tab, Color::Black, Some(PAPER), true)?;
+                draw_span(out, &mut x, y, &tab, theme().ink, Some(theme().paper), true)?;
             } else {
-                draw_text(out, &mut x, y, &tab, DIM)?;
+                draw_text(out, &mut x, y, &tab, theme().dim)?;
             }
-            draw_text(out, &mut x, y, "· ", LINE)?;
+            draw_text(out, &mut x, y, "· ", theme().line)?;
         }
         let host = self
             .client
@@ -6456,12 +6683,12 @@ impl App {
             .replace("http://", "");
         let mut right_segments: Vec<(String, Color, bool)> = Vec::new();
         if !self.search.is_empty() {
-            right_segments.push((format!("/{}", self.search), ACCENT, false));
+            right_segments.push((format!("/{}", self.search), theme().accent, false));
         }
         if self.filter != FilterMode::All {
-            right_segments.push((format!("f:{}", self.filter.label()), ACCENT, false));
+            right_segments.push((format!("f:{}", self.filter.label()), theme().accent, false));
         }
-        right_segments.push((format!("sort:{}", self.sort.label()), DIM, false));
+        right_segments.push((format!("sort:{}", self.sort.label()), theme().dim, false));
         // fleet indicator: ⚑N need you (amber) + running count with a spinner
         let fleet_running = self
             .agent_jobs
@@ -6474,31 +6701,31 @@ impl App {
             .filter(|handle| FleetBucket::of(handle.job.status) == FleetBucket::NeedsYou)
             .count();
         if fleet_needs > 0 {
-            right_segments.push((format!("⚑{fleet_needs}"), AMBER, true));
+            right_segments.push((format!("⚑{fleet_needs}"), theme().amber, true));
         }
         if fleet_running > 0 {
             right_segments.push((
                 format!("J{fleet_running} {}", FRAMES[self.frame]),
-                GREEN,
+                theme().green,
                 false,
             ));
         } else {
-            right_segments.push(("J".to_owned(), DIMMER, false));
+            right_segments.push(("J".to_owned(), theme().dimmer, false));
         }
         let sync_secs = self.project().loaded_at.elapsed().as_secs();
         let (sync_text, sync_color) = if sync_secs < 60 {
-            ("⟳now".to_owned(), DIMMER)
+            ("⟳now".to_owned(), theme().dimmer)
         } else if sync_secs < 3600 {
             (
                 format!("⟳{}m", sync_secs / 60),
-                if sync_secs >= 900 { AMBER } else { DIMMER },
+                if sync_secs >= 900 { theme().amber } else { theme().dimmer },
             )
         } else {
-            (format!("⟳{}h", sync_secs / 3600), AMBER)
+            (format!("⟳{}h", sync_secs / 3600), theme().amber)
         };
         right_segments.push((sync_text, sync_color, false));
-        right_segments.push((host, DIM, false));
-        right_segments.push(("●".to_owned(), GREEN, false));
+        right_segments.push((host, theme().dim, false));
+        right_segments.push(("●".to_owned(), theme().green, false));
 
         let right_width = right_segments
             .iter()
@@ -6510,9 +6737,9 @@ impl App {
             if right_x > x.saturating_add(1) {
                 for (index, (text, color, bold)) in right_segments.iter().enumerate() {
                     if index > 0 {
-                        draw_span(out, &mut right_x, y, " ", DIMMER, Some(BG), false)?;
+                        draw_span(out, &mut right_x, y, " ", theme().dimmer, Some(theme().bg), false)?;
                     }
-                    draw_span(out, &mut right_x, y, text, *color, Some(BG), *bold)?;
+                    draw_span(out, &mut right_x, y, text, *color, Some(theme().bg), *bold)?;
                 }
             }
         }
@@ -6539,7 +6766,7 @@ impl App {
             } else {
                 String::new()
             };
-            draw_cell(out, col_x, y, effective_width, "", DIM, Some(BG), false)?;
+            draw_cell(out, col_x, y, effective_width, "", theme().dim, Some(theme().bg), false)?;
             let mut header_x = col_x + 1;
             draw_span(
                 out,
@@ -6547,10 +6774,10 @@ impl App {
                 y,
                 state.glyph(),
                 state.color(),
-                Some(BG),
+                Some(theme().bg),
                 true,
             )?;
-            draw_span(out, &mut header_x, y, " ", DIM, Some(BG), false)?;
+            draw_span(out, &mut header_x, y, " ", theme().dim, Some(theme().bg), false)?;
             let wip_limit = self.wip_limit();
             let over_wip = *state == StateKind::Started && wip_limit > 0 && total > wip_limit;
             draw_span(
@@ -6558,11 +6785,11 @@ impl App {
                 &mut header_x,
                 y,
                 state.name(),
-                if over_wip { RED } else { PAPER },
-                Some(BG),
+                if over_wip { theme().red } else { theme().paper },
+                Some(theme().bg),
                 true,
             )?;
-            draw_span(out, &mut header_x, y, " ", DIM, Some(BG), false)?;
+            draw_span(out, &mut header_x, y, " ", theme().dim, Some(theme().bg), false)?;
             let count_text = if *state == StateKind::Started && wip_limit > 0 {
                 format!("{total}/{wip_limit}")
             } else {
@@ -6573,8 +6800,8 @@ impl App {
                 &mut header_x,
                 y,
                 &count_text,
-                if over_wip { RED } else { DIM },
-                Some(BG),
+                if over_wip { theme().red } else { theme().dim },
+                Some(theme().bg),
                 over_wip,
             )?;
             if !shown.is_empty() && effective_width as usize > shown.width() + 1 {
@@ -6584,24 +6811,24 @@ impl App {
                     y,
                     shown.width() as u16,
                     shown.trim(),
-                    DIMMER,
-                    Some(BG),
+                    theme().dimmer,
+                    Some(theme().bg),
                     false,
                 )?;
             }
             queue!(
                 out,
                 MoveTo(col_x, y + 1),
-                SetForegroundColor(LINE),
-                SetBackgroundColor(BG),
+                SetForegroundColor(theme().line),
+                SetBackgroundColor(theme().bg),
                 Print("─".repeat(effective_width.saturating_sub(1) as usize))
             )?;
             for row in 0..height {
                 queue!(
                     out,
                     MoveTo(col_x + effective_width.saturating_sub(1), y + row),
-                    SetForegroundColor(LINE),
-                    SetBackgroundColor(BG),
+                    SetForegroundColor(theme().line),
+                    SetBackgroundColor(theme().bg),
                     Print("│")
                 )?;
             }
@@ -6650,8 +6877,8 @@ impl App {
                     y + height.saturating_sub(1),
                     effective_width.saturating_sub(1),
                     &more,
-                    DIM,
-                    Some(BG),
+                    theme().dim,
+                    Some(theme().bg),
                     false,
                 )?;
             }
@@ -6669,14 +6896,14 @@ impl App {
         item: &WorkItem,
         selected: bool,
     ) -> Result<()> {
-        let fg = if selected { Color::Black } else { PAPER };
+        let fg = if selected { theme().ink } else { theme().paper };
         let marked = if self.marks.contains(&item.key) {
             "✓"
         } else {
             " "
         };
-        let border_color = if selected { ACCENT } else { LINE };
-        draw_card_border(out, x, y, width, border_color, Some(CELL_BG))?;
+        let border_color = if selected { theme().accent } else { theme().line };
+        draw_card_border(out, x, y, width, border_color, Some(theme().cell_bg))?;
         let inner_x = x + 1;
         let inner_width = width.saturating_sub(2);
         draw_cell(
@@ -6685,31 +6912,31 @@ impl App {
             y + 1,
             inner_width,
             "",
-            DIM,
-            Some(CELL_BG),
+            theme().dim,
+            Some(theme().cell_bg),
             false,
         )?;
         let mut cursor = inner_x;
-        draw_span(out, &mut cursor, y + 1, marked, ACCENT, Some(CELL_BG), true)?;
-        draw_span(out, &mut cursor, y + 1, " ", DIM, Some(CELL_BG), false)?;
+        draw_span(out, &mut cursor, y + 1, marked, theme().accent, Some(theme().cell_bg), true)?;
+        draw_span(out, &mut cursor, y + 1, " ", theme().dim, Some(theme().cell_bg), false)?;
         draw_span(
             out,
             &mut cursor,
             y + 1,
             &item.key,
-            DIM,
-            Some(CELL_BG),
+            theme().dim,
+            Some(theme().cell_bg),
             false,
         )?;
         if let Some((badge, badge_color)) = self.job_badge(&item.key) {
-            draw_span(out, &mut cursor, y + 1, " ", DIM, Some(CELL_BG), false)?;
+            draw_span(out, &mut cursor, y + 1, " ", theme().dim, Some(theme().cell_bg), false)?;
             draw_span(
                 out,
                 &mut cursor,
                 y + 1,
                 badge,
                 badge_color,
-                Some(CELL_BG),
+                Some(theme().cell_bg),
                 true,
             )?;
         }
@@ -6723,14 +6950,14 @@ impl App {
                 glyph_width,
                 glyph,
                 item.priority.color(),
-                Some(CELL_BG),
+                Some(theme().cell_bg),
                 true,
             )?;
         }
         let title_bg = if selected {
-            Some(ACCENT)
+            Some(theme().accent)
         } else {
-            Some(CELL_BG)
+            Some(theme().cell_bg)
         };
         let title_lines = wrap_line(&item.title, inner_width as usize);
         draw_cell(
@@ -6760,7 +6987,7 @@ impl App {
                 item.updated_at
                     .map(time_ago)
                     .unwrap_or_else(|| "unknown".to_owned()),
-                DIMMER,
+                theme().dimmer,
             ),
         };
         self.draw_card_labels(out, inner_x, y + 4, inner_width, item, &meta, meta_color)?;
@@ -6778,7 +7005,7 @@ impl App {
         age: &str,
         age_color: Color,
     ) -> Result<()> {
-        draw_cell(out, x, y, width, "", DIM, Some(CELL_BG), false)?;
+        draw_cell(out, x, y, width, "", theme().dim, Some(theme().cell_bg), false)?;
         let age_width = age.width().min(width as usize);
         if age_width < width as usize {
             draw_cell(
@@ -6788,7 +7015,7 @@ impl App {
                 age_width as u16,
                 age,
                 age_color,
-                Some(CELL_BG),
+                Some(theme().cell_bg),
                 false,
             )?;
         }
@@ -6816,8 +7043,8 @@ impl App {
                     cell_end,
                     y,
                     " ",
-                    DIM,
-                    Some(CELL_BG),
+                    theme().dim,
+                    Some(theme().cell_bg),
                     false,
                 )?;
             }
@@ -6832,7 +7059,7 @@ impl App {
                 y,
                 &text,
                 label.color,
-                Some(CELL_BG),
+                Some(theme().cell_bg),
                 false,
             )?;
             rendered += 1;
@@ -6845,8 +7072,8 @@ impl App {
                     y,
                     label_width,
                     "no labels",
-                    DIM,
-                    Some(CELL_BG),
+                    theme().dim,
+                    Some(theme().cell_bg),
                     false,
                 )?;
             } else {
@@ -6857,7 +7084,7 @@ impl App {
                     .map(|label| format!("·{label}"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                draw_cell(out, x, y, label_width, &fallback, DIM, Some(CELL_BG), false)?;
+                draw_cell(out, x, y, label_width, &fallback, theme().dim, Some(theme().cell_bg), false)?;
             }
         }
         Ok(())
@@ -6868,9 +7095,9 @@ impl App {
             return Ok(());
         }
 
-        clear_area(out, x, y, width, height, Some(BG))?;
+        clear_area(out, x, y, width, height, Some(theme().bg))?;
         let layout = ListLayout::new(width);
-        draw_cell(out, x, y, width, "", DIMMER, Some(BG), false)?;
+        draw_cell(out, x, y, width, "", theme().dimmer, Some(theme().bg), false)?;
         self.draw_list_header(out, x, y, width, layout)?;
         if height > 1 {
             draw_cell(
@@ -6879,8 +7106,8 @@ impl App {
                 y + 1,
                 width,
                 &"─".repeat(width as usize),
-                LINE,
-                Some(BG),
+                theme().line,
+                Some(theme().bg),
                 false,
             )?;
         }
@@ -6905,8 +7132,8 @@ impl App {
                 y + height.saturating_sub(1),
                 width,
                 &format!("… {hidden} below"),
-                DIMMER,
-                Some(BG),
+                theme().dimmer,
+                Some(theme().bg),
                 false,
             )?;
             return Ok(());
@@ -6950,8 +7177,8 @@ impl App {
                 y + height.saturating_sub(1),
                 width,
                 &footer,
-                DIMMER,
-                Some(BG),
+                theme().dimmer,
+                Some(theme().bg),
                 false,
             )?;
         }
@@ -6966,12 +7193,12 @@ impl App {
         width: u16,
         layout: ListLayout,
     ) -> Result<()> {
-        let bg = Some(BG);
+        let bg = Some(theme().bg);
         let mut cursor = x;
         let end = x.saturating_add(width);
-        cursor = draw_list_cell(out, cursor, end, y, layout.mark, "", DIMMER, bg, false)?;
-        cursor = draw_list_cell(out, cursor, end, y, layout.priority, "p", DIMMER, bg, false)?;
-        cursor = draw_list_cell(out, cursor, end, y, layout.key, "key", DIMMER, bg, false)?;
+        cursor = draw_list_cell(out, cursor, end, y, layout.mark, "", theme().dimmer, bg, false)?;
+        cursor = draw_list_cell(out, cursor, end, y, layout.priority, "p", theme().dimmer, bg, false)?;
+        cursor = draw_list_cell(out, cursor, end, y, layout.key, "key", theme().dimmer, bg, false)?;
         cursor = draw_list_cell(
             out,
             cursor,
@@ -6979,7 +7206,7 @@ impl App {
             y,
             layout.title,
             "title",
-            DIMMER,
+            theme().dimmer,
             bg,
             false,
         )?;
@@ -6990,7 +7217,7 @@ impl App {
             y,
             layout.state,
             "state",
-            DIMMER,
+            theme().dimmer,
             bg,
             false,
         )?;
@@ -7001,11 +7228,11 @@ impl App {
             y,
             layout.labels,
             "labels",
-            DIMMER,
+            theme().dimmer,
             bg,
             false,
         )?;
-        cursor = draw_list_cell_right(out, cursor, end, y, layout.due, "due", DIMMER, bg, false)?;
+        cursor = draw_list_cell_right(out, cursor, end, y, layout.due, "due", theme().dimmer, bg, false)?;
         let _ = draw_list_cell_right(
             out,
             cursor,
@@ -7013,7 +7240,7 @@ impl App {
             y,
             layout.updated,
             "updated",
-            DIMMER,
+            theme().dimmer,
             bg,
             false,
         )?;
@@ -7030,24 +7257,24 @@ impl App {
         item: &WorkItem,
         selected: bool,
     ) -> Result<()> {
-        let bg = if selected { Some(ACCENT) } else { Some(BG) };
-        let selected_fg = Color::Black;
+        let bg = if selected { Some(theme().accent) } else { Some(theme().bg) };
+        let selected_fg = theme().ink;
         draw_cell(out, x, y, width, "", selected_fg, bg, false)?;
 
-        let mark_fg = if selected { selected_fg } else { ACCENT };
+        let mark_fg = if selected { selected_fg } else { theme().accent };
         let priority_fg = if selected {
             selected_fg
         } else {
             item.priority.color()
         };
-        let key_fg = if selected { selected_fg } else { DIM };
-        let title_fg = if selected { selected_fg } else { PAPER };
+        let key_fg = if selected { selected_fg } else { theme().dim };
+        let title_fg = if selected { selected_fg } else { theme().paper };
         let state_fg = if selected {
             selected_fg
         } else {
             item.state.color()
         };
-        let muted_fg = if selected { selected_fg } else { DIMMER };
+        let muted_fg = if selected { selected_fg } else { theme().dimmer };
         let (due, due_fg) = list_due(item.due.as_deref());
         let due_fg = if selected { selected_fg } else { due_fg };
         let updated = item
@@ -7136,7 +7363,7 @@ impl App {
             return Ok(next_list_x(x, width, end));
         }
 
-        let fg = if selected { Color::Black } else { DIM };
+        let fg = if selected { theme().ink } else { theme().dim };
         draw_cell(out, x, y, effective_width, "", fg, bg, false)?;
         let mut cursor = x;
         let cell_end = x.saturating_add(effective_width);
@@ -7156,7 +7383,7 @@ impl App {
             if rendered > 0 {
                 draw_span_clipped(out, &mut cursor, cell_end, y, " ", fg, bg, false)?;
             }
-            let label_fg = if selected { Color::Black } else { label.color };
+            let label_fg = if selected { theme().ink } else { label.color };
             let text = format!("{}{}", color_marker(label.color), label.name);
             draw_span_clipped(out, &mut cursor, cell_end, y, &text, label_fg, bg, false)?;
             rendered += 1;
@@ -7186,13 +7413,13 @@ impl App {
     ) -> Result<()> {
         let content_x = x.saturating_add(1);
         let content_width = width.saturating_sub(1);
-        clear_area(out, content_x, y, content_width, height, Some(BG))?;
+        clear_area(out, content_x, y, content_width, height, Some(theme().bg))?;
         for row in 0..height {
             queue!(
                 out,
                 MoveTo(x, y + row),
-                SetForegroundColor(LINE),
-                SetBackgroundColor(BG),
+                SetForegroundColor(theme().line),
+                SetBackgroundColor(theme().bg),
                 Print("│")
             )?;
         }
@@ -7203,24 +7430,24 @@ impl App {
                 y,
                 content_width,
                 "no item",
-                DIM,
+                theme().dim,
                 None,
                 false,
             )?;
             return Ok(());
         };
         let mut row = y;
-        draw_cell(out, content_x, row, content_width, "", DIM, None, false)?;
+        draw_cell(out, content_x, row, content_width, "", theme().dim, None, false)?;
         let mut cursor = content_x;
-        draw_span(out, &mut cursor, row, &item.key, DIM, Some(BG), true)?;
-        draw_span(out, &mut cursor, row, " · ", DIMMER, Some(BG), false)?;
+        draw_span(out, &mut cursor, row, &item.key, theme().dim, Some(theme().bg), true)?;
+        draw_span(out, &mut cursor, row, " · ", theme().dimmer, Some(theme().bg), false)?;
         draw_span(
             out,
             &mut cursor,
             row,
             &format!("{} {}", item.priority.glyph(), item.priority.as_plane()),
             item.priority.color(),
-            Some(BG),
+            Some(theme().bg),
             true,
         )?;
         let state_text = format!(
@@ -7237,7 +7464,7 @@ impl App {
                 state_width,
                 &state_text,
                 item.state.color(),
-                Some(BG),
+                Some(theme().bg),
                 true,
             )?;
         }
@@ -7246,7 +7473,7 @@ impl App {
             .into_iter()
             .take(2)
         {
-            draw_cell(out, x + 1, row, width - 1, &line, PAPER, None, true)?;
+            draw_cell(out, x + 1, row, width - 1, &line, theme().paper, None, true)?;
             row += 1;
         }
         if row < y + height {
@@ -7256,7 +7483,7 @@ impl App {
                 row,
                 width - 1,
                 &"─".repeat(width.saturating_sub(2) as usize),
-                LINE,
+                theme().line,
                 None,
                 false,
             )?;
@@ -7277,7 +7504,7 @@ impl App {
                 format!("{} · p to set", item.priority.as_plane()),
                 item.priority.color(),
             ),
-            ("labels", String::new(), TEXT),
+            ("labels", String::new(), theme().text),
             (
                 "due",
                 match item.due.as_deref() {
@@ -7290,8 +7517,8 @@ impl App {
                 match item.due.as_deref() {
                     Some(due) => card_due_alert(Some(due))
                         .map(|(_, color)| color)
-                        .unwrap_or(TEXT),
-                    None => DIMMER,
+                        .unwrap_or(theme().text),
+                    None => theme().dimmer,
                 },
             ),
             (
@@ -7299,14 +7526,14 @@ impl App {
                 item.created_at
                     .map(|dt| dt.date_naive().to_string())
                     .unwrap_or_else(|| "unknown".to_owned()),
-                TEXT,
+                theme().text,
             ),
             (
                 "updated",
                 item.updated_at
                     .map(|dt| format!("{} · {}", dt.date_naive(), time_ago(dt)))
                     .unwrap_or_else(|| "unknown".to_owned()),
-                TEXT,
+                theme().text,
             ),
             (
                 "completed",
@@ -7314,7 +7541,7 @@ impl App {
                     .clone()
                     .map(|value| value.chars().take(10).collect::<String>())
                     .unwrap_or_else(|| "none".to_owned()),
-                TEXT,
+                theme().text,
             ),
             (
                 "url",
@@ -7322,7 +7549,7 @@ impl App {
                     "{}/{}/browse/{}",
                     self.client.config.base_url, self.client.config.workspace, item.key
                 ),
-                ACCENT,
+                theme().accent,
             ),
         ];
         for (name, value, value_color) in fields {
@@ -7339,7 +7566,7 @@ impl App {
             row += 1;
         }
         row += 1;
-        draw_cell(out, x + 1, row, width - 1, "description", DIM, None, false)?;
+        draw_cell(out, x + 1, row, width - 1, "description", theme().dim, None, false)?;
         row += 1;
         let desc = if item.description.trim().is_empty() {
             "(no description · e to edit)".to_owned()
@@ -7350,18 +7577,18 @@ impl App {
             .into_iter()
             .take(height.saturating_sub(row - y + 4) as usize)
         {
-            draw_cell(out, x + 1, row, width - 1, &line, DIM, None, false)?;
+            draw_cell(out, x + 1, row, width - 1, &line, theme().dim, None, false)?;
             row += 1;
         }
         if !item.actions.is_empty() && row + 1 < y + height {
             row += 1;
-            draw_cell(out, x + 1, row, width - 1, "activity", DIM, None, false)?;
+            draw_cell(out, x + 1, row, width - 1, "activity", theme().dim, None, false)?;
             row += 1;
             for action in item.actions.iter().take(4) {
                 if row >= y + height {
                     break;
                 }
-                draw_cell(out, x + 1, row, width - 1, action, DIM, None, false)?;
+                draw_cell(out, x + 1, row, width - 1, action, theme().dim, None, false)?;
                 row += 1;
             }
         }
@@ -7372,8 +7599,8 @@ impl App {
         queue!(
             out,
             MoveTo(x, y),
-            SetForegroundColor(LINE),
-            SetBackgroundColor(BG),
+            SetForegroundColor(theme().line),
+            SetBackgroundColor(theme().bg),
             Print("─".repeat(width as usize))
         )?;
         let mut row = y + 1;
@@ -7390,7 +7617,7 @@ impl App {
                     "api · base {} · workspace {} · auth X-API-Key **** · x to close",
                     self.client.config.base_url, self.client.config.workspace
                 ),
-                DIM,
+                theme().dim,
                 None,
                 false,
             )?;
@@ -7416,10 +7643,10 @@ impl App {
                         entry.ms
                     ),
                     match entry.method {
-                        "PATCH" => AMBER,
-                        "POST" => GREEN,
-                        "GET" => ACCENT,
-                        _ => TEXT,
+                        "PATCH" => theme().amber,
+                        "POST" => theme().green,
+                        "GET" => theme().accent,
+                        _ => theme().text,
                     },
                     None,
                     false,
@@ -7445,8 +7672,8 @@ impl App {
                         " {} marked · s state · p priority · t label · o open · I invert · U clear",
                         self.marks.len()
                     ),
-                    Color::Black,
-                    Some(ACCENT),
+                    theme().ink,
+                    Some(theme().accent),
                     true,
                 )?;
                 row += 1;
@@ -7539,9 +7766,9 @@ impl App {
                 };
                 if menu != MenuMode::Label {
                     let menu_bg = if menu == MenuMode::ConfirmWip {
-                        RED
+                        theme().red
                     } else {
-                        PAPER
+                        theme().paper
                     };
                     draw_cell(
                         out,
@@ -7549,7 +7776,7 @@ impl App {
                         row,
                         inner_width,
                         &text,
-                        Color::Black,
+                        theme().ink,
                         Some(menu_bg),
                         true,
                     )?;
@@ -7567,7 +7794,7 @@ impl App {
             } else {
                 "j/k h/l move · enter detail · e edit · a/A agent · m mark · s state · p priority · t label · D done · T triage · v view · J fleet · / search · : cmd · x api · ? keys · q quit"
             };
-            draw_cell(out, inner_x, row, inner_width, hint, DIMMER, None, false)?;
+            draw_cell(out, inner_x, row, inner_width, hint, theme().dimmer, None, false)?;
         }
         Ok(())
     }
@@ -7577,13 +7804,13 @@ impl App {
             return Ok(());
         }
 
-        draw_cell(out, x, y, width, "", TEXT, Some(BG), false)?;
+        draw_cell(out, x, y, width, "", theme().text, Some(theme().bg), false)?;
 
         let left = self.command_line_text();
         let left_color = if self.input_mode.is_some() {
-            PAPER
+            theme().paper
         } else {
-            DIM
+            theme().dim
         };
         let position = self.position_text();
         let position_width = min(position.width(), width as usize) as u16;
@@ -7613,11 +7840,11 @@ impl App {
                 .min(width);
             let left_width = width.saturating_sub(right_width.saturating_add(1));
 
-            draw_cell(out, x, y, left_width, &left, left_color, Some(BG), false)?;
+            draw_cell(out, x, y, left_width, &left, left_color, Some(theme().bg), false)?;
 
             let mut cursor = x + width.saturating_sub(right_width);
             if job_width > 0 {
-                draw_cell(out, cursor, y, job_width, &job, AMBER, Some(BG), true)?;
+                draw_cell(out, cursor, y, job_width, &job, theme().amber, Some(theme().bg), true)?;
                 cursor = cursor.saturating_add(job_width).saturating_add(gap);
             }
             if position_width > 0 && cursor < x + width {
@@ -7627,8 +7854,8 @@ impl App {
                     y,
                     min(position_width, x + width - cursor),
                     &position,
-                    DIMMER,
-                    Some(BG),
+                    theme().dimmer,
+                    Some(theme().bg),
                     false,
                 )?;
             }
@@ -7641,7 +7868,7 @@ impl App {
             0
         };
         let left_width = width.saturating_sub(right_width);
-        draw_cell(out, x, y, left_width, &left, left_color, Some(BG), false)?;
+        draw_cell(out, x, y, left_width, &left, left_color, Some(theme().bg), false)?;
         if position_width > 0 {
             draw_cell(
                 out,
@@ -7649,8 +7876,8 @@ impl App {
                 y,
                 position_width,
                 &position,
-                DIMMER,
-                Some(BG),
+                theme().dimmer,
+                Some(theme().bg),
                 false,
             )?;
         }
@@ -7704,7 +7931,7 @@ impl App {
             return Ok(());
         };
         let end = x.saturating_add(width);
-        draw_cell(out, x, y, width, "", DIM, Some(BG_RAISE), false)?;
+        draw_cell(out, x, y, width, "", theme().dim, Some(theme().bg_raise), false)?;
         let mut cursor = x;
         draw_span_clipped(
             out,
@@ -7712,8 +7939,8 @@ impl App {
             end,
             y,
             " backend → ",
-            Color::Black,
-            Some(PAPER),
+            theme().ink,
+            Some(theme().paper),
             true,
         )?;
         self.draw_backend_wizard_choice(
@@ -7742,8 +7969,8 @@ impl App {
             end,
             y,
             &details,
-            DIM,
-            Some(BG_RAISE),
+            theme().dim,
+            Some(theme().bg_raise),
             false,
         )?;
         draw_span_clipped(
@@ -7752,8 +7979,8 @@ impl App {
             end,
             y,
             "  m model  e effort  enter save  esc cancel",
-            DIMMER,
-            Some(BG_RAISE),
+            theme().dimmer,
+            Some(theme().bg_raise),
             false,
         )?;
         Ok(())
@@ -7768,9 +7995,9 @@ impl App {
         label: &str,
         selected: bool,
     ) -> Result<()> {
-        draw_span_clipped(out, cursor, end, y, " ", DIM, Some(BG_RAISE), false)?;
-        let bg = if selected { ACCENT } else { CELL_BG };
-        let fg = if selected { Color::Black } else { PAPER };
+        draw_span_clipped(out, cursor, end, y, " ", theme().dim, Some(theme().bg_raise), false)?;
+        let bg = if selected { theme().accent } else { theme().cell_bg };
+        let fg = if selected { theme().ink } else { theme().paper };
         draw_span_clipped(
             out,
             cursor,
@@ -7784,32 +8011,32 @@ impl App {
     }
 
     fn draw_label_menu_bar(&self, out: &mut Screen, x: u16, y: u16, width: u16) -> Result<()> {
-        draw_cell(out, x, y, width, "", DIM, Some(BG_RAISE), false)?;
+        draw_cell(out, x, y, width, "", theme().dim, Some(theme().bg_raise), false)?;
         let mut cursor = x;
         draw_span(
             out,
             &mut cursor,
             y,
             &format!(" toggle label → {} item ", self.target_keys().len()),
-            Color::Black,
-            Some(PAPER),
+            theme().ink,
+            Some(theme().paper),
             true,
         )?;
         for (index, label) in self.project().labels.iter().take(9).enumerate() {
             if cursor.saturating_sub(x) >= width.saturating_sub(14) {
                 break;
             }
-            draw_span(out, &mut cursor, y, " ", DIM, Some(BG_RAISE), false)?;
+            draw_span(out, &mut cursor, y, " ", theme().dim, Some(theme().bg_raise), false)?;
             draw_span(
                 out,
                 &mut cursor,
                 y,
                 &(index + 1).to_string(),
-                ACCENT,
-                Some(BG_RAISE),
+                theme().accent,
+                Some(theme().bg_raise),
                 true,
             )?;
-            draw_span(out, &mut cursor, y, " ", DIM, Some(BG_RAISE), false)?;
+            draw_span(out, &mut cursor, y, " ", theme().dim, Some(theme().bg_raise), false)?;
             let text = format!("{}{}", color_marker(label.color), label.name);
             let remaining = width.saturating_sub(cursor.saturating_sub(x)) as usize;
             draw_span(
@@ -7818,19 +8045,19 @@ impl App {
                 y,
                 &truncate(&text, remaining.min(16)),
                 label.color,
-                Some(BG_RAISE),
+                Some(theme().bg_raise),
                 false,
             )?;
         }
         if cursor.saturating_sub(x) < width.saturating_sub(12) {
-            draw_span(out, &mut cursor, y, "  n ", DIM, Some(BG_RAISE), false)?;
+            draw_span(out, &mut cursor, y, "  n ", theme().dim, Some(theme().bg_raise), false)?;
             draw_span(
                 out,
                 &mut cursor,
                 y,
                 "new label",
-                GREEN,
-                Some(BG_RAISE),
+                theme().green,
+                Some(theme().bg_raise),
                 true,
             )?;
         }
@@ -7840,8 +8067,8 @@ impl App {
                 &mut cursor,
                 y,
                 "  esc done",
-                DIM,
-                Some(BG_RAISE),
+                theme().dim,
+                Some(theme().bg_raise),
                 false,
             )?;
         }
@@ -7976,8 +8203,8 @@ impl App {
                 y + 2 + offset as u16,
                 box_width.saturating_sub(6),
                 line,
-                TEXT,
-                Some(BG),
+                theme().text,
+                Some(theme().bg),
                 false,
             )?;
         }
@@ -7987,8 +8214,8 @@ impl App {
             y + box_height.saturating_sub(3),
             box_width.saturating_sub(6),
             &hint,
-            DIM,
-            Some(BG),
+            theme().dim,
+            Some(theme().bg),
             false,
         )?;
         Ok(())
@@ -8044,9 +8271,9 @@ impl App {
 
         let mut lines: Vec<(String, Color, bool)> = Vec::new();
         for line in wrap_line(&item.title, content_width) {
-            lines.push((line, PAPER, true));
+            lines.push((line, theme().paper, true));
         }
-        lines.push((String::new(), TEXT, false));
+        lines.push((String::new(), theme().text, false));
         lines.push((
             format!(
                 "{} {}   ·   {} {}",
@@ -8063,13 +8290,13 @@ impl App {
         } else {
             item.labels.join(" · ")
         };
-        lines.push((format!("labels    {labels}"), TEXT, false));
+        lines.push((format!("labels    {labels}"), theme().text, false));
         let (due_text, due_color) = match item.due.as_deref() {
             Some(due) => {
                 let (_, color) = list_due(Some(due));
                 (due.to_owned(), color)
             }
-            None => ("none".to_owned(), DIMMER),
+            None => ("none".to_owned(), theme().dimmer),
         };
         lines.push((format!("due       {due_text}"), due_color, false));
         lines.push((
@@ -8082,7 +8309,7 @@ impl App {
                     .map(time_ago)
                     .unwrap_or_else(|| "unknown".to_owned())
             ),
-            TEXT,
+            theme().text,
             false,
         ));
         lines.push((
@@ -8090,11 +8317,11 @@ impl App {
                 "url       {}/{}/browse/{}",
                 self.client.config.base_url, self.client.config.workspace, item.key
             ),
-            ACCENT,
+            theme().accent,
             false,
         ));
-        lines.push((String::new(), TEXT, false));
-        lines.push(("description".to_owned(), DIM, false));
+        lines.push((String::new(), theme().text, false));
+        lines.push(("description".to_owned(), theme().dim, false));
         let description = if item.description.trim().is_empty() {
             "(no description)".to_owned()
         } else {
@@ -8102,22 +8329,22 @@ impl App {
         };
         for raw_line in description.lines() {
             for line in wrap_line(raw_line, content_width) {
-                lines.push((line, TEXT, false));
+                lines.push((line, theme().text, false));
             }
         }
-        lines.push((String::new(), TEXT, false));
-        lines.push((format!("comments ({})", detail.comments.len()), DIM, false));
+        lines.push((String::new(), theme().text, false));
+        lines.push((format!("comments ({})", detail.comments.len()), theme().dim, false));
         if detail.comments.is_empty() {
-            lines.push(("(no comments)".to_owned(), DIMMER, false));
+            lines.push(("(no comments)".to_owned(), theme().dimmer, false));
         }
         for (when, text) in &detail.comments {
-            lines.push((format!("· {when}"), ACCENT, false));
+            lines.push((format!("· {when}"), theme().accent, false));
             for raw_line in text.lines() {
                 for line in wrap_line(raw_line, content_width.saturating_sub(2)) {
-                    lines.push((format!("  {line}"), TEXT, false));
+                    lines.push((format!("  {line}"), theme().text, false));
                 }
             }
-            lines.push((String::new(), TEXT, false));
+            lines.push((String::new(), theme().text, false));
         }
 
         let visible = box_height.saturating_sub(5) as usize;
@@ -8135,7 +8362,7 @@ impl App {
             let (line, color, bold) = lines
                 .get(scroll + offset)
                 .map(|(line, color, bold)| (line.as_str(), *color, *bold))
-                .unwrap_or(("", TEXT, false));
+                .unwrap_or(("", theme().text, false));
             draw_cell(
                 out,
                 x + 3,
@@ -8143,7 +8370,7 @@ impl App {
                 box_width.saturating_sub(6),
                 line,
                 color,
-                Some(BG),
+                Some(theme().bg),
                 bold,
             )?;
         }
@@ -8159,8 +8386,8 @@ impl App {
             y + box_height.saturating_sub(3),
             box_width.saturating_sub(6),
             &hint,
-            DIM,
-            Some(BG),
+            theme().dim,
+            Some(theme().bg),
             false,
         )?;
         Ok(())
@@ -8256,6 +8483,7 @@ impl Drop for TerminalGuard {
 
 fn main() -> Result<()> {
     let config = Config::from_args()?;
+    set_active_theme(theme_by_name(&config.theme_name).unwrap_or(THEME_MIDNIGHT));
     let check_api = config.check_api;
     let client = PlaneClient::new(config);
     let mut app = App::load(client)?;
@@ -8313,10 +8541,10 @@ fn card_due_alert(due: Option<&str>) -> Option<(String, Color)> {
         .signed_duration_since(Local::now().date_naive())
         .num_days();
     match days {
-        d if d < 0 => Some((format!("{}d over", -d), RED)),
-        0 => Some(("due today".to_owned(), RED)),
-        1 => Some(("due tom".to_owned(), AMBER)),
-        2..=3 => Some((format!("due {}", due.get(5..).unwrap_or(due)), AMBER)),
+        d if d < 0 => Some((format!("{}d over", -d), theme().red)),
+        0 => Some(("due today".to_owned(), theme().red)),
+        1 => Some(("due tom".to_owned(), theme().amber)),
+        2..=3 => Some((format!("due {}", due.get(5..).unwrap_or(due)), theme().amber)),
         _ => None,
     }
 }
@@ -8648,6 +8876,29 @@ fn plane_tui_data_dir() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(".plane-tui-data"))
 }
 
+fn theme_config_path() -> Result<PathBuf> {
+    Ok(plane_tui_data_dir()?.join("theme"))
+}
+
+/// The color scheme name persisted by a previous `:theme`/`C` choice, if any.
+fn saved_theme_name() -> Option<String> {
+    let raw = fs::read_to_string(theme_config_path().ok()?).ok()?;
+    let name = raw.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Remember the chosen scheme so it survives restarts. Best-effort — a failure
+/// to write just means the choice isn't sticky.
+fn save_theme_name(name: &str) {
+    let Ok(path) = theme_config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, name);
+}
+
 #[derive(Debug, Default)]
 struct AgentPrefs {
     backend: Option<String>,
@@ -8954,10 +9205,10 @@ fn color_marker(color: Color) -> &'static str {
 
 fn list_due(value: Option<&str>) -> (String, Color) {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return ("-".to_owned(), DIMMER);
+        return ("-".to_owned(), theme().dimmer);
     };
     let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") else {
-        return (value.to_owned(), TEXT);
+        return (value.to_owned(), theme().text);
     };
     let days = date
         .signed_duration_since(Local::now().date_naive())
@@ -8967,7 +9218,7 @@ fn list_due(value: Option<&str>) -> (String, Color) {
         1 => "tom".to_owned(),
         _ => value.get(5..).unwrap_or(value).to_owned(),
     };
-    let color = if days <= 3 { RED } else { TEXT };
+    let color = if days <= 3 { theme().red } else { theme().text };
     (text, color)
 }
 
@@ -8989,13 +9240,13 @@ fn fleet_glyph(status: jobs::JobStatus, stalled: bool, frame: usize) -> &'static
 
 fn fleet_color(status: jobs::JobStatus, stalled: bool) -> Color {
     if stalled {
-        return AMBER;
+        return theme().amber;
     }
     match status {
-        jobs::JobStatus::Running | jobs::JobStatus::Landed => GREEN,
-        jobs::JobStatus::Review | jobs::JobStatus::Question | jobs::JobStatus::Briefing => AMBER,
-        jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => RED,
-        jobs::JobStatus::Queued | jobs::JobStatus::Discarded => DIMMER,
+        jobs::JobStatus::Running | jobs::JobStatus::Landed => theme().green,
+        jobs::JobStatus::Review | jobs::JobStatus::Question | jobs::JobStatus::Briefing => theme().amber,
+        jobs::JobStatus::Failed | jobs::JobStatus::Orphaned => theme().red,
+        jobs::JobStatus::Queued | jobs::JobStatus::Discarded => theme().dimmer,
     }
 }
 
@@ -9106,8 +9357,6 @@ const fn ink_of(c: Color) -> Ink {
         _ => Ink::Default,
     }
 }
-const BG_INK: Ink = ink_of(BG);
-
 #[derive(Clone, PartialEq, Debug)]
 struct Cell {
     ch: char,
@@ -9124,7 +9373,7 @@ impl Cell {
         Cell {
             ch: ' ',
             fg: Ink::Default,
-            bg: BG_INK,
+            bg: ink_of(theme().bg),
             bold: false,
             link: None,
             cont: false,
@@ -9505,7 +9754,7 @@ fn draw_text(out: &mut Screen, x: &mut u16, y: u16, text: &str, fg: Color) -> Re
         out,
         MoveTo(*x, y),
         SetForegroundColor(fg),
-        SetBackgroundColor(BG),
+        SetBackgroundColor(theme().bg),
         Print(text),
         ResetColor
     )?;
@@ -9521,15 +9770,15 @@ fn draw_link_field(
     url: &str,
     value_color: Color,
 ) -> Result<()> {
-    draw_cell(out, x, y, width, "", DIM, None, false)?;
+    draw_cell(out, x, y, width, "", theme().dim, None, false)?;
     let mut cursor = x;
     draw_span(
         out,
         &mut cursor,
         y,
         &format!("{:<9}", "url"),
-        DIMMER,
-        Some(BG),
+        theme().dimmer,
+        Some(theme().bg),
         false,
     )?;
     let remaining = width.saturating_sub(cursor.saturating_sub(x));
@@ -9540,7 +9789,7 @@ fn draw_link_field(
             out,
             MoveTo(cursor, y),
             SetForegroundColor(value_color),
-            SetBackgroundColor(BG),
+            SetBackgroundColor(theme().bg),
             Print(format!("\x1b]8;;{url}\x1b\\{display}\x1b]8;;\x1b\\")),
             ResetColor
         )?;
@@ -9557,15 +9806,15 @@ fn draw_field_line(
     value: &str,
     value_color: Color,
 ) -> Result<()> {
-    draw_cell(out, x, y, width, "", DIM, None, false)?;
+    draw_cell(out, x, y, width, "", theme().dim, None, false)?;
     let mut cursor = x;
     draw_span(
         out,
         &mut cursor,
         y,
         &format!("{name:<9}"),
-        DIMMER,
-        Some(BG),
+        theme().dimmer,
+        Some(theme().bg),
         false,
     )?;
     let used = cursor.saturating_sub(x);
@@ -9577,7 +9826,7 @@ fn draw_field_line(
             y,
             &truncate(value, remaining as usize),
             value_color,
-            Some(BG),
+            Some(theme().bg),
             false,
         )?;
     }
@@ -9592,17 +9841,17 @@ fn draw_label_field(
     project: &Project,
     item: &WorkItem,
 ) -> Result<()> {
-    draw_cell(out, x, y, width, "", DIM, None, false)?;
+    draw_cell(out, x, y, width, "", theme().dim, None, false)?;
     let mut cursor = x;
-    draw_span(out, &mut cursor, y, "labels   ", DIMMER, Some(BG), false)?;
+    draw_span(out, &mut cursor, y, "labels   ", theme().dimmer, Some(theme().bg), false)?;
     if item.label_ids.is_empty() {
         draw_span(
             out,
             &mut cursor,
             y,
             "none · t to add",
-            DIMMER,
-            Some(BG),
+            theme().dimmer,
+            Some(theme().bg),
             false,
         )?;
         return Ok(());
@@ -9617,7 +9866,7 @@ fn draw_label_field(
             break;
         }
         if rendered > 0 {
-            draw_span(out, &mut cursor, y, " ", DIM, Some(BG), false)?;
+            draw_span(out, &mut cursor, y, " ", theme().dim, Some(theme().bg), false)?;
         }
         let remaining = width.saturating_sub(cursor.saturating_sub(x));
         let text = format!("{}{}", color_marker(label.color), label.name);
@@ -9627,7 +9876,7 @@ fn draw_label_field(
             y,
             &truncate(&text, remaining as usize),
             label.color,
-            Some(BG),
+            Some(theme().bg),
             false,
         )?;
         rendered += 1;
@@ -9644,8 +9893,8 @@ fn draw_label_field(
             &mut cursor,
             y,
             &truncate(&fallback, remaining as usize),
-            TEXT,
-            Some(BG),
+            theme().text,
+            Some(theme().bg),
             false,
         )?;
     }
@@ -9663,8 +9912,8 @@ fn draw_outer_frame(out: &mut Screen, frame: LayoutFrame) -> Result<()> {
     queue!(
         out,
         MoveTo(left, top),
-        SetForegroundColor(LINE),
-        SetBackgroundColor(BG),
+        SetForegroundColor(theme().line),
+        SetBackgroundColor(theme().bg),
         Print("┌"),
         Print("─".repeat(width.saturating_sub(2) as usize)),
         Print("┐")
@@ -9673,8 +9922,8 @@ fn draw_outer_frame(out: &mut Screen, frame: LayoutFrame) -> Result<()> {
         queue!(
             out,
             MoveTo(left, top + row),
-            SetForegroundColor(LINE),
-            SetBackgroundColor(BG),
+            SetForegroundColor(theme().line),
+            SetBackgroundColor(theme().bg),
             Print("│"),
             MoveTo(left + width.saturating_sub(1), top + row),
             Print("│")
@@ -9761,7 +10010,7 @@ fn draw_cell(
     let content = truncate(text, width as usize);
     let pad = width as usize - content.width().min(width as usize);
     queue!(out, MoveTo(x, y), SetForegroundColor(fg))?;
-    queue!(out, SetBackgroundColor(bg.unwrap_or(BG)))?;
+    queue!(out, SetBackgroundColor(bg.unwrap_or(theme().bg)))?;
     if bold {
         queue!(out, SetAttribute(Attribute::Bold))?;
     }
@@ -9788,7 +10037,7 @@ fn draw_cell_right(
     let content = truncate(text, width as usize);
     let pad = width as usize - content.width().min(width as usize);
     queue!(out, MoveTo(x, y), SetForegroundColor(fg))?;
-    queue!(out, SetBackgroundColor(bg.unwrap_or(BG)))?;
+    queue!(out, SetBackgroundColor(bg.unwrap_or(theme().bg)))?;
     if bold {
         queue!(out, SetAttribute(Attribute::Bold))?;
     }
@@ -9853,7 +10102,7 @@ fn draw_card_border(
     if width < 2 {
         return Ok(());
     }
-    let bg = bg.unwrap_or(BG);
+    let bg = bg.unwrap_or(theme().bg);
     queue!(
         out,
         MoveTo(x, y),
@@ -9889,7 +10138,7 @@ fn draw_card_border(
 
 fn draw_help_panel(out: &mut Screen, width: u16, height: u16) -> Result<()> {
     let box_width = min(width.saturating_sub(8), 112);
-    let box_height = min(height.saturating_sub(6), 29);
+    let box_height = min(height.saturating_sub(6), 30);
     if box_width < 48 || box_height < 10 {
         return draw_overlay(
             out,
@@ -10062,8 +10311,17 @@ fn draw_help_panel(out: &mut Screen, width: u16, height: u16) -> Result<()> {
         left,
         value_x,
         row,
+        "C",
+        "cycle color scheme (midnight · gruvbox · daylight) · also :theme <name>",
+    )?;
+    row += 1;
+    draw_shortcut_row(
+        out,
+        left,
+        value_x,
+        row,
         "/  :  f  S",
-        "search · command (:new, :project, :backend, :repos) · filter · sort",
+        "search · command (:new, :project, :backend, :repos, :theme) · filter · sort",
     )?;
     row += 1;
     draw_shortcut_row(out, left, value_x, row, "? / q / esc", "close this panel")?;
@@ -10080,7 +10338,7 @@ fn draw_modal_shell(
     title: &str,
 ) -> Result<()> {
     for row in 0..height {
-        draw_cell(out, x, y + row, width, "", TEXT, Some(BG), false)?;
+        draw_cell(out, x, y + row, width, "", theme().text, Some(theme().bg), false)?;
     }
     draw_cell(
         out,
@@ -10088,15 +10346,15 @@ fn draw_modal_shell(
         y,
         width,
         &format!(" {title}"),
-        Color::Black,
-        Some(PAPER),
+        theme().ink,
+        Some(theme().paper),
         true,
     )?;
     queue!(
         out,
         MoveTo(x, y + 1),
-        SetForegroundColor(PAPER),
-        SetBackgroundColor(BG),
+        SetForegroundColor(theme().paper),
+        SetBackgroundColor(theme().bg),
         Print("│"),
         MoveTo(x + width.saturating_sub(1), y + 1),
         Print("│")
@@ -10105,8 +10363,8 @@ fn draw_modal_shell(
         queue!(
             out,
             MoveTo(x, y + row),
-            SetForegroundColor(PAPER),
-            SetBackgroundColor(BG),
+            SetForegroundColor(theme().paper),
+            SetBackgroundColor(theme().bg),
             Print("│"),
             MoveTo(x + width.saturating_sub(1), y + row),
             Print("│")
@@ -10118,8 +10376,8 @@ fn draw_modal_shell(
         y + height.saturating_sub(2),
         width,
         "",
-        DIM,
-        Some(BG),
+        theme().dim,
+        Some(theme().bg),
         false,
     )?;
     if width > 4 {
@@ -10134,7 +10392,7 @@ fn draw_modal_shell(
                 g: 190,
                 b: 190,
             },
-            Some(PAPER),
+            Some(theme().paper),
             false,
         )?;
     }
@@ -10144,8 +10402,8 @@ fn draw_modal_shell(
         y + height.saturating_sub(1),
         width,
         "",
-        PAPER,
-        Some(BG),
+        theme().paper,
+        Some(theme().bg),
         false,
     )?;
     queue!(out, ResetColor)?;
@@ -10153,7 +10411,7 @@ fn draw_modal_shell(
 }
 
 fn draw_help_section(out: &mut Screen, x: u16, y: u16, title: &str) -> Result<()> {
-    draw_cell(out, x, y, 28, title, DIM, Some(BG), false)
+    draw_cell(out, x, y, 28, title, theme().dim, Some(theme().bg), false)
 }
 
 fn draw_shortcut_row(
@@ -10165,9 +10423,9 @@ fn draw_shortcut_row(
     description: &str,
 ) -> Result<()> {
     let mut cursor = x;
-    draw_span(out, &mut cursor, y, keys, ACCENT, Some(BG), true)?;
+    draw_span(out, &mut cursor, y, keys, theme().accent, Some(theme().bg), true)?;
     cursor = value_x;
-    draw_span(out, &mut cursor, y, description, DIM, Some(BG), false)?;
+    draw_span(out, &mut cursor, y, description, theme().dim, Some(theme().bg), false)?;
     Ok(())
 }
 
@@ -10242,8 +10500,298 @@ fn draw_overlay(out: &mut Screen, width: u16, height: u16, lines: &[&str]) -> Re
 }
 
 #[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            base_url: "https://plane.invalid".to_owned(),
+            api_key: "test".to_owned(),
+            workspace: "test".to_owned(),
+            wanted_projects: Vec::new(),
+            per_page: 100,
+            check_api: false,
+            agent_backend: AgentBackend::Codex,
+            codex_bin: "codex".to_owned(),
+            claude_bin: "claude".to_owned(),
+            claude_model: "claude-fable-5".to_owned(),
+            claude_effort: "high".to_owned(),
+            repo_dir: None,
+            context_file: None,
+            auto_refresh_mins: 5,
+            wip_limit: 2,
+            theme_name: THEME_MIDNIGHT.name.to_owned(),
+        }
+    }
+
+    fn test_item(sequence_id: i64, state: StateKind, priority: Priority) -> WorkItem {
+        WorkItem {
+            id: format!("item-{sequence_id}"),
+            key: format!("TM-{sequence_id}"),
+            sequence_id,
+            title: format!("item {sequence_id}"),
+            state_id: state.slug().to_owned(),
+            state,
+            priority,
+            labels: Vec::new(),
+            label_ids: Vec::new(),
+            due: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            description: String::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    fn test_app(items: Vec<WorkItem>) -> App {
+        App {
+            client: PlaneClient::new(test_config()),
+            projects: vec![Project {
+                id: "project".to_owned(),
+                name: "Project".to_owned(),
+                identifier: "TM".to_owned(),
+                states: vec![
+                    State {
+                        id: StateKind::Backlog.slug().to_owned(),
+                        name: StateKind::Backlog.name().to_owned(),
+                        kind: StateKind::Backlog,
+                    },
+                    State {
+                        id: StateKind::Todo.slug().to_owned(),
+                        name: StateKind::Todo.name().to_owned(),
+                        kind: StateKind::Todo,
+                    },
+                    State {
+                        id: StateKind::Started.slug().to_owned(),
+                        name: StateKind::Started.name().to_owned(),
+                        kind: StateKind::Started,
+                    },
+                    State {
+                        id: StateKind::Done.slug().to_owned(),
+                        name: StateKind::Done.name().to_owned(),
+                        kind: StateKind::Done,
+                    },
+                ],
+                labels: Vec::new(),
+                items,
+                loaded_at: Instant::now(),
+            }],
+            active_project: 0,
+            view: ViewMode::Board,
+            column: 1,
+            row: 0,
+            cursor: 0,
+            marks: BTreeSet::new(),
+            filter: FilterMode::All,
+            sort: SortMode::Priority,
+            search: String::new(),
+            input_mode: None,
+            input: String::new(),
+            input_cursor: 0,
+            editing_key: None,
+            new_project_name: None,
+            menu: None,
+            api_open: false,
+            show_done: false,
+            keys_open: false,
+            notes_open: false,
+            triage: None,
+            prompt_view: None,
+            codex_job: None,
+            detail: None,
+            backend_wizard: None,
+            last_idle_draw: None,
+            api_log: Vec::new(),
+            status: String::new(),
+            busy: None,
+            last_g: None,
+            frame: 0,
+            should_quit: false,
+            screen: Screen::default(),
+            force_clear: false,
+            agent_jobs: Vec::new(),
+            jobs_open: false,
+            jobs_sel_id: None,
+            dispatch_item: None,
+            dispatch_backend: AgentBackend::Codex,
+            dispatch_interactive: true,
+            dispatch_brief: false,
+            dispatch_explore: false,
+            dispatch_repo: 0,
+            repo_wizard: None,
+            repo_wizard_sel: 0,
+            work_wizard: None,
+            work_item: None,
+            work_sessions: Vec::new(),
+            work_sessions_at: None,
+            skill_wizard: None,
+            skill_wizard_sel: 0,
+            dispatch_skills: Vec::new(),
+            feedback_job: None,
+            feedback_backend: None,
+            land_job: None,
+            post_results: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn select_item_by_key_moves_board_cursor_to_item() {
+        let mut app = test_app(vec![
+            test_item(2, StateKind::Todo, Priority::None),
+            test_item(1, StateKind::Todo, Priority::None),
+            test_item(3, StateKind::Started, Priority::None),
+        ]);
+        app.sort = SortMode::Key;
+
+        assert!(app.select_item_by_key("TM-1"));
+
+        assert_eq!(app.column, 1);
+        assert_eq!(app.row, 1);
+        assert_eq!(app.current_item().unwrap().key, "TM-1");
+        assert!(app.force_clear);
+    }
+
+    #[test]
+    fn select_item_by_key_moves_list_cursor_to_item() {
+        let mut app = test_app(vec![
+            test_item(3, StateKind::Backlog, Priority::None),
+            test_item(2, StateKind::Todo, Priority::None),
+            test_item(1, StateKind::Started, Priority::None),
+        ]);
+        app.view = ViewMode::List;
+        app.sort = SortMode::Key;
+
+        assert!(app.select_item_by_key("TM-1"));
+
+        assert_eq!(app.cursor, 2);
+        assert_eq!(app.current_item().unwrap().key, "TM-1");
+    }
+
+    #[test]
+    fn select_item_by_key_reveals_item_hidden_by_filter() {
+        let mut app = test_app(vec![
+            test_item(2, StateKind::Todo, Priority::High),
+            test_item(1, StateKind::Todo, Priority::None),
+        ]);
+        app.view = ViewMode::List;
+        app.sort = SortMode::Key;
+        app.filter = FilterMode::Fire;
+        app.search = "does-not-match".to_owned();
+
+        assert!(app.select_item_by_key("TM-1"));
+
+        assert_eq!(app.filter, FilterMode::All);
+        assert!(app.search.is_empty());
+        assert_eq!(app.current_item().unwrap().key, "TM-1");
+    }
+}
+
+#[cfg(test)]
 mod render_tests {
     use super::*;
+
+    #[test]
+    fn theme_registry_is_well_formed() {
+        // The default (first) scheme is midnight, matching the historical palette.
+        assert_eq!(THEMES[0].name, THEME_MIDNIGHT.name);
+        assert_eq!(THEME_MIDNIGHT.name, "midnight");
+        assert!(THEMES.len() >= 2, "expected at least one alternate scheme");
+
+        // Names are unique so lookup and cycling are unambiguous.
+        for (i, a) in THEMES.iter().enumerate() {
+            for b in &THEMES[i + 1..] {
+                assert_ne!(a.name, b.name, "duplicate theme name {}", a.name);
+            }
+        }
+    }
+
+    #[test]
+    fn theme_lookup_is_case_insensitive() {
+        assert_eq!(theme_by_name("GRUVBOX").map(|t| t.name), Some("gruvbox"));
+        assert_eq!(theme_by_name("  daylight ").map(|t| t.name), Some("daylight"));
+        assert!(theme_by_name("nope").is_none());
+    }
+
+    #[test]
+    fn next_theme_cycles_and_wraps() {
+        // Walking `next_theme` from the default visits every scheme then wraps.
+        let mut name = THEMES[0].name;
+        let mut seen = vec![name];
+        for _ in 1..THEMES.len() {
+            name = next_theme(name).name;
+            seen.push(name);
+        }
+        for scheme in THEMES {
+            assert!(seen.contains(&scheme.name), "cycle skipped {}", scheme.name);
+        }
+        assert_eq!(next_theme(name).name, THEMES[0].name, "cycle should wrap");
+        // An unknown name falls back to the first scheme's successor.
+        assert_eq!(next_theme("bogus").name, THEMES[1 % THEMES.len()].name);
+    }
+
+    #[test]
+    fn set_active_theme_swaps_the_palette() {
+        set_active_theme(THEME_DAYLIGHT);
+        assert_eq!(theme().name, "daylight");
+        assert_eq!(theme().bg, THEME_DAYLIGHT.bg);
+        // Restore the default so other tests on this thread see midnight.
+        set_active_theme(THEME_MIDNIGHT);
+        assert_eq!(theme().bg, THEME_MIDNIGHT.bg);
+    }
+
+    #[test]
+    fn active_theme_flows_into_rendered_cells() {
+        // End-to-end: the same draw call paints different inks under different
+        // schemes, proving the palette reaches the renderer (not just the const).
+        let ink = |scheme: Theme| {
+            set_active_theme(scheme);
+            let mut s = Screen::blank(8, 1);
+            draw_cell(&mut s, 0, 0, 8, "hi", theme().paper, Some(theme().bg), false).unwrap();
+            let cell = &s.cells[s.idx(0, 0)];
+            (cell.fg, cell.bg)
+        };
+        let midnight = ink(THEME_MIDNIGHT);
+        let daylight = ink(THEME_DAYLIGHT);
+        assert_eq!(midnight, (ink_of(THEME_MIDNIGHT.paper), ink_of(THEME_MIDNIGHT.bg)));
+        assert_eq!(daylight, (ink_of(THEME_DAYLIGHT.paper), ink_of(THEME_DAYLIGHT.bg)));
+        assert_ne!(midnight, daylight);
+        set_active_theme(THEME_MIDNIGHT);
+    }
+
+    #[test]
+    fn work_session_names_include_the_item_title() {
+        assert_eq!(
+            work_session_name("TM-201", "Upload retry loop (phase 2)"),
+            "pti-work-tm-201--upload-retry-loop-phase-2"
+        );
+        assert_eq!(
+            work_session_item_key("pti-work-tm-201--upload-retry-loop-phase-2").as_deref(),
+            Some("TM-201")
+        );
+    }
+
+    #[test]
+    fn work_session_names_use_all_safe_space_without_splitting_unicode() {
+        let name = work_session_name("TM-201", &"é".repeat(200));
+
+        assert!(name.len() <= WORK_SESSION_NAME_MAX_BYTES);
+        assert!(name.starts_with("pti-work-tm-201--"));
+        assert!(name.is_char_boundary(name.len()));
+    }
+
+    #[test]
+    fn work_session_matching_supports_legacy_names_without_key_prefix_collisions() {
+        assert!(work_session_matches_item("pti-work-tm-1", "TM-1"));
+        assert!(work_session_matches_item(
+            "pti-work-tm-1--short-title",
+            "TM-1"
+        ));
+        assert!(!work_session_matches_item(
+            "pti-work-tm-10--short-title",
+            "TM-1"
+        ));
+    }
 
     fn grid_text(s: &Screen) -> Vec<String> {
         (0..s.h)
@@ -10274,7 +10822,7 @@ mod render_tests {
     #[test]
     fn parses_move_color_print() {
         let mut s = Screen::blank(20, 3);
-        draw_cell(&mut s, 0, 0, 20, "hello", PAPER, Some(BG), false).unwrap();
+        draw_cell(&mut s, 0, 0, 20, "hello", theme().paper, Some(theme().bg), false).unwrap();
         let s = replay(&mut s);
         assert_eq!(grid_text(&s)[0], format!("{:<20}", "hello"));
         let c = &s.cells[s.idx(0, 0)];
@@ -10286,7 +10834,7 @@ mod render_tests {
         let mut s = Screen::blank(10, 1);
         let mut x = 0;
         // a double-width glyph
-        draw_span(&mut s, &mut x, 0, "⣾", ACCENT, Some(BG), false).unwrap();
+        draw_span(&mut s, &mut x, 0, "⣾", theme().accent, Some(theme().bg), false).unwrap();
         s.flush_ground();
         assert_eq!(s.cells[s.idx(0, 0)].ch, '⣾');
         assert!(!s.cells[s.idx(0, 0)].cont);
@@ -10299,7 +10847,7 @@ mod render_tests {
     #[test]
     fn osc8_link_round_trips() {
         let mut s = Screen::blank(40, 1);
-        draw_link_field(&mut s, 0, 0, 40, "https://example.com/x", ACCENT).unwrap();
+        draw_link_field(&mut s, 0, 0, 40, "https://example.com/x", theme().accent).unwrap();
         s.flush_ground();
         // the url cells should carry a link annotation
         let has_link = (0..s.w).any(|x| s.cells[s.idx(x, 0)].link.is_some());
@@ -10312,11 +10860,11 @@ mod render_tests {
     #[test]
     fn flush_reproduces_frame() {
         let mut s = Screen::blank(24, 4);
-        draw_cell(&mut s, 0, 0, 24, "top line", PAPER, Some(BG), true).unwrap();
+        draw_cell(&mut s, 0, 0, 24, "top line", theme().paper, Some(theme().bg), true).unwrap();
         let mut x = 1;
-        draw_span(&mut s, &mut x, 1, "mixed", RED, Some(CELL_BG), false).unwrap();
-        draw_span(&mut s, &mut x, 1, " tail", GREEN, None, true).unwrap();
-        draw_cell_right(&mut s, 0, 2, 24, "right", DIM, Some(BG), false).unwrap();
+        draw_span(&mut s, &mut x, 1, "mixed", theme().red, Some(theme().cell_bg), false).unwrap();
+        draw_span(&mut s, &mut x, 1, " tail", theme().green, None, true).unwrap();
+        draw_cell_right(&mut s, 0, 2, 24, "right", theme().dim, Some(theme().bg), false).unwrap();
         s.flush_ground();
         let fresh = replay(&mut s);
         assert_eq!(grid_text(&fresh), grid_text(&s));
@@ -10329,7 +10877,7 @@ mod render_tests {
     fn chunked_writes_survive_split_escapes() {
         // Emulate crossterm splitting a single command across write() calls.
         let mut whole = Screen::blank(20, 1);
-        draw_cell(&mut whole, 0, 0, 20, "split me", AMBER, Some(BG), true).unwrap();
+        draw_cell(&mut whole, 0, 0, 20, "split me", theme().amber, Some(theme().bg), true).unwrap();
         whole.flush_ground();
 
         // capture the exact bytes, then feed them one at a time
@@ -10355,12 +10903,12 @@ mod render_tests {
             0,
             30,
             "unchanged header",
-            PAPER,
-            Some(BG),
+            theme().paper,
+            Some(theme().bg),
             false,
         )
         .unwrap();
-        draw_cell(&mut frame1, 0, 1, 30, "status: idle", DIM, Some(BG), false).unwrap();
+        draw_cell(&mut frame1, 0, 1, 30, "status: idle", theme().dim, Some(theme().bg), false).unwrap();
         let mut sink = Vec::new();
         frame1.flush_into(&mut prev, &mut sink).unwrap();
 
@@ -10374,8 +10922,8 @@ mod render_tests {
             1,
             30,
             "status: busy",
-            AMBER,
-            Some(BG),
+            theme().amber,
+            Some(theme().bg),
             false,
         )
         .unwrap();
@@ -10409,8 +10957,8 @@ mod render_tests {
                     y,
                     w,
                     &format!("row {y:02} of the board view here"),
-                    PAPER,
-                    Some(BG),
+                    theme().paper,
+                    Some(theme().bg),
                     false,
                 )
                 .unwrap();
@@ -10421,8 +10969,8 @@ mod render_tests {
                 &mut x,
                 h - 1,
                 &format!("working {spinner}"),
-                AMBER,
-                Some(BG),
+                theme().amber,
+                Some(theme().bg),
                 true,
             )
             .unwrap();
@@ -10469,8 +11017,8 @@ mod render_tests {
             0,
             20,
             "base row zero here",
-            DIM,
-            Some(BG),
+            theme().dim,
+            Some(theme().bg),
             false,
         )
         .unwrap();
@@ -10480,8 +11028,8 @@ mod render_tests {
             1,
             20,
             "OVERLAY POPUP",
-            PAPER,
-            Some(CELL_BG),
+            theme().paper,
+            Some(theme().cell_bg),
             true,
         )
         .unwrap();
@@ -10497,8 +11045,8 @@ mod render_tests {
             0,
             20,
             "base row zero here",
-            DIM,
-            Some(BG),
+            theme().dim,
+            Some(theme().bg),
             false,
         )
         .unwrap();

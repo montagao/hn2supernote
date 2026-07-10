@@ -46,8 +46,9 @@ pti
 - `p`: set priority on cursor or marks
 - `t`: toggle labels on cursor or marks; press `n` in the label menu to create a label
 - `T`: triage unprioritized backlog items
+- `C`: cycle the color scheme (see below)
 - `/`: search
-- `:`: command mode, including `:new title`, `:project`, and `:backend`
+- `:`: command mode, including `:new title`, `:project`, `:backend`, and `:theme`
 - `x`: API drawer
 - `?`: keys overlay
 - `R`: refresh from Plane
@@ -55,9 +56,9 @@ pti
 - `q`: quit
 
 New items are created in the currently selected board state. In list view, they use the
-selected item's state. `:new` accepts inline tokens: `!u/!h/!m/!l` set priority and
-`#labelname` attaches labels (case-insensitive, unique prefixes work), e.g.
-`:new fix upload bug !h #fullstack`.
+selected item's state, then become the active cursor item. `:new` accepts inline tokens:
+`!u/!h/!m/!l` set priority and `#labelname` attaches labels (case-insensitive,
+unique prefixes work), e.g. `:new fix upload bug !h #fullstack`.
 
 `:project` opens a two-step wizard for creating a Plane project: enter the display
 name, then confirm or edit the generated project key before it is posted. Created
@@ -72,6 +73,18 @@ default 5, `0` disables).
 The In Progress board column enforces a WIP limit (`--wip-limit` / `PLANE_TUI_WIP_LIMIT`,
 default 2, `0` disables): its header shows `N/limit` and turns red when over, and both
 `s` and the `T` triage flow guard against moving more items in past the limit.
+
+## Color schemes
+
+Three built-in schemes ship: `midnight` (the default warm-on-indigo dark theme),
+`gruvbox` (warm dark), and `daylight` (light — dark ink on warm off-white).
+
+- `C` cycles to the next scheme live and repaints immediately.
+- `:theme` cycles; `:theme <name>` selects one; `:theme list` shows the choices.
+- `--theme <name>` / `PLANE_TUI_THEME` picks the scheme at startup.
+
+The active choice is remembered in `~/.local/share/plane-tui/theme`, so it persists
+across runs (an explicit `--theme`/`PLANE_TUI_THEME` overrides the remembered one).
 
 ## Agent prompts (`a` / `A`)
 
