@@ -551,8 +551,19 @@ fn next_theme(name: &str) -> Theme {
     THEMES[(index + 1) % THEMES.len()]
 }
 
+/// `pti --version` string: semver plus the git commit + date it was built from,
+/// so you can always tell which build is installed (see build.rs).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("PTI_GIT_SHA"),
+    " ",
+    env!("PTI_BUILD_DATE"),
+    ")"
+);
+
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version = VERSION, about)]
 struct Args {
     #[arg(long, env = "PLANE_BASE_URL", hide_env_values = true)]
     base_url: Option<String>,
