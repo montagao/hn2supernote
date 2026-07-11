@@ -70,6 +70,28 @@ fn agent_wip() -> usize {
     env_u64("PLANE_TUI_AGENT_WIP", 3).max(1) as usize
 }
 
+/// Model a headless Claude job automatically falls back to when it exits with
+/// an error (default Opus 4.8). Set PLANE_TUI_CLAUDE_FALLBACK_MODEL to another
+/// model id, or to "off"/"none"/"0"/"" to disable the automatic retry.
+fn claude_fallback_model() -> Option<String> {
+    resolve_claude_fallback(std::env::var("PLANE_TUI_CLAUDE_FALLBACK_MODEL").ok().as_deref())
+}
+
+/// Pure resolution of the fallback-model setting (see `claude_fallback_model`).
+fn resolve_claude_fallback(raw: Option<&str>) -> Option<String> {
+    match raw {
+        Some(value) => {
+            let value = value.trim();
+            let disabled = value.is_empty()
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("none")
+                || value == "0";
+            (!disabled).then(|| value.to_owned())
+        }
+        None => Some("claude-opus-4-8".to_owned()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepoSource {
     Default,      // --repo-dir: always available, can't be removed here
@@ -3725,7 +3747,9 @@ impl App {
                 self.post_result_comment(&job, &dir);
             }
             jobs::JobStatus::Failed => {
-                self.status = format!("✗ {key} agent failed — J for the log");
+                if !self.try_claude_fallback(index) {
+                    self.status = format!("✗ {key} agent failed — J for the log");
+                }
             }
             jobs::JobStatus::Orphaned => {
                 self.status = format!("{key} agent orphaned (tmux session gone) — J to retry");
@@ -3733,6 +3757,65 @@ impl App {
             _ => {}
         }
         self.force_clear = true;
+    }
+
+    /// A headless Claude job just exited with an error. Retry it once on the
+    /// fallback model (Opus 4.8 by default) before surfacing the failure to the
+    /// human. The model swap is the loop guard: once a job is already on the
+    /// fallback model, a second error is left for manual `r`/`f`. Returns true
+    /// when the job was re-dispatched (respawned or queued).
+    fn try_claude_fallback(&mut self, index: usize) -> bool {
+        let Some(fallback) = claude_fallback_model() else {
+            return false; // disabled via env
+        };
+        {
+            let handle = &self.agent_jobs[index];
+            let job = &handle.job;
+            if job.backend != "claude"
+                || job.mode == jobs::JobMode::Interactive
+                || job.model == fallback
+                || !handle.dir.join("prompt.md").exists()
+            {
+                return false;
+            }
+        }
+        let from = {
+            let handle = &mut self.agent_jobs[index];
+            jobs::kill_session(&handle.job);
+            let from = handle.job.model.clone();
+            handle.job.model = fallback.clone();
+            handle.job.attempt += 1;
+            handle.job.tmux_session =
+                jobs::session_name(&handle.job.item_key, handle.job.attempt);
+            handle.diff_stat = None;
+            handle.tail.push(format!(
+                "── claude error on {from} — falling back to {fallback} (attempt {}) ──",
+                handle.job.attempt
+            ));
+            from
+        };
+        let key = self.agent_jobs[index].job.item_key.clone();
+        let attempt = self.agent_jobs[index].job.attempt;
+        if self.running_agents() < agent_wip() {
+            match self.spawn_agent_job(index) {
+                Ok(()) => {
+                    self.status = format!(
+                        "⟳ {key} claude errored on {from} — retrying on {fallback} (attempt {attempt})"
+                    );
+                }
+                Err(err) => {
+                    // spawn_agent_job already re-marked it Failed; report and stop
+                    self.status = format!("{key} fallback to {fallback} failed to spawn: {err:#}");
+                }
+            }
+        } else {
+            self.agent_jobs[index].job.status = jobs::JobStatus::Queued;
+            let _ = jobs::save(&self.agent_jobs[index].dir, &self.agent_jobs[index].job);
+            self.status = format!(
+                "⟳ {key} claude errored on {from} — queued on {fallback} (attempt {attempt})"
+            );
+        }
+        true
     }
 
     /// Post the agent's result back to the Plane item as a comment, in the
@@ -10690,6 +10773,22 @@ mod app_tests {
 #[cfg(test)]
 mod render_tests {
     use super::*;
+
+    #[test]
+    fn claude_fallback_defaults_to_opus_and_can_be_disabled() {
+        // unset → default to Opus 4.8
+        assert_eq!(resolve_claude_fallback(None).as_deref(), Some("claude-opus-4-8"));
+        // explicit model wins
+        assert_eq!(
+            resolve_claude_fallback(Some("claude-sonnet-5")).as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(resolve_claude_fallback(Some("  claude-opus-4-8 ")).as_deref(), Some("claude-opus-4-8"));
+        // disable sentinels
+        for off in ["", "  ", "off", "OFF", "none", "None", "0"] {
+            assert_eq!(resolve_claude_fallback(Some(off)), None, "{off:?} should disable");
+        }
+    }
 
     #[test]
     fn theme_registry_is_well_formed() {

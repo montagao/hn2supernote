@@ -185,6 +185,15 @@ slots free. A running job with no output for `PLANE_TUI_STALL_MIN` minutes
 (default 8) is flagged `⚠ STALLED?`; after `PLANE_TUI_JOB_TIMEOUT_MIN` minutes
 (default 45, `0` disables) it is cancelled and marked failed.
 
+When a headless **claude** job exits with an error, the cockpit retries it once
+on a stronger model — **Opus 4.8** by default — before surfacing the failure, so
+a flaky or under-powered default model self-heals without a keystroke. It swaps
+the model, bumps the attempt (keeping the worktree and its commits), and respawns
+(or queues if at the WIP limit); once a job is already on the fallback model a
+second error is left for you to `r` retry or `f` feedback. Point
+`PLANE_TUI_CLAUDE_FALLBACK_MODEL` at another model id to change the target, or set
+it to `off` to disable. Interactive sessions and the codex backend are exempt.
+
 On success the agent's final message is posted back to the Plane item as a
 comment (retried in the background) and the job lands in REVIEW; a result
 starting with `QUESTION:` shows as `?` instead. In the fleet (`J`):
