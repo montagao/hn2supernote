@@ -8902,6 +8902,22 @@ fn spawn_agent(config: &Config, out_file: &std::path::Path) -> Result<std::proce
     })
 }
 
+/// The most useful one-line reason from a failed agent run. Prefers the last
+/// non-empty stderr line, then stdout — `claude --print` reports operational
+/// errors (rate limits, model access) on stdout, not stderr, so relying on
+/// stderr alone swallowed them as an opaque "no stderr".
+fn agent_failure_tail(stderr: &str, stdout: &str) -> String {
+    let last_nonempty = |text: &str| -> Option<String> {
+        text.lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_owned())
+    };
+    last_nonempty(stderr)
+        .or_else(|| last_nonempty(stdout))
+        .unwrap_or_else(|| "no output".to_owned())
+}
+
 fn complete_agent(
     mut child: std::process::Child,
     backend: AgentBackend,
@@ -8922,13 +8938,12 @@ fn complete_agent(
         .with_context(|| format!("wait for {bin}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail = stderr
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("no stderr")
-            .to_owned();
-        bail!("{bin} failed ({}): {tail}", output.status);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "{bin} failed ({}): {}",
+            output.status,
+            agent_failure_tail(&stderr, &stdout)
+        );
     }
     let text = match backend {
         AgentBackend::Codex => {
@@ -10784,6 +10799,21 @@ mod app_tests {
 #[cfg(test)]
 mod render_tests {
     use super::*;
+
+    #[test]
+    fn agent_failure_tail_falls_back_to_stdout() {
+        // stderr wins when it has content
+        assert_eq!(agent_failure_tail("boom\n", "ignored stdout"), "boom");
+        // last non-empty stderr line wins
+        assert_eq!(agent_failure_tail("first\nsecond\n\n", ""), "second");
+        // claude --print puts rate-limit errors on stdout with empty stderr
+        assert_eq!(
+            agent_failure_tail("  \n\n", "You've reached your Fable 5 limit."),
+            "You've reached your Fable 5 limit."
+        );
+        // nothing anywhere
+        assert_eq!(agent_failure_tail("", ""), "no output");
+    }
 
     #[test]
     fn claude_fallback_defaults_to_opus_and_can_be_disabled() {
