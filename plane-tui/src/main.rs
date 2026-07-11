@@ -2168,6 +2168,45 @@ impl App {
         self.cursor = self.cursor.min(list_len);
     }
 
+    /// Move the selection onto the first card matching the active search so the
+    /// result is scrolled into view. The board's scroll window is anchored to
+    /// `self.column`/`self.row`; without re-focusing, the window stays where it
+    /// sat before the search and can skip past every match — leaving matching
+    /// cards off-screen, or the whole column looking empty.
+    fn focus_first_match(&mut self) {
+        if self.search.is_empty() {
+            self.clamp_selection();
+            return;
+        }
+        match self.view {
+            ViewMode::Board => {
+                let states = self.board_states();
+                let current_has_match = states
+                    .get(self.column)
+                    .is_some_and(|state| !self.filtered_indices_for_state(*state).is_empty());
+                if !current_has_match {
+                    if let Some(column) = states
+                        .iter()
+                        .position(|state| !self.filtered_indices_for_state(*state).is_empty())
+                    {
+                        self.column = column;
+                    }
+                }
+                self.row = 0;
+            }
+            ViewMode::List => self.cursor = 0,
+        }
+        self.clamp_selection();
+    }
+
+    /// Apply the in-progress input box as the live search query and re-focus
+    /// onto the first match so it becomes visible immediately.
+    fn update_search_query(&mut self) {
+        self.search = self.input.clone();
+        self.force_clear = true;
+        self.focus_first_match();
+    }
+
     fn target_keys(&self) -> Vec<String> {
         if self.marks.is_empty() {
             self.current_item()
@@ -5274,9 +5313,8 @@ impl App {
             KeyCode::Enter => {
                 let keep_input = match mode {
                     InputMode::Search => {
-                        self.search = self.input.clone();
+                        self.update_search_query();
                         self.status = format!("search → /{}", self.search);
-                        self.force_clear = true;
                         false
                     }
                     InputMode::Command => {
@@ -5337,8 +5375,7 @@ impl App {
                     self.input_cursor = previous;
                 }
                 if mode == InputMode::Search {
-                    self.search = self.input.clone();
-                    self.force_clear = true;
+                    self.update_search_query();
                 }
             }
             KeyCode::Delete => {
@@ -5347,8 +5384,7 @@ impl App {
                     self.input.replace_range(self.input_cursor..next, "");
                 }
                 if mode == InputMode::Search {
-                    self.search = self.input.clone();
-                    self.force_clear = true;
+                    self.update_search_query();
                 }
             }
             KeyCode::Left => {
@@ -5363,8 +5399,7 @@ impl App {
                 self.input.insert(self.input_cursor, ch);
                 self.input_cursor += ch.len_utf8();
                 if mode == InputMode::Search {
-                    self.search = self.input.clone();
-                    self.force_clear = true;
+                    self.update_search_query();
                 }
             }
             _ => {}
@@ -6928,7 +6963,7 @@ impl App {
             }
             let max_cards = height.saturating_sub(3) as usize / CARD_HEIGHT as usize;
             let selected_row = if col_index == self.column {
-                self.row
+                self.row.min(indices.len().saturating_sub(1))
             } else {
                 usize::MAX
             };
@@ -10793,6 +10828,49 @@ mod app_tests {
         assert_eq!(app.filter, FilterMode::All);
         assert!(app.search.is_empty());
         assert_eq!(app.current_item().unwrap().key, "TM-1");
+    }
+
+    #[test]
+    fn search_reveals_match_scrolled_out_of_view() {
+        // A tall column with the selection scrolled to the bottom before searching.
+        let items = (1..=12)
+            .map(|seq| test_item(seq, StateKind::Started, Priority::None))
+            .collect();
+        let mut app = test_app(items);
+        app.sort = SortMode::Key;
+        app.column = 2; // Started
+        app.row = 11; // scrolled far down before the search
+
+        // Live-search for the single card whose key is TM-7.
+        app.input = "TM-7".to_owned();
+        app.update_search_query();
+
+        // Selection lands on the match with a row inside the filtered list, so the
+        // render window (anchored on `row`) can no longer skip past every match.
+        let indices = app.filtered_indices_for_state(StateKind::Started);
+        assert_eq!(indices.len(), 1);
+        assert!(app.row < indices.len());
+        assert_eq!(app.row, 0);
+        assert_eq!(app.current_item().unwrap().key, "TM-7");
+    }
+
+    #[test]
+    fn search_hops_to_the_column_holding_the_match() {
+        let mut app = test_app(vec![
+            test_item(1, StateKind::Backlog, Priority::None),
+            test_item(2, StateKind::Todo, Priority::None),
+            test_item(3, StateKind::Started, Priority::None),
+        ]);
+        app.sort = SortMode::Key;
+        app.column = 0; // Backlog selected, but the only match lives in Started
+        app.row = 0;
+
+        app.input = "TM-3".to_owned();
+        app.update_search_query();
+
+        assert_eq!(app.column, 2);
+        assert_eq!(app.row, 0);
+        assert_eq!(app.current_item().unwrap().key, "TM-3");
     }
 }
 
