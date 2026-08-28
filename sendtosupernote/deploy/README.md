@@ -3,9 +3,10 @@
 The production API runs as the `sendtosupernote` system user. Uvicorn listens
 only on `127.0.0.1:8765`; nginx exposes `https://supernote.translate.mom`.
 
-Runtime state is stored in `/var/lib/sendtosupernote`. Supernote credentials
-are kept in process memory only and are discarded on service restart. Access
-tokens expire after seven days by default.
+Runtime state is stored in `/var/lib/sendtosupernote`. Supernote passwords are
+not retained after login. Cloud session tokens are kept in process memory only
+and are discarded on service restart. API access tokens expire after seven
+days by default.
 
 Optional settings belong in `/etc/sendtosupernote.env`:
 

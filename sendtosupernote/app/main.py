@@ -31,15 +31,15 @@ app = FastAPI(
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Runtime state contains task metadata only. Supernote credentials remain in
-# memory and are discarded whenever the service restarts.
+# Runtime state contains task metadata only. Supernote session tokens remain
+# in memory and are discarded whenever the service restarts.
 STATE_DIR = Path(os.getenv("SENDTOSUPERNOTE_STATE_DIR", Path(__file__).parent))
 TASK_STATUS_FILE_PATH = STATE_DIR / "task_status_store.json"
 TASK_STATUS_TTL_DAYS = int(os.getenv("TASK_STATUS_TTL_DAYS", "30"))
 TOKEN_TTL_HOURS = int(os.getenv("TOKEN_TTL_HOURS", "168"))
 PROCESSING_CONCURRENCY = max(1, int(os.getenv("PROCESSING_CONCURRENCY", "2")))
 
-# In-memory store for active tokens and associated credentials.
+# In-memory store for API tokens and their Supernote session tokens.
 active_tokens: Dict[str, Dict[str, str]] = {}
 task_statuses: Dict[str, Dict[str, str]] = {}
 task_status_lock = Lock()
@@ -185,7 +185,7 @@ class TaskStatusResponse(BaseModel):
 
 class UserInfo(BaseModel):
     email: str
-    password: str # Store password here temporarily, associated with the token
+    supernote_token: str
 
 # --- Authentication Dependencies ---
 async def get_validated_user_info_from_token(authorization: Optional[str] = Header(None)) -> UserInfo:
@@ -225,21 +225,24 @@ async def get_validated_user_info_from_token(authorization: Optional[str] = Head
             headers={"WWW-Authenticate": "Bearer"},
         )
     logger.info(f"Successfully authenticated user {user_creds['email']} with token.")
-    return UserInfo(email=user_creds["email"], password=user_creds["password"])
+    return UserInfo(
+        email=user_creds["email"],
+        supernote_token=user_creds["supernote_token"],
+    )
 
-async def verify_supernote_credentials(email: str, password: str) -> bool:
+async def authenticate_with_supernote(email: str, password: str) -> Optional[str]:
     logger.info(f"Attempting Supernote login for {email}")
     if not email or not password:
         logger.warning("Supernote email or password not provided for verification.")
-        return False
+        return None
     try:
         client = SNClientWithCSRF()
-        client.login(email, password) # This is the actual check
+        token = client.login(email, password)
         logger.info(f"Supernote login successful for {email}")
-        return True
+        return token
     except SNAuthenticationError as e:
         logger.error(f"Supernote login failed for {email}: {e}")
-        return False
+        return None
     except Exception as e:
         logger.error(f"Supernote Cloud login service error for {email}: {e}")
         raise
@@ -277,7 +280,7 @@ async def healthcheck():
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login_for_access_token(form_data: LoginRequest):
     try:
-        login_successful = await verify_supernote_credentials(
+        supernote_token = await authenticate_with_supernote(
             form_data.supernote_email, form_data.supernote_password
         )
     except Exception as exc:
@@ -285,7 +288,7 @@ async def login_for_access_token(form_data: LoginRequest):
             status_code=502,
             detail="Supernote Cloud login is temporarily unavailable",
         ) from exc
-    if not login_successful:
+    if not supernote_token:
         raise HTTPException(
             status_code=401,
             detail="Incorrect Supernote email or password",
@@ -294,7 +297,7 @@ async def login_for_access_token(form_data: LoginRequest):
     access_token = str(uuid.uuid4()) # Simple UUID token
     active_tokens[access_token] = {
         "email": form_data.supernote_email,
-        "password": form_data.supernote_password,
+        "supernote_token": supernote_token,
         "expires_at": (_utc_now() + timedelta(hours=TOKEN_TTL_HOURS)).isoformat(),
     }
     logger.info("Generated an access token for %s", form_data.supernote_email)
@@ -417,7 +420,7 @@ def process_article_in_background(request_data: ArticleQueueRequest, user_info: 
         uploaded_count = processing.upload_pdfs_to_supernote(
             pdf_filepaths=[str(actual_pdf_path)], # Pass the path to the PDF with the correct name
             sn_email=user_info.email,
-            sn_password=user_info.password,
+            sn_access_token=user_info.supernote_token,
             sn_target_path=request_data.target_path 
         )
 

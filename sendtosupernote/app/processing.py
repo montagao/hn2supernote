@@ -656,10 +656,17 @@ def generate_supernote_pdf_filename(article_title: str, author_name: str | None 
         return f"{sanitized_title}_{sanitized_author}.pdf"
     return f"{sanitized_title}.pdf"
 
-def upload_pdfs_to_supernote(pdf_filepaths: list[str], sn_email: str, sn_password: str, sn_target_path: str | None = None) -> int:
+def upload_pdfs_to_supernote(
+    pdf_filepaths: list[str],
+    sn_email: str,
+    sn_password: str | None = None,
+    sn_target_path: str | None = None,
+    sn_access_token: str | None = None,
+) -> int:
     """
     Upload PDF files to the specified path on Supernote using sncloud.
-    Credentials (sn_email, sn_password) are passed directly.
+    A previously authenticated access token is preferred. Email/password login
+    remains as a compatibility fallback for callers outside the API service.
     sn_target_path can be passed, otherwise defaults to SUPERNOTE_TARGET_PATH env var or /Inbox/SendToSupernote.
     Returns the number of successfully uploaded files.
     """
@@ -672,8 +679,8 @@ def upload_pdfs_to_supernote(pdf_filepaths: list[str], sn_email: str, sn_passwor
             logger.info(f"Would have uploaded: {', '.join(pdf_filepaths)}")
         return len(pdf_filepaths)
 
-    if not sn_email or not sn_password:
-        logger.error("Supernote email or password not provided for upload.")
+    if not sn_email or (not sn_access_token and not sn_password):
+        logger.error("Supernote authentication not provided for upload.")
         return 0
 
     target_path_str = sn_target_path or os.getenv("SUPERNOTE_TARGET_PATH", "/Inbox/SendToSupernote")
@@ -686,9 +693,13 @@ def upload_pdfs_to_supernote(pdf_filepaths: list[str], sn_email: str, sn_passwor
 
     try:
         client = SNClientWithCSRF()
-        logger.info(f"Logging in to Supernote cloud with email: {sn_email}")
-        client.login(sn_email, sn_password)
-        logger.info("Successfully logged in to Supernote cloud")
+        if sn_access_token:
+            client._access_token = sn_access_token
+            logger.info("Using the existing Supernote Cloud session for %s", sn_email)
+        else:
+            logger.info(f"Logging in to Supernote cloud with email: {sn_email}")
+            client.login(sn_email, sn_password)
+            logger.info("Successfully logged in to Supernote cloud")
 
         path_exists = False
         try:
