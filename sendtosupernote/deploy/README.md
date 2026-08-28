@@ -21,3 +21,12 @@ by the extension when it creates the PDF.
 
 Install the pinned runtime dependencies from `requirements.txt`, then install
 the matching browser bundle with `playwright install --with-deps chromium`.
+
+After the DNS record points at the VPS, enable HTTPS with:
+
+```bash
+certbot --nginx -d supernote.translate.mom --redirect
+```
+
+The nginx site exposes only the root health information, `/healthz`, the login
+endpoint, the article queue endpoint, and UUID-shaped task-status endpoints.

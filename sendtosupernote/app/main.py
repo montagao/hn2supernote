@@ -18,7 +18,13 @@ from sncloud import SNClient
 from . import processing # Import the processing module
 
 # --- Application Setup ---
-app = FastAPI(title="SendToSupernote API", version="0.1.0")
+app = FastAPI(
+    title="SendToSupernote API",
+    version="0.1.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 # Configure logging (basic setup)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
