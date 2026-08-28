@@ -14,8 +14,9 @@ from urllib.parse import urlparse # Added for domain extraction
 import shutil # Added for temporary directory cleanup
 import json
 
-from sncloud import SNClient
 from . import processing # Import the processing module
+from .sn_client import SNClientWithCSRF
+from sncloud.exceptions import AuthenticationError as SNAuthenticationError
 
 # --- Application Setup ---
 app = FastAPI(
@@ -232,16 +233,16 @@ async def verify_supernote_credentials(email: str, password: str) -> bool:
         logger.warning("Supernote email or password not provided for verification.")
         return False
     try:
-        client = SNClient()
+        client = SNClientWithCSRF()
         client.login(email, password) # This is the actual check
         logger.info(f"Supernote login successful for {email}")
         return True
-    except Exception as e:
+    except SNAuthenticationError as e:
         logger.error(f"Supernote login failed for {email}: {e}")
-        # Optionally log traceback for more details in server logs:
-        # import traceback
-        # logger.error(traceback.format_exc())
         return False
+    except Exception as e:
+        logger.error(f"Supernote Cloud login service error for {email}: {e}")
+        raise
 
 # --- API Endpoints ---
 @app.on_event("startup")
@@ -275,7 +276,15 @@ async def healthcheck():
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login_for_access_token(form_data: LoginRequest):
-    login_successful = await verify_supernote_credentials(form_data.supernote_email, form_data.supernote_password)
+    try:
+        login_successful = await verify_supernote_credentials(
+            form_data.supernote_email, form_data.supernote_password
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Supernote Cloud login is temporarily unavailable",
+        ) from exc
     if not login_successful:
         raise HTTPException(
             status_code=401,

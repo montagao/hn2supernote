@@ -11,8 +11,9 @@ from bs4 import BeautifulSoup # Added for fallback title extraction
 import re
 from datetime import date as datetime_date # Alias to avoid confusion with datetime module
 from pathlib import Path
-from sncloud import SNClient
 from urllib.parse import urljoin # Added for resolving relative image URLs
+
+from .sn_client import SNClientWithCSRF
 
 # Configure a logger for this module
 logger = logging.getLogger(__name__)
@@ -684,7 +685,7 @@ def upload_pdfs_to_supernote(pdf_filepaths: list[str], sn_email: str, sn_passwor
     parent_path_str = os.path.dirname(target_path_str)
 
     try:
-        client = SNClient()
+        client = SNClientWithCSRF()
         logger.info(f"Logging in to Supernote cloud with email: {sn_email}")
         client.login(sn_email, sn_password)
         logger.info("Successfully logged in to Supernote cloud")
@@ -741,4 +742,4 @@ def upload_pdfs_to_supernote(pdf_filepaths: list[str], sn_email: str, sn_passwor
 
     except Exception as e_sn_process:
         logger.error(f"ERROR in Supernote upload process: {e_sn_process}\n{traceback.format_exc()}")
-        return 0 
+        return 0
