@@ -1,0 +1,35 @@
+[Unit]
+Description=Send to Supernote API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=sendtosupernote
+Group=sendtosupernote
+WorkingDirectory=/opt/sendtosupernote
+EnvironmentFile=-/etc/sendtosupernote.env
+Environment=HOME=/var/lib/sendtosupernote
+Environment=SENDTOSUPERNOTE_STATE_DIR=/var/lib/sendtosupernote
+Environment=PROCESSING_CONCURRENCY=2
+Environment=TOKEN_TTL_HOURS=168
+Environment=PYTHONUNBUFFERED=1
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/sendtosupernote/.playwright
+Environment=TMPDIR=/var/lib/sendtosupernote/tmp
+ExecStart=/opt/sendtosupernote/.venv/bin/uvicorn sendtosupernote.app.main:app --host 127.0.0.1 --port 8765 --workers 1 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sendtosupernote
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=3G
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

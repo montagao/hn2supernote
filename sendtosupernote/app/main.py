@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, HttpUrl, validator # Import validator
 from typing import Optional, Dict
+from threading import Lock, Semaphore
+from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 import os
@@ -10,7 +12,7 @@ from pathlib import Path # For path manipulation
 import re # For path validation
 from urllib.parse import urlparse # Added for domain extraction
 import shutil # Added for temporary directory cleanup
-import json # For persistent token storage
+import json
 
 from sncloud import SNClient
 from . import processing # Import the processing module
@@ -22,35 +24,88 @@ app = FastAPI(title="SendToSupernote API", version="0.1.0")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Path for the persistent token store
-TOKEN_FILE_PATH = Path(__file__).parent / "token_store.json"
+# Runtime state contains task metadata only. Supernote credentials remain in
+# memory and are discarded whenever the service restarts.
+STATE_DIR = Path(os.getenv("SENDTOSUPERNOTE_STATE_DIR", Path(__file__).parent))
+TASK_STATUS_FILE_PATH = STATE_DIR / "task_status_store.json"
+TASK_STATUS_TTL_DAYS = int(os.getenv("TASK_STATUS_TTL_DAYS", "30"))
+TOKEN_TTL_HOURS = int(os.getenv("TOKEN_TTL_HOURS", "168"))
+PROCESSING_CONCURRENCY = max(1, int(os.getenv("PROCESSING_CONCURRENCY", "2")))
 
-# In-memory store for active tokens and associated credentials
-# This will be loaded from/saved to TOKEN_FILE_PATH
+# In-memory store for active tokens and associated credentials.
 active_tokens: Dict[str, Dict[str, str]] = {}
+task_statuses: Dict[str, Dict[str, str]] = {}
+task_status_lock = Lock()
+processing_slots = Semaphore(PROCESSING_CONCURRENCY)
 
-# --- Token Persistence Functions ---
-def load_tokens_from_file():
-    global active_tokens
-    if TOKEN_FILE_PATH.exists():
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _utc_now_iso() -> str:
+    return _utc_now().isoformat()
+
+def _prune_task_statuses(statuses: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, str]]:
+    cutoff = _utc_now() - timedelta(days=TASK_STATUS_TTL_DAYS)
+    pruned: Dict[str, Dict[str, str]] = {}
+    for task_id, record in statuses.items():
+        updated_at = record.get("updated_at") or record.get("created_at")
+        if not updated_at:
+            pruned[task_id] = record
+            continue
         try:
-            with open(TOKEN_FILE_PATH, "r") as f:
-                active_tokens = json.load(f)
-            logger.info(f"Loaded {len(active_tokens)} tokens from {TOKEN_FILE_PATH}")
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Error loading tokens from {TOKEN_FILE_PATH}: {e}. Starting with an empty token store.")
-            active_tokens = {}
-    else:
-        logger.info(f"Token file {TOKEN_FILE_PATH} not found. Starting with an empty token store.")
-        active_tokens = {}
+            updated_dt = datetime.fromisoformat(updated_at)
+        except ValueError:
+            pruned[task_id] = record
+            continue
+        if updated_dt.tzinfo is None:
+            updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+        if updated_dt >= cutoff:
+            pruned[task_id] = record
+    return pruned
 
-def save_tokens_to_file():
+def load_task_statuses_from_file():
+    global task_statuses
+    if not TASK_STATUS_FILE_PATH.exists():
+        task_statuses = {}
+        return
     try:
-        with open(TOKEN_FILE_PATH, "w") as f:
-            json.dump(active_tokens, f, indent=4)
-        logger.info(f"Saved {len(active_tokens)} tokens to {TOKEN_FILE_PATH}")
-    except IOError as e:
-        logger.error(f"Error saving tokens to {TOKEN_FILE_PATH}: {e}")
+        with TASK_STATUS_FILE_PATH.open("r") as status_file:
+            data = json.load(status_file)
+        task_statuses = _prune_task_statuses(data) if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Could not load task statuses: %s", exc)
+        task_statuses = {}
+
+def save_task_statuses_to_file():
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        pruned = _prune_task_statuses(task_statuses)
+        with TASK_STATUS_FILE_PATH.open("w") as status_file:
+            json.dump(pruned, status_file, indent=2)
+    except OSError as exc:
+        logger.error("Could not save task statuses: %s", exc)
+
+def update_task_status(task_id: str, status: Optional[str] = None, message: Optional[str] = None, **fields):
+    now = _utc_now_iso()
+    with task_status_lock:
+        record = task_statuses.get(task_id, {})
+        record.setdefault("created_at", now)
+        record["updated_at"] = now
+        if status:
+            record["status"] = status
+        if message is not None:
+            record["message"] = message
+        for key, value in fields.items():
+            if value is not None:
+                record[key] = value
+        task_statuses[task_id] = record
+    save_task_statuses_to_file()
+    return record
+
+def get_task_status_record(task_id: str) -> Optional[Dict[str, str]]:
+    with task_status_lock:
+        record = task_statuses.get(task_id)
+        return dict(record) if record else None
 
 # --- Pydantic Models ---
 class LoginRequest(BaseModel):
@@ -112,6 +167,15 @@ class ArticleQueueResponse(BaseModel):
     task_id: str
     article_url: HttpUrl
 
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    message: Optional[str] = None
+    article_url: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    pdf_filename: Optional[str] = None
+
 class UserInfo(BaseModel):
     email: str
     password: str # Store password here temporarily, associated with the token
@@ -136,15 +200,23 @@ async def get_validated_user_info_from_token(authorization: Optional[str] = Head
         )
     
     token = parts[1]
-    if token not in active_tokens:
-        logger.warning(f"Invalid or expired token: {token}")
+    user_creds = active_tokens.get(token)
+    if not user_creds:
+        logger.warning("Invalid or expired bearer token")
         raise HTTPException(
             status_code=401,
             detail="Not authenticated: Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    user_creds = active_tokens[token]
+    expires_at = datetime.fromisoformat(user_creds["expires_at"])
+    if expires_at <= _utc_now():
+        active_tokens.pop(token, None)
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated: Token expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     logger.info(f"Successfully authenticated user {user_creds['email']} with token.")
     return UserInfo(email=user_creds["email"], password=user_creds["password"])
 
@@ -170,8 +242,8 @@ async def verify_supernote_credentials(email: str, password: str) -> bool:
 async def startup_event():
     logger.info("Application startup: SendToSupernote API is starting.")
     
-    # Load persistent tokens
-    load_tokens_from_file()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    load_task_statuses_from_file()
     
     # Configure Gemini API Key if present
     gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -191,6 +263,10 @@ async def startup_event():
 async def read_root():
     return {"message": "Welcome to the SendToSupernote API"}
 
+@app.get("/healthz")
+async def healthcheck():
+    return {"status": "ok"}
+
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login_for_access_token(form_data: LoginRequest):
     login_successful = await verify_supernote_credentials(form_data.supernote_email, form_data.supernote_password)
@@ -201,19 +277,22 @@ async def login_for_access_token(form_data: LoginRequest):
             headers={"WWW-Authenticate": "Bearer"}, # Though not strictly bearer if we don't use OAuth2PasswordBearer fully
         )
     access_token = str(uuid.uuid4()) # Simple UUID token
-    active_tokens[access_token] = {"email": form_data.supernote_email, "password": form_data.supernote_password}
-    logger.info(f"Generated token {access_token} for user {form_data.supernote_email}")
-    
-    # Save tokens to file
-    save_tokens_to_file()
+    active_tokens[access_token] = {
+        "email": form_data.supernote_email,
+        "password": form_data.supernote_password,
+        "expires_at": (_utc_now() + timedelta(hours=TOKEN_TTL_HOURS)).isoformat(),
+    }
+    logger.info("Generated an access token for %s", form_data.supernote_email)
     
     return TokenResponse(access_token=access_token)
 
-async def process_article_in_background(request_data: ArticleQueueRequest, user_info: UserInfo, task_id: str):
+def process_article_in_background(request_data: ArticleQueueRequest, user_info: UserInfo, task_id: str):
     logger.info(f"[Task {task_id}] Starting background processing for URL: {request_data.url} for user {user_info.email}")
+    update_task_status(task_id, status="processing", message="Processing started")
     temp_dir_path_str = None # Initialize to None
     actual_pdf_path = None # Path to the PDF with the desired name
     
+    processing_slots.acquire()
     try:
         # 1. Scrape content using the Playwright/Trafilatura pipeline from processing.py
         logger.info(f"[Task {task_id}] Scraping content for {request_data.url}")
@@ -224,6 +303,7 @@ async def process_article_in_background(request_data: ArticleQueueRequest, user_
 
         if not scraped_content or not scraped_content.get('plain_text'):
             logger.error(f"[Task {task_id}] Scraping failed or no plain text for {request_data.url}. Aborting.")
+            update_task_status(task_id, status="failed", message="Scraping failed or no content found")
             return
 
         article_title = scraped_content.get('title', "Untitled Article")
@@ -312,6 +392,7 @@ async def process_article_in_background(request_data: ArticleQueueRequest, user_
 
         if not pdf_generated:
             logger.error(f"[Task {task_id}] PDF generation failed for '{article_title}'. Aborting.")
+            update_task_status(task_id, status="failed", message="PDF generation failed")
             # No need to remove actual_pdf_path here, as the whole temp_dir will be removed in finally
             return
         logger.info(f"[Task {task_id}] PDF generated successfully: {actual_pdf_path} for '{article_title}'.")
@@ -327,11 +408,14 @@ async def process_article_in_background(request_data: ArticleQueueRequest, user_
 
         if uploaded_count > 0:
             logger.info(f"[Task {task_id}] Successfully uploaded {actual_pdf_path.name} to Supernote for '{article_title}'.")
+            update_task_status(task_id, status="uploaded", message="Uploaded to Supernote", pdf_filename=actual_pdf_path.name)
         else:
             logger.error(f"[Task {task_id}] Failed to upload {actual_pdf_path.name} to Supernote for '{article_title}'.")
+            update_task_status(task_id, status="failed", message="Upload failed")
 
     except Exception as e:
         logger.error(f"[Task {task_id}] Unhandled error in background processing for {request_data.url}: {e}")
+        update_task_status(task_id, status="failed", message=str(e))
         import traceback
         logger.error(traceback.format_exc())
     finally:
@@ -341,6 +425,7 @@ async def process_article_in_background(request_data: ArticleQueueRequest, user_
                 logger.info(f"[Task {task_id}] Cleaned up temporary directory: {temp_dir_path_str}")
             except Exception as e_clean:
                 logger.error(f"[Task {task_id}] Error cleaning up temp directory {temp_dir_path_str}: {e_clean}")
+        processing_slots.release()
         
     logger.info(f"[Task {task_id}] Finished background processing for {request_data.url}")
 
@@ -348,6 +433,14 @@ async def process_article_in_background(request_data: ArticleQueueRequest, user_
 async def queue_article(request_data: ArticleQueueRequest, background_tasks: BackgroundTasks, current_user: UserInfo = Depends(get_validated_user_info_from_token)):
     task_id = str(uuid.uuid4())
     logger.info(f"Queueing article: {request_data.url} for user {current_user.email} with Task ID: {task_id}")
+    update_task_status(
+        task_id,
+        status="queued",
+        message="Article queued for processing",
+        url=str(request_data.url),
+        email=current_user.email,
+        target_path=request_data.target_path,
+    )
     background_tasks.add_task(process_article_in_background, request_data, current_user, task_id)
     return ArticleQueueResponse(
         message="Article successfully queued for processing.", 
@@ -355,7 +448,22 @@ async def queue_article(request_data: ArticleQueueRequest, background_tasks: Bac
         article_url=request_data.url
     )
 
+@app.get("/api/task/{task_id}", response_model=TaskStatusResponse)
+async def get_task_status(task_id: str, current_user: UserInfo = Depends(get_validated_user_info_from_token)):
+    record = get_task_status_record(task_id)
+    if not record or record.get("email") != current_user.email:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return TaskStatusResponse(
+        task_id=task_id,
+        status=record.get("status", "unknown"),
+        message=record.get("message"),
+        article_url=record.get("url"),
+        created_at=record.get("created_at"),
+        updated_at=record.get("updated_at"),
+        pdf_filename=record.get("pdf_filename"),
+    )
+
 if __name__ == "__main__":
     import uvicorn
     # When running with "python -m sendtosupernote.app.main", uvicorn needs the full path.
-    uvicorn.run("sendtosupernote.app.main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("sendtosupernote.app.main:app", host="127.0.0.1", port=8765)
