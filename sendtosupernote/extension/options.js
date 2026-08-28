@@ -2,7 +2,11 @@ const backendUrlInput = document.getElementById('backendUrl');
 const emailInput = document.getElementById('email');
 const passwordInput = document.getElementById('password');
 const loginSaveButton = document.getElementById('loginSaveButton');
+const verificationSection = document.getElementById('verificationSection');
+const verificationCodeInput = document.getElementById('verificationCode');
+const verifyButton = document.getElementById('verifyButton');
 const statusMessage = document.getElementById('statusMessage');
+let pendingVerificationId = null;
 
 // Keys for chrome.storage.local
 const STORAGE_KEYS = {
@@ -21,6 +25,24 @@ function displayMessage(message, isError = false) {
         statusMessage.style.border = 'none';
         statusMessage.style.backgroundColor = 'transparent';
     }
+}
+
+function saveAuthenticatedSettings(backendUrl, email, accessToken) {
+    chrome.storage.local.set({
+        [STORAGE_KEYS.BACKEND_URL]: backendUrl,
+        [STORAGE_KEYS.EMAIL]: email,
+        [STORAGE_KEYS.AUTH_TOKEN]: accessToken
+    }, () => {
+        if (chrome.runtime.lastError) {
+            displayMessage('Error saving token: ' + chrome.runtime.lastError.message, true);
+            return;
+        }
+        displayMessage('Login successful! Token and settings saved.', false);
+        passwordInput.value = '';
+        verificationCodeInput.value = '';
+        verificationSection.hidden = true;
+        pendingVerificationId = null;
+    });
 }
 
 async function loadOptions() {
@@ -68,19 +90,19 @@ async function handleLoginAndSave() {
 
             const responseData = await response.json();
 
-            if (response.ok && responseData.access_token) {
+            if (response.status === 202 && responseData.verification_required) {
+                pendingVerificationId = responseData.verification_id;
+                verificationSection.hidden = false;
+                passwordInput.value = '';
                 chrome.storage.local.set({
                     [STORAGE_KEYS.BACKEND_URL]: backendUrl,
-                    [STORAGE_KEYS.EMAIL]: email,
-                    [STORAGE_KEYS.AUTH_TOKEN]: responseData.access_token
-                }, () => {
-                    if (chrome.runtime.lastError) {
-                        displayMessage('Error saving token: ' + chrome.runtime.lastError.message, true);
-                    } else {
-                        displayMessage('Login successful! Token and settings saved.', false);
-                        passwordInput.value = ''; // Clear password after successful login
-                    }
+                    [STORAGE_KEYS.EMAIL]: email
                 });
+                chrome.storage.local.remove(STORAGE_KEYS.AUTH_TOKEN);
+                displayMessage(responseData.message || 'Enter the latest code sent by Supernote.', false);
+                verificationCodeInput.focus();
+            } else if (response.ok && responseData.access_token) {
+                saveAuthenticatedSettings(backendUrl, email, responseData.access_token);
             } else {
                 const errorDetail = responseData.detail || `Login failed with status: ${response.status}`;
                 displayMessage(`Login failed: ${errorDetail}`, true);
@@ -115,5 +137,39 @@ async function handleLoginAndSave() {
     }
 }
 
+async function handleVerification() {
+    const backendUrl = backendUrlInput.value.trim();
+    const email = emailInput.value.trim();
+    const verificationCode = verificationCodeInput.value.trim();
+
+    if (!pendingVerificationId || !verificationCode) {
+        displayMessage('Enter the latest verification code sent by Supernote.', true);
+        return;
+    }
+
+    displayMessage('Verifying code...', false);
+    try {
+        const response = await fetch(`${backendUrl}/api/auth/verify`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                verification_id: pendingVerificationId,
+                verification_code: verificationCode,
+            }),
+        });
+        const responseData = await response.json();
+        if (response.ok && responseData.access_token) {
+            saveAuthenticatedSettings(backendUrl, email, responseData.access_token);
+        } else {
+            displayMessage(`Verification failed: ${responseData.detail || response.statusText}`, true);
+        }
+    } catch (error) {
+        displayMessage(`Verification error: ${error.message}`, true);
+    }
+}
+
 loginSaveButton.addEventListener('click', handleLoginAndSave);
-document.addEventListener('DOMContentLoaded', loadOptions); 
+verifyButton.addEventListener('click', handleVerification);
+document.addEventListener('DOMContentLoaded', loadOptions);

@@ -17,12 +17,20 @@
   </label><br><br>
 
   <button id="loginSaveButton">Login and Save Settings</button>
+
+  <div id="verificationSection" hidden style="margin-top:1em">
+    <label>Supernote verification code<br>
+      <input id="verificationCode" type="text" inputmode="numeric" autocomplete="one-time-code" style="width:100%" placeholder="Enter the latest emailed code">
+    </label><br><br>
+    <button id="verifyButton">Verify and Save Settings</button>
+  </div>
+
   <div id="statusMessage" style="margin-top: 1em; padding: 0.5em;"></div>
 
   <p style="margin-top:1.5em;color:#555">
-    Your password is used once to obtain a login token from the backend and is not stored by the extension.
+    Your password is used once to obtain a Supernote session and is not stored by the extension or backend.
   </p>
 
   <script src="options.js"></script>
 </body>
-</html> 
+</html>

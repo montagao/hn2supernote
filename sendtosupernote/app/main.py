@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, HttpUrl, validator # Import validator
 from typing import Optional, Dict
@@ -37,10 +38,12 @@ STATE_DIR = Path(os.getenv("SENDTOSUPERNOTE_STATE_DIR", Path(__file__).parent))
 TASK_STATUS_FILE_PATH = STATE_DIR / "task_status_store.json"
 TASK_STATUS_TTL_DAYS = int(os.getenv("TASK_STATUS_TTL_DAYS", "30"))
 TOKEN_TTL_HOURS = int(os.getenv("TOKEN_TTL_HOURS", "168"))
+VERIFICATION_TTL_MINUTES = int(os.getenv("VERIFICATION_TTL_MINUTES", "10"))
 PROCESSING_CONCURRENCY = max(1, int(os.getenv("PROCESSING_CONCURRENCY", "2")))
 
 # In-memory store for API tokens and their Supernote session tokens.
 active_tokens: Dict[str, Dict[str, str]] = {}
+pending_verifications: Dict[str, Dict[str, str]] = {}
 task_statuses: Dict[str, Dict[str, str]] = {}
 task_status_lock = Lock()
 processing_slots = Semaphore(PROCESSING_CONCURRENCY)
@@ -123,6 +126,10 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
+class VerificationRequest(BaseModel):
+    verification_id: str
+    verification_code: str
+
 class ArticleQueueRequest(BaseModel):
     url: HttpUrl
     html_content: Optional[str] = None
@@ -187,6 +194,31 @@ class UserInfo(BaseModel):
     email: str
     supernote_token: str
 
+class VerificationRequired(Exception):
+    def __init__(self, context: Dict[str, str]):
+        super().__init__("Supernote verification required")
+        self.context = context
+
+def issue_access_token(email: str, supernote_token: str) -> TokenResponse:
+    access_token = str(uuid.uuid4())
+    active_tokens[access_token] = {
+        "email": email,
+        "supernote_token": supernote_token,
+        "expires_at": (_utc_now() + timedelta(hours=TOKEN_TTL_HOURS)).isoformat(),
+    }
+    logger.info("Generated an access token for %s", email)
+    return TokenResponse(access_token=access_token)
+
+def get_pending_verification(verification_id: str) -> Optional[Dict[str, str]]:
+    challenge = pending_verifications.get(verification_id)
+    if not challenge:
+        return None
+    expires_at = datetime.fromisoformat(challenge["expires_at"])
+    if expires_at <= _utc_now():
+        pending_verifications.pop(verification_id, None)
+        return None
+    return challenge
+
 # --- Authentication Dependencies ---
 async def get_validated_user_info_from_token(authorization: Optional[str] = Header(None)) -> UserInfo:
     if authorization is None:
@@ -241,6 +273,11 @@ async def authenticate_with_supernote(email: str, password: str) -> Optional[str
         logger.info(f"Supernote login successful for {email}")
         return token
     except SNAuthenticationError as e:
+        if client._last_auth_error_code == "E1760":
+            verification_context = client.request_email_verification_code(
+                email, client._last_login_timestamp
+            )
+            raise VerificationRequired(verification_context) from e
         logger.error(f"Supernote login failed for {email}: {e}")
         return None
     except Exception as e:
@@ -277,11 +314,27 @@ async def read_root():
 async def healthcheck():
     return {"status": "ok"}
 
-@app.post("/api/auth/login", response_model=TokenResponse)
+@app.post("/api/auth/login")
 async def login_for_access_token(form_data: LoginRequest):
     try:
         supernote_token = await authenticate_with_supernote(
             form_data.supernote_email, form_data.supernote_password
+        )
+    except VerificationRequired as exc:
+        verification_id = str(uuid.uuid4())
+        pending_verifications[verification_id] = {
+            **exc.context,
+            "expires_at": (
+                _utc_now() + timedelta(minutes=VERIFICATION_TTL_MINUTES)
+            ).isoformat(),
+        }
+        return JSONResponse(
+            status_code=202,
+            content={
+                "verification_required": True,
+                "verification_id": verification_id,
+                "message": "Enter the latest verification code sent by Supernote.",
+            },
         )
     except Exception as exc:
         raise HTTPException(
@@ -294,15 +347,38 @@ async def login_for_access_token(form_data: LoginRequest):
             detail="Incorrect Supernote email or password",
             headers={"WWW-Authenticate": "Bearer"}, # Though not strictly bearer if we don't use OAuth2PasswordBearer fully
         )
-    access_token = str(uuid.uuid4()) # Simple UUID token
-    active_tokens[access_token] = {
-        "email": form_data.supernote_email,
-        "supernote_token": supernote_token,
-        "expires_at": (_utc_now() + timedelta(hours=TOKEN_TTL_HOURS)).isoformat(),
-    }
-    logger.info("Generated an access token for %s", form_data.supernote_email)
-    
-    return TokenResponse(access_token=access_token)
+    return issue_access_token(form_data.supernote_email, supernote_token)
+
+@app.post("/api/auth/verify", response_model=TokenResponse)
+async def verify_login_code(form_data: VerificationRequest):
+    challenge = get_pending_verification(form_data.verification_id)
+    if not challenge:
+        raise HTTPException(
+            status_code=400,
+            detail="Verification session expired. Start login again.",
+        )
+
+    try:
+        client = SNClientWithCSRF()
+        supernote_token = client.login_with_verification_code(
+            email=challenge["email"],
+            verification_code=form_data.verification_code.strip(),
+            valid_code_key=challenge["valid_code_key"],
+            timestamp=challenge["timestamp"],
+        )
+    except SNAuthenticationError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect or expired verification code",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Supernote Cloud verification is temporarily unavailable",
+        ) from exc
+
+    pending_verifications.pop(form_data.verification_id, None)
+    return issue_access_token(challenge["email"], supernote_token)
 
 def process_article_in_background(request_data: ArticleQueueRequest, user_info: UserInfo, task_id: str):
     logger.info(f"[Task {task_id}] Starting background processing for URL: {request_data.url} for user {user_info.email}")

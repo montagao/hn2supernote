@@ -30,4 +30,5 @@ certbot --nginx -d supernote.translate.mom --redirect
 ```
 
 The nginx site exposes only the root health information, `/healthz`, the login
-endpoint, the article queue endpoint, and UUID-shaped task-status endpoints.
+and verification endpoints, the article queue endpoint, and UUID-shaped
+task-status endpoints.
