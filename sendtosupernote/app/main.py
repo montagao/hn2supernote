@@ -14,6 +14,7 @@ import re # For path validation
 from urllib.parse import urlparse # Added for domain extraction
 import shutil # Added for temporary directory cleanup
 import json
+from html import escape as escape_html
 
 from . import processing # Import the processing module
 from .sn_client import SNClientWithCSRF
@@ -136,6 +137,28 @@ class ArticleQueueRequest(BaseModel):
     target_path: Optional[str] = None       # e.g., /Inbox/MyArticles or from user config
     pdf_font_size: Optional[str] = None   # e.g., "12pt" or from user config
     source_identifier: Optional[str] = "WebApp" # To help name the PDF
+    content_title: Optional[str] = None
+    content_author: Optional[str] = None
+    content_kind: Optional[str] = None
+
+    @validator('content_title', 'content_author')
+    def validate_content_metadata(cls, v):
+        if v is None:
+            return v
+        normalized = v.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 300:
+            raise ValueError('content metadata must not exceed 300 characters.')
+        return normalized
+
+    @validator('content_kind')
+    def validate_content_kind(cls, v):
+        if v is None:
+            return v
+        if v not in {'article', 'x-post'}:
+            raise ValueError('content_kind must be "article" or "x-post".')
+        return v
 
     @validator('target_path')
     def validate_target_path(cls, v):
@@ -392,7 +415,8 @@ def process_article_in_background(request_data: ArticleQueueRequest, user_info: 
         logger.info(f"[Task {task_id}] Scraping content for {request_data.url}")
         scraped_content = processing.scrape_article_content(
             url=str(request_data.url), 
-            raw_html_from_extension=request_data.html_content
+            raw_html_from_extension=request_data.html_content,
+            content_kind=request_data.content_kind,
         )
 
         if not scraped_content or not scraped_content.get('plain_text'):
@@ -400,11 +424,11 @@ def process_article_in_background(request_data: ArticleQueueRequest, user_info: 
             update_task_status(task_id, status="failed", message="Scraping failed or no content found")
             return
 
-        article_title = scraped_content.get('title', "Untitled Article")
+        article_title = request_data.content_title or scraped_content.get('title', "Untitled Article")
         plain_text = scraped_content.get('plain_text')
         cleaned_html = scraped_content.get('html_content') 
         publish_date_str = scraped_content.get('extracted_date')
-        author_name = scraped_content.get('author') 
+        author_name = request_data.content_author or scraped_content.get('author')
 
         # Fallback for Author Name
         if not author_name or author_name.strip() == "":
@@ -431,7 +455,7 @@ def process_article_in_background(request_data: ArticleQueueRequest, user_info: 
         image_urls_for_gemini = scraped_content.get('image_urls', []) # Get image_urls, default to empty list
 
         logger.info(f"Task {task_id}: Reformatting to Markdown for: {article_title}. Providing {len(image_urls_for_gemini)} image URLs to Gemini.")
-        if scraped_content.get('plain_text'): # Ensure plain_text exists
+        if request_data.content_kind != 'x-post' and scraped_content.get('plain_text'): # Ensure plain_text exists
             markdown_content = processing.reformat_to_markdown_gemini(
                 article_text=scraped_content['plain_text'],
                 article_url=str(request_data.url),
@@ -460,7 +484,7 @@ def process_article_in_background(request_data: ArticleQueueRequest, user_info: 
                 return_css_only=True
             )
             html_to_render = f"""
-            <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>{article_title}</title>
+            <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>{escape_html(article_title)}</title>
             <style>{retrieved_markdown_css}</style></head><body>{cleaned_html}</body></html>
             """
             logger.info(f"[Task {task_id}] Wrapped cleaned HTML with styles for '{article_title}'.")

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Min length for content to be considered valid after extraction
 MIN_CONTENT_LENGTH = 150
+MIN_X_POST_CONTENT_LENGTH = 1
 HTML_SNIPPET_LENGTH = 1000 # For logging
 
 
@@ -74,7 +75,11 @@ def _extract_text_with_image_placeholders(soup: BeautifulSoup, base_url: str) ->
     return text.strip()
 
 
-def scrape_article_content(url: str, raw_html_from_extension: str | None = None):
+def scrape_article_content(
+    url: str,
+    raw_html_from_extension: str | None = None,
+    content_kind: str | None = None,
+):
     """
     Scrape article content.
     If raw_html_from_extension is provided, it's assumed to be Readability.js output;
@@ -145,8 +150,11 @@ def scrape_article_content(url: str, raw_html_from_extension: str | None = None)
             # If there's an error here, plain_text or title might be None/default
 
         # Check content sufficiency from extension HTML
-        if not plain_text or len(plain_text) < MIN_CONTENT_LENGTH:
-            logger.error(f"FAIL {url}: Plain text from extension HTML is insufficient (length: {len(plain_text) if plain_text else 0}, min: {MIN_CONTENT_LENGTH}).")
+        minimum_content_length = (
+            MIN_X_POST_CONTENT_LENGTH if content_kind == 'x-post' else MIN_CONTENT_LENGTH
+        )
+        if not plain_text or len(plain_text) < minimum_content_length:
+            logger.error(f"FAIL {url}: Plain text from extension HTML is insufficient (length: {len(plain_text) if plain_text else 0}, min: {minimum_content_length}).")
             return None
         
         logger.info(f"Successfully processed content from extension HTML for {url}. Title: '{title}'. Plain text length: {len(plain_text)}.")
@@ -568,6 +576,38 @@ def convert_markdown_to_styled_html(markdown_string: str, font_size: str = "14pt
             height: auto;
             display: block; /* Avoid extra space below images */
             margin: 1em 0; /* Add some margin around images */
+        }}
+        .x-post {{
+            max-width: 46em;
+            margin: 0 auto;
+        }}
+        .x-post header h1 {{
+            margin-bottom: 0.2em;
+        }}
+        .x-post-meta {{
+            color: #555;
+            margin-top: 0;
+        }}
+        .x-post-text {{
+            white-space: normal;
+            overflow-wrap: anywhere;
+        }}
+        .x-post-media {{
+            width: auto;
+            max-width: 100%;
+            max-height: 70vh;
+            object-fit: contain;
+        }}
+        .x-post figure {{
+            margin: 1.25em 0;
+            break-inside: avoid;
+        }}
+        .x-post figcaption, .x-post footer {{
+            color: #555;
+            font-size: 0.9em;
+        }}
+        .x-post-links {{
+            margin-top: 1.5em;
         }}
     """
 

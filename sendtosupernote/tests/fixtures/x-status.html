@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>pending</title>
+</head>
+<body>
+  <main>
+    <article>
+      <div data-testid="User-Name">
+        <a href="/lennysan"><span>Lenny Rachitsky</span></a>
+        <a href="/lennysan"><span>@lennysan</span></a>
+      </div>
+      <div data-testid="tweetText">
+        I thought AI was terrible at design <img src="https://abs.twimg.com/emoji/v2/svg/1f92f.svg" alt="🤯"> until
+        <a href="/anshuc"><span>@anshuc</span></a> explained it.<br>
+        Read the post at <a href="https://t.co/example"><span>lennysnewsletter.com/example</span></a>.
+      </div>
+      <div data-testid="tweetPhoto">
+        <img src="https://pbs.twimg.com/media/example?format=jpg&amp;name=small" alt="Design example">
+      </div>
+      <video poster="https://pbs.twimg.com/ext_tw_video_thumb/example.jpg"></video>
+      <a href="/lennysan/status/2094821687590375802">
+        <time datetime="2026-09-02T00:16:00.000Z">Sep 2</time>
+      </a>
+    </article>
+    <article>
+      <div data-testid="tweetText">This reply must not be included.</div>
+      <a href="/someone/status/999"><time>Sep 2</time></a>
+    </article>
+  </main>
+  <script src="../../extension/x-extractor.js"></script>
+  <script>
+    try {
+      const extracted = XPostExtractor.extractXPost(
+        document,
+        'https://x.com/lennysan/status/2094821687590375802'
+      );
+      document.title = encodeURIComponent(JSON.stringify(extracted));
+    } catch (error) {
+      document.title = encodeURIComponent(JSON.stringify({ error: error.message }));
+    }
+  </script>
+</body>
+</html>

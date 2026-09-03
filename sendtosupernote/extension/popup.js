@@ -75,6 +75,9 @@ sendButton.addEventListener('click', async () => {
         url: activeTab.url,
         html_content: extractedHtmlResponse.content,
         source_identifier: activeTab.title || "Chrome Extension Article", // Use tab title if available
+        content_title: extractedHtmlResponse.title || activeTab.title || null,
+        content_author: extractedHtmlResponse.author || null,
+        content_kind: extractedHtmlResponse.contentKind || 'article',
         // target_path: Defaulted by backend or future option
         // pdf_font_size: Defaulted by backend or future option
     };
@@ -104,4 +107,4 @@ sendButton.addEventListener('click', async () => {
     } catch (error) {
         displayStatus(`Network or other error: ${error.message}. Check backend URL.`, true);
     }
-}); 
+});

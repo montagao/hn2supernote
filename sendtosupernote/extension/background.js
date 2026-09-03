@@ -50,6 +50,14 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
     // If it's a link click, we need to fetch and process that URL
     if (info.linkUrl) {
+        if (isXStatusUrl(info.linkUrl)) {
+            await showNotification(
+                'error',
+                'Open the X post first',
+                'X posts must be open so the extension can read the signed-in page.'
+            );
+            return;
+        }
         await sendUrlToBackend(info.linkUrl, backendUrl, authToken);
     } else {
         // For page context, extract content from current tab
@@ -110,6 +118,9 @@ async function sendCurrentPageToBackend(tabId, tab, backendUrl, authToken) {
         url: tab.url,
         html_content: extractedHtmlResponse.content,
         source_identifier: tab.title || 'Chrome Extension Article',
+        content_title: extractedHtmlResponse.title || tab.title || null,
+        content_author: extractedHtmlResponse.author || null,
+        content_kind: extractedHtmlResponse.contentKind || 'article',
     };
 
     try {
@@ -172,4 +183,15 @@ async function showNotification(type, title, message) {
 function truncateUrl(url, maxLength = 50) {
     if (url.length <= maxLength) return url;
     return url.substring(0, maxLength - 3) + '...';
+}
+
+function isXStatusUrl(value) {
+    try {
+        const url = new URL(value);
+        const host = url.hostname.toLowerCase();
+        return ['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com'].includes(host)
+            && /^\/[^/]+\/status\/\d+(?:\/|$)/i.test(url.pathname);
+    } catch (_error) {
+        return false;
+    }
 }

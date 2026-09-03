@@ -129,6 +129,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'extract') {
     try {
+      const xStatus = typeof XPostExtractor !== 'undefined'
+        ? XPostExtractor.parseXStatusUrl(window.location.href)
+        : null;
+
+      if (xStatus) {
+        try {
+          const extractedPost = XPostExtractor.extractXPost(document, window.location.href);
+          sendResponse({ success: true, ...extractedPost });
+        } catch (error) {
+          console.error('Error during X post extraction:', error);
+          sendResponse({
+            success: false,
+            error: `${error.message} Wait for the post to load, then try again.`,
+          });
+        }
+        return true;
+      }
+
       if (typeof Readability === 'undefined') {
         console.error('Readability.js is not loaded. Ensure it is listed before content.js in manifest.json\'s content_scripts and the file exists in the extension package.');
         sendResponse({ success: false, error: 'Readability library not available. Check extension setup.' });
@@ -139,7 +157,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const article = new Readability(documentClone).parse();
 
       if (article && article.content) {
-        sendResponse({ success: true, content: article.content });
+        sendResponse({
+          success: true,
+          content: article.content,
+          title: article.title || document.title,
+          author: article.byline || null,
+          contentKind: 'article',
+        });
       } else {
         const errorMessage = article && article.title ? `Readability could not extract content (title: ${article.title}).` : 'Readability could not extract content from this page.';
         console.warn(errorMessage);
@@ -151,4 +175,4 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     return true; // Keep the message channel open for the asynchronous response
   }
-}); 
+});
