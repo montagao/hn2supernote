@@ -1,7 +1,7 @@
 {
   "name": "Send to Supernote",
   "description": "Send the current page to your Supernote device via a self-hosted backend.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "manifest_version": 3,
   "permissions": [
     "activeTab",

@@ -91,3 +91,45 @@ test('extracts only the target X post in a real browser DOM', (t) => {
   assert.doesNotMatch(result.content, /abs\.twimg\.com\/emoji/);
   assert.doesNotMatch(result.content, /This reply must not be included/);
 });
+
+test('extracts the complete X long-form article in a real browser DOM', (t) => {
+  const chromeCandidates = [
+    process.env.CHROME_BIN,
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium',
+  ].filter(Boolean);
+  const chrome = chromeCandidates.find((candidate) => fs.existsSync(candidate));
+  if (!chrome) {
+    t.skip('Chrome is not installed');
+    return;
+  }
+
+  const fixture = path.join(__dirname, 'fixtures', 'x-longform-status.html');
+  const run = spawnSync(chrome, [
+    '--headless=new',
+    '--disable-gpu',
+    '--disable-extensions',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-background-networking',
+    '--blink-settings=imagesEnabled=false',
+    '--dump-dom',
+    pathToFileURL(fixture).href,
+  ], { encoding: 'utf8', timeout: 30000 });
+
+  assert.equal(run.status, 0, run.stderr);
+  const titleMatch = run.stdout.match(/<title>([^<]+)<\/title>/i);
+  assert.ok(titleMatch, 'fixture did not return an extraction result');
+  const result = JSON.parse(decodeURIComponent(titleMatch[1]));
+
+  assert.equal(result.title, 'Why Some Startups Become Everywhere Overnight');
+  assert.equal(result.author, '@0xfJuan');
+  assert.match(result.content, /You open X in the morning/);
+  assert.match(result.content, /By lunch, everyone seems to be talking about it/);
+  assert.match(result.content, /<h2>The launch system<\/h2>/);
+  assert.match(result.content, /<blockquote>Distribution is engineered\.<\/blockquote>/);
+  assert.match(result.content, /https:\/\/example\.com\/playbook/);
+  assert.match(result.content, /name=large/);
+  assert.doesNotMatch(result.content, /This reply must not be included/);
+});

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>pending</title>
+</head>
+<body>
+  <main>
+    <article data-testid="tweet">
+      <div data-testid="User-Name">
+        <a href="/0xfJuan"><span>Juan</span></a>
+        <a href="/0xfJuan"><span>@0xfJuan</span></a>
+      </div>
+      <div data-testid="twitterArticleReadView">
+        <img src="https://pbs.twimg.com/media/hero?format=jpg&amp;name=small" alt="Article hero">
+        <h1 data-testid="twitter-article-title">Why Some Startups Become Everywhere Overnight</h1>
+        <div data-testid="twitterArticleRichTextView">
+          <div class="longform-unstyled" data-offset-key="a">
+            <span data-text="true">You open X in the morning and see a startup you've never heard of.</span>
+          </div>
+          <div class="longform-unstyled" data-offset-key="b">
+            <span data-text="true">By lunch, everyone seems to be talking about it. </span>
+            <a href="https://example.com/playbook"><span data-text="true">Here is the playbook.</span></a>
+          </div>
+          <div class="longform-header-two" data-offset-key="c">
+            <span data-text="true">The launch system</span>
+          </div>
+          <div class="longform-blockquote" data-offset-key="d">
+            <span data-text="true">Distribution is engineered.</span>
+          </div>
+        </div>
+      </div>
+      <a href="/0xfJuan/status/2095192939169234945">
+        <time datetime="2026-09-03T00:00:00.000Z">Sep 3</time>
+      </a>
+    </article>
+    <article data-testid="tweet">
+      <div data-testid="tweetText">This reply must not be included.</div>
+      <a href="/someone/status/999"><time>Sep 3</time></a>
+    </article>
+  </main>
+  <script src="../../extension/x-extractor.js"></script>
+  <script>
+    try {
+      const extracted = XPostExtractor.extractXPost(
+        document,
+        'https://x.com/0xfJuan/status/2095192939169234945'
+      );
+      document.title = encodeURIComponent(JSON.stringify(extracted));
+    } catch (error) {
+      document.title = encodeURIComponent(JSON.stringify({ error: error.message }));
+    }
+  </script>
+</body>
+</html>

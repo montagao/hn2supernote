@@ -9,6 +9,25 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function createXPostExtractor() {
   const X_HOSTS = new Set(['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com']);
   const MAX_TITLE_EXCERPT_LENGTH = 72;
+  const LONGFORM_ROOT_SELECTOR = '[data-testid="twitterArticleReadView"]';
+  const LONGFORM_TITLE_SELECTOR = '[data-testid="twitter-article-title"]';
+  const LONGFORM_RICH_TEXT_SELECTOR = '[data-testid="twitterArticleRichTextView"], [data-testid="longformRichTextComponent"], .public-DraftEditor-content';
+  const LONGFORM_BLOCK_SELECTOR = [
+    '.longform-header-one',
+    '.longform-header-one-narrow',
+    '.longform-header-two',
+    '.longform-header-two-narrow',
+    '.longform-unstyled',
+    '.longform-unstyled-narrow',
+    '.longform-blockquote',
+    '.longform-blockquote-narrow',
+    '.longform-unordered-list-item',
+    '.longform-unordered-list-item-narrow',
+    '.longform-ordered-list-item',
+    '.longform-ordered-list-item-narrow',
+    'section[data-block="true"]',
+    '[data-testid="markdown-code-block"]',
+  ].join(', ');
 
   function escapeHtml(value) {
     return String(value ?? '')
@@ -112,6 +131,81 @@
     return escapeHtml(normalizedText(element)).replace(/\n/g, '<br>');
   }
 
+  function outermostLongformBlocks(root) {
+    const blocks = Array.from(root.querySelectorAll(LONGFORM_BLOCK_SELECTOR));
+    const blockSet = new Set(blocks);
+
+    return blocks.filter((block) => {
+      for (let parent = block.parentElement; parent && parent !== root; parent = parent.parentElement) {
+        if (blockSet.has(parent)) return false;
+      }
+      return true;
+    });
+  }
+
+  function serializeLongformBlock(block, baseUrl, titleText) {
+    const text = normalizedText(block);
+    if (!text || text === titleText) return null;
+
+    const classes = Array.from(block.classList || []);
+    const hasClass = (prefix) => classes.some((className) => className.startsWith(prefix));
+    if (block.matches('[data-testid="markdown-code-block"]')) {
+      return { html: `<pre>${escapeHtml(text)}</pre>`, text };
+    }
+
+    const inlineHtml = Array.from(block.childNodes)
+      .map((node) => serializeInlineNode(node, baseUrl))
+      .join('')
+      .trim() || escapeHtml(text);
+
+    if (hasClass('longform-header-')) {
+      return { html: `<h2>${inlineHtml}</h2>`, text };
+    }
+    if (hasClass('longform-blockquote')) {
+      return { html: `<blockquote>${inlineHtml}</blockquote>`, text };
+    }
+    if (hasClass('longform-unordered-list-item') || hasClass('longform-ordered-list-item')) {
+      return { html: `<p class="x-article-list-item">&bull; ${inlineHtml}</p>`, text };
+    }
+    return { html: `<p>${inlineHtml}</p>`, text };
+  }
+
+  function extractLongformContent(doc, article, baseUrl) {
+    const root = article.querySelector(LONGFORM_ROOT_SELECTOR)
+      || doc.querySelector(LONGFORM_ROOT_SELECTOR);
+    if (!root) return null;
+
+    const titleElement = root.querySelector(LONGFORM_TITLE_SELECTOR)
+      || root.querySelector('h1');
+    const title = normalizedText(titleElement);
+    if (!title) return null;
+
+    const richTextRoot = root.querySelector(LONGFORM_RICH_TEXT_SELECTOR) || root;
+    const blocks = outermostLongformBlocks(richTextRoot)
+      .map((block) => serializeLongformBlock(block, baseUrl, title))
+      .filter(Boolean);
+
+    if (blocks.length === 0) {
+      const fallbackText = normalizedText(richTextRoot);
+      if (fallbackText && fallbackText !== title) {
+        blocks.push({
+          html: `<p>${escapeHtml(fallbackText).replace(/\n/g, '<br>')}</p>`,
+          text: fallbackText,
+        });
+      }
+    }
+
+    const text = blocks.map((block) => block.text).join('\n\n').trim();
+    if (!text) return null;
+
+    return {
+      root,
+      title,
+      text,
+      html: `<section class="x-article-body">${blocks.map((block) => block.html).join('')}</section>`,
+    };
+  }
+
   function findAuthor(article, username) {
     const handle = `@${username}`;
     const userNameBlock = article.querySelector('[data-testid="User-Name"]');
@@ -150,7 +244,8 @@
     const images = [];
     const seenUrls = new Set();
 
-    for (const image of article.querySelectorAll('[data-testid="tweetPhoto"] img')) {
+    for (const image of article.querySelectorAll('[data-testid="tweetPhoto"] img, img[src*="pbs.twimg.com/media"]')) {
+      if (image.closest('[data-testid="UserAvatar-Container"], [data-testid="User-Name"]')) continue;
       const src = largerXImageUrl(image.currentSrc || image.src || image.getAttribute('src'));
       if (!src || seenUrls.has(src)) continue;
       seenUrls.add(src);
@@ -211,7 +306,11 @@
     const timestamp = record.timestampLabel
       ? `<time${record.timestampIso ? ` datetime="${escapeHtml(record.timestampIso)}"` : ''}>${escapeHtml(record.timestampLabel)}</time>`
       : '';
-    const authorMeta = [escapeHtml(record.handle), timestamp].filter(Boolean).join(' &middot; ');
+    const authorMeta = record.articleTitle
+      ? [escapeHtml(record.displayName), escapeHtml(record.handle), timestamp].filter(Boolean).join(' &middot; ')
+      : [escapeHtml(record.handle), timestamp].filter(Boolean).join(' &middot; ');
+    const heading = record.articleTitle || record.displayName;
+    const articleClass = record.articleTitle ? 'x-post x-article' : 'x-post';
 
     const imagesHtml = record.media.images
       .map((image) => `<figure><img class="x-post-media" src="${escapeHtml(image.src)}" alt="${escapeHtml(image.alt)}"></figure>`)
@@ -229,7 +328,7 @@
       title,
       author: record.handle,
       contentKind: 'x-post',
-      content: `<article class="x-post"><header><h1>${escapeHtml(record.displayName)}</h1>${authorMeta ? `<p class="x-post-meta">${authorMeta}</p>` : ''}</header><div class="x-post-text">${record.postHtml}</div>${imagesHtml}${videoHtml}${linksHtml}<footer><a href="${escapeHtml(record.sourceUrl)}">Original post on X</a></footer></article>`,
+      content: `<article class="${articleClass}"><header><h1>${escapeHtml(heading)}</h1>${authorMeta ? `<p class="x-post-meta">${authorMeta}</p>` : ''}</header><div class="x-post-text">${record.postHtml}</div>${imagesHtml}${videoHtml}${linksHtml}<footer><a href="${escapeHtml(record.sourceUrl)}">Original post on X</a></footer></article>`,
     };
   }
 
@@ -242,7 +341,8 @@
 
     const { article, timeLink } = match;
     const textElement = article.querySelector('[data-testid="tweetText"]');
-    const postText = normalizedText(textElement);
+    const longform = extractLongformContent(doc, article, status.canonicalUrl);
+    const postText = longform?.text || normalizedText(textElement);
     const media = collectMedia(article, status.canonicalUrl);
     if (!postText && media.images.length === 0 && !media.hasVideo) {
       throw new Error('The target X post contains no readable text or media.');
@@ -252,9 +352,10 @@
     const timeElement = timeLink.querySelector('time');
     const record = {
       ...author,
-      title: makePostTitle(author.displayName, postText),
+      articleTitle: longform?.title || '',
+      title: longform?.title || makePostTitle(author.displayName, postText),
       postText,
-      postHtml: serializeTweetText(textElement, status.canonicalUrl) || '<p>Media post</p>',
+      postHtml: longform?.html || serializeTweetText(textElement, status.canonicalUrl) || '<p>Media post</p>',
       timestampLabel: normalizedText(timeElement),
       timestampIso: timeElement?.getAttribute('datetime') || '',
       media,
